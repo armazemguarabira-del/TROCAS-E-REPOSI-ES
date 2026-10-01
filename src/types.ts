@@ -1,0 +1,864 @@
+import { safeSetItem } from "./utils/apiSync";
+
+export interface ExchangeRecord {
+  id: string; // Unique generated ID (hash or index of import)
+  unb: string;
+  descricaoUnb: string;
+  codigoCliente: string;
+  nomeCliente: string;
+  solicitacao: string; // Solicitação Reposição
+  tipo: string; // Tipo Solicitação
+  dataSolicitacao: string;
+  hora: string;
+  status: string; // Status Solicitação (Aprovada, Pendente, Reprovada)
+  dataAcao: string;
+  usuarioAcao: string;
+  mapa: string; // Mapa Operacional / Entrega (Coluna X / Origem ou Reposição)
+  mapaOrigem?: string; // Coluna X do Relatório 03.18.05 (Mapa Origem da Carga/Entrega)
+  mapaReposicao?: string; // Coluna L do Relatório 03.18.05 (Mapa de Reposição Gerado)
+  nf: string; // Nota Fiscal/Serie
+  nfOrigem?: string; // NF Origem (Coluna Y)
+  statusNf: string;
+  produto: string; // Código do Produto
+  descricaoProduto: string;
+  quantidade: number;
+  um: string; // Unidade de medida
+  valorUnitario: number;
+  valorTotal: number; // Valor final do repasse
+  justificativa: string;
+  fatorHecto?: number;
+  hectolitros?: number;
+  
+  // Deliveries / logistics
+  veiculo: string;
+  placa: string;
+  transportadora: string;
+  nomeTransportadora: string;
+  motorista: string;
+  nomeMotorista: string;
+  conferente: string; // Conferente - Solicitação Reposição
+  conferenteCarregamento: string;
+  
+  // Audits and Systems
+  nrPedidoReposicao: string;
+  statusCheck: string;
+  sistemaOrigem: string;
+  observacao: string;
+  setorVenda: string; // Setor da solicitação
+  
+  // Metadata for history
+  importTimestamp: number;
+  importBatchName: string;
+}
+
+export interface SectorAnalytics {
+  setor: string;
+  totalSpent: number;
+  totalHl: number;
+  requestCount: number;
+  averageSpent: number;
+  averageHl: number;
+  topProducts: { produto: string; descricao: string; quantity: number; totalSpent: number; hl: number }[];
+  topClients: { codigoCliente: string; nome: string; requestCount: number; totalSpent: number; hl: number }[];
+  justificationCounts: { [justification: string]: { count: number; totalSpent: number; hl: number } };
+}
+
+export interface ImportBatch {
+  id: string;
+  timestamp: number;
+  fileName: string;
+  recordCount: number;
+  totalValue: number;
+}
+
+export interface RepresentativeInfo {
+  setor: string;
+  nome: string;
+  gv: string;
+  cpf?: string;
+  base?: string;
+}
+
+export const DEFAULT_REPRESENTATIVOS_SETOR: Record<string, RepresentativeInfo> = {
+  "600": { setor: "600", nome: "JOSE THIAGO BATISTA DO NASCIMENTO", gv: "DIEGO", cpf: "084.279.294-55", base: "DIEGO" },
+  "601": { setor: "601", nome: "FELIPE MOREIRA FELIX", gv: "DIEGO", cpf: "702.505.984-69", base: "DIEGO" },
+  "602": { setor: "602", nome: "JEAN REGIS DOS SANTOS", gv: "DIEGO", cpf: "102.881.334-12", base: "DIEGO" },
+  "603": { setor: "603", nome: "JOSE KLEBSON BRAGANTE SILVA FILHO", gv: "DIEGO", cpf: "069.775.604-10", base: "DIEGO" },
+  "604": { setor: "604", nome: "MARCOS ANTONIO COSTA FERREIRA", gv: "DIEGO", cpf: "131.606.934-65", base: "DIEGO" },
+  "605": { setor: "605", nome: "LUCAS GABRIEL COSTA SOARES", gv: "DIEGO", cpf: "139.975.894-29", base: "DIEGO" },
+  "606": { setor: "606", nome: "JOSUEL ALVES LIMA DA SILVA", gv: "DIEGO", cpf: "063.511.704-51", base: "DIEGO" },
+  "607": { setor: "607", nome: "KAHLIL GIBRAN VIEIRA DOS SANTOS", gv: "DIEGO", cpf: "075.223.134-06", base: "DIEGO" },
+  "608": { setor: "608", nome: "JHONATAN BOTOLO ROCHA", gv: "DIEGO", cpf: "081.608.154-92", base: "DIEGO" },
+  "700": { setor: "700", nome: "VALDEMIR VANDERLEI GOMES FILHO", gv: "ERIVAN", cpf: "105.880.584-32", base: "ERIVAN" },
+  "701": { setor: "701", nome: "ROBSON ALLAN SANTOS DA SILVA", gv: "ERIVAN", cpf: "704.979.364-70", base: "ERIVAN" },
+  "702": { setor: "702", nome: "JUAN PABLO MACIEL SANTOS DE ALMEIDA", gv: "ERIVAN", cpf: "163.696.974-78", base: "ERIVAN" },
+  "703": { setor: "703", nome: "CARLOS EMANUEL PONTES DOS SANTOS", gv: "ERIVAN", cpf: "102.956.624-09", base: "ERIVAN" },
+  "704": { setor: "704", nome: "JOAO LUCAS DOS SANTOS", gv: "ERIVAN", cpf: "126.912.944-98", base: "ERIVAN" },
+  "705": { setor: "705", nome: "RONIELYSON ALVES EVANGELISTA MARINHO", gv: "ERIVAN", cpf: "702.288.514-16", base: "ERIVAN" },
+  "706": { setor: "706", nome: "ALEX JUNIOR VELOSO DA SILVA", gv: "ERIVAN", cpf: "118.273.704-83", base: "ERIVAN" },
+  "707": { setor: "707", nome: "MATHEUS ALVES LIMA DA SILVA", gv: "ERIVAN", cpf: "060.058.094-66", base: "ERIVAN" }
+};
+
+let cachedRepresentativosSetor: Record<string, RepresentativeInfo> | null = null;
+
+export const clearRepresentativosCache = () => {
+  cachedRepresentativosSetor = null;
+};
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", () => {
+    cachedRepresentativosSetor = null;
+  });
+}
+
+export const getRepresentativosSetor = (): Record<string, RepresentativeInfo> => {
+  if (cachedRepresentativosSetor) return cachedRepresentativosSetor;
+  if (typeof window === "undefined") return DEFAULT_REPRESENTATIVOS_SETOR;
+  const saved = localStorage.getItem("sstr_reps_setor");
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved);
+      const merged: Record<string, RepresentativeInfo> = { ...DEFAULT_REPRESENTATIVOS_SETOR, ...parsed };
+      Object.keys(DEFAULT_REPRESENTATIVOS_SETOR).forEach(k => {
+        if (!merged[k] || !merged[k].cpf || merged[k].nome !== DEFAULT_REPRESENTATIVOS_SETOR[k].nome) {
+          merged[k] = { ...merged[k], ...DEFAULT_REPRESENTATIVOS_SETOR[k] };
+        }
+      });
+      cachedRepresentativosSetor = merged;
+      return cachedRepresentativosSetor;
+    } catch (e) {
+      console.error(e);
+    }
+  }
+  cachedRepresentativosSetor = DEFAULT_REPRESENTATIVOS_SETOR;
+  return DEFAULT_REPRESENTATIVOS_SETOR;
+};
+
+export const REPRESENTATIVOS_SETOR: Record<string, RepresentativeInfo> = new Proxy({}, {
+  get(target, prop: string | symbol) {
+    if (typeof prop === "symbol" || prop === "prototype") {
+      return (target as any)[prop];
+    }
+    const list = getRepresentativosSetor();
+    return list[prop as string];
+  },
+  ownKeys() {
+    return Reflect.ownKeys(getRepresentativosSetor());
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const list = getRepresentativosSetor();
+    if (Object.prototype.hasOwnProperty.call(list, prop)) {
+      return {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: list[prop as string]
+      };
+    }
+    return undefined;
+  },
+  has(target, prop) {
+    if (typeof prop === "symbol") return false;
+    return prop in getRepresentativosSetor();
+  }
+});
+
+export interface RouteDriverInfo {
+  rota: string;
+  nome: string;
+  veiculo: string;
+}
+
+export const DEFAULT_MOTORISTAS_ROTAS: Record<string, RouteDriverInfo> = {
+  "R101": { rota: "R101", nome: "EDENILSON DE SOUSA SILVA", veiculo: "Motorista de Distribuição" },
+  "R102": { rota: "R102", nome: "VITOR MACENA GOMES", veiculo: "Ajudante de Distribuição" },
+  "R103": { rota: "R103", nome: "IDALMO FELIPE DOS SANTOS", veiculo: "Ajudante de Distribuição" },
+  "R104": { rota: "R104", nome: "JEFFERSON SOARES PONTES DA SILVA", veiculo: "Ajudante de Distribuição" },
+  "R105": { rota: "R105", nome: "JOSE DE MESQUITA FABRICIO", veiculo: "Ajudante de Distribuição" },
+  "R106": { rota: "R106", nome: "KERCY JONES BERNARDINO DOS SANTOS", veiculo: "Ajudante de Distribuição" },
+  "R107": { rota: "R107", nome: "JOAB DA SILVA MONTE", veiculo: "Ajudante de Distribuição" },
+  "R108": { rota: "R108", nome: "ITALO BRUNO SILVA DE MEDEIROS", veiculo: "Ajudante de Distribuição" },
+  "R109": { rota: "R109", nome: "ABRAAO EVANGELISTA DOS SANTOS", veiculo: "Ajudante de Distribuição II" },
+  "R110": { rota: "R110", nome: "VALDKLEBER DE SOUZA ALEXANDRE", veiculo: "Motorista de Distribuição" },
+  "R111": { rota: "R111", nome: "DANILLO PEREIRA DOS SANTOS SILVA", veiculo: "Motorista de Distribuição" },
+  "R112": { rota: "R112", nome: "EWERTON RODRIGUES DA SILVA", veiculo: "Motorista de Distribuição" },
+  "R113": { rota: "R113", nome: "ADELSON SANTOS DE ARAUJO", veiculo: "Motorista de Distribuição" },
+  "R114": { rota: "R114", nome: "GILMAR DOS SANTOS FERNANDES", veiculo: "Motorista de Distribuição" },
+  "R115": { rota: "R115", nome: "MANOEL ALVES DUTRA NETO", veiculo: "Motorista de Distribuição" },
+  "R116": { rota: "R116", nome: "CESARIO FERREIRA DE VASCONCELOS", veiculo: "Motorista de Distribuição" },
+  "R117": { rota: "R117", nome: "JOSE HONORIO DA SILVA", veiculo: "Motorista de Distribuição" },
+  "R118": { rota: "R118", nome: "JOSENILSON INACIO DE ANDRADE", veiculo: "Motorista de Distribuição" },
+  "R119": { rota: "R119", nome: "JOSE CARLOS DE LIMA ARAUJO", veiculo: "Motorista de Distribuição" },
+  "R120": { rota: "R120", nome: "EDILSON DE ANDRADE LIMA JUNIOR", veiculo: "Motorista de Distribuição" },
+  "R121": { rota: "R121", nome: "JEFFERSON JONES PAULINO COSTA", veiculo: "Motorista de Distribuição" },
+  "R122": { rota: "R122", nome: "JOSE MATUZALEM PONTES DE OLIVEIRA", veiculo: "Motorista de Distribuição" },
+  "R123": { rota: "R123", nome: "JOSICLAUDIO DE OLIVEIRA RODRIGUES", veiculo: "Motorista de Distribuição" },
+  "X": { rota: "X", nome: "X", veiculo: "Motorista Operacional (Sem Cobrança / Não Rateia)" }
+};
+
+let cachedMotoristasRotas: Record<string, RouteDriverInfo> | null = null;
+
+export const clearMotoristasRotasCache = () => {
+  cachedMotoristasRotas = null;
+};
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", () => {
+    cachedMotoristasRotas = null;
+  });
+}
+
+export const getMotoristasRotas = (): Record<string, RouteDriverInfo> => {
+  if (cachedMotoristasRotas) return cachedMotoristasRotas;
+  if (typeof window === "undefined") return DEFAULT_MOTORISTAS_ROTAS;
+  const saved = localStorage.getItem("sstr_motoristas_rotas");
+  if (saved) {
+    try {
+      cachedMotoristasRotas = JSON.parse(saved);
+      return cachedMotoristasRotas!;
+    } catch (e) {
+      console.error(e);
+    }
+  }
+  cachedMotoristasRotas = DEFAULT_MOTORISTAS_ROTAS;
+  return DEFAULT_MOTORISTAS_ROTAS;
+};
+
+export const MOTORISTAS_ROTAS: Record<string, RouteDriverInfo> = new Proxy({}, {
+  get(target, prop: string | symbol) {
+    if (typeof prop === "symbol" || prop === "prototype") {
+      return (target as any)[prop];
+    }
+    const list = getMotoristasRotas();
+    return list[prop as string];
+  },
+  ownKeys() {
+    return Reflect.ownKeys(getMotoristasRotas());
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    const list = getMotoristasRotas();
+    if (Object.prototype.hasOwnProperty.call(list, prop)) {
+      return {
+        enumerable: true,
+        configurable: true,
+        writable: true,
+        value: list[prop as string]
+      };
+    }
+    return undefined;
+  },
+  has(target, prop) {
+    if (typeof prop === "symbol") return false;
+    return prop in getMotoristasRotas();
+  }
+});
+
+export interface RequestItem {
+  id: string;
+  item: string; // SKU code
+  itemCode?: string;
+  descricao?: string; // Product name
+  itemDesc?: string;
+  quantidade: number;
+  fatorHecto?: number;
+  hectolitros?: number;
+  motivo?: string; // specific item reason: Product Avariado, Falta no SKU, Falta de SKU Completo, Inversão
+  unidadeMedida?: string;
+  precoSugerido?: number;
+  precoCalculated?: number; // calculated item price (BRL)
+  fatorEmbalagem?: number;
+  customUnitPrice?: number;
+  
+  // Specific fields for Inversion ("Inversão")
+  produtoAhEnviar?: string; // product that should go
+  produtoARecolher?: string; // product that should be collected
+}
+
+export interface PendingRequest {
+  id: string; // e.g. "pending_req_1720239023..."
+  timestamp: number;
+  data: string; // formatted date (e.g., "20/06/2026")
+  setor: string; // e.g. "600", "700" or "ROTA - R101"
+  mapa: string;
+  nb: string; // client code
+  nf: string; // Nota Fiscal (Required)
+  fotoUrl: string; // Base64 encoding or image link (Required)
+  observacao: string;
+  statusPromax: "pendente" | "cadastrado" | "reprovado" | "corrigir";
+  status?: string; // e.g. "baixado", "concluido", etc.
+  cadastroUser?: string;
+  cadastroDate?: string;
+  cadastroRole?: "motorista" | "rn" | "admin";
+  origem?: "motorista" | "rn" | "admin" | string;
+  perfilUsuario?: string;
+  motivo?: string; // e.g., "Avaria", "Falta no SKU", etc.
+  notified?: boolean; // has the RN seen the approval notification
+  rejeitadoObs?: string; // Motivo de reprovação (Required if rejected)
+  reprovadoReason?: string;
+  reprovadoDate?: string;
+  reprovadoUser?: string;
+  item?: string; // added to support duplicate checks and detailed listings
+  produto?: string;
+  descricaoProduto?: string;
+  productDesc?: string;
+  quantidade?: number; // added to support duplicate checks and detailed listings
+  unidadeMedida?: string;
+  unidadeMedia?: string;
+  um?: string;
+  fatorHecto?: number;
+  hectolitros?: number;
+  isOffline?: boolean;
+  items?: RequestItem[];
+
+  // PDF Export and Network Storage
+  pdfFilePath?: string;
+  pdfFilename?: string;
+  baixadaDate?: string;
+  baixadaUser?: string;
+
+  // Shortage physical settlement properties (Faltas e Inversões)
+  tipoRegistroFalta?: boolean;
+  gerouVale?: boolean;
+  valeId?: string;
+  faltaBaixa?: boolean;
+  faltaBaixaDate?: string;
+  faltaDataBaixa?: string;
+  faltaBaixaUser?: string;
+  faltaUsuarioBaixa?: string;
+  faltaBaixaReciboName?: string;
+  faltaBaixaReciboUrl?: string;
+  faltaBaixaReciboType?: string;
+  faltaBaixaObs?: string;
+  faltaTipoErro?: string; // "carregamento" or "entrega"
+  faltaMotorista?: string;
+  faltaMotoristaCpf?: string;
+  faltaAjudantes?: string;
+  faltaAjudante1?: string;
+  faltaAjudante1Cpf?: string;
+  faltaAjudante2?: string;
+  faltaAjudante2Cpf?: string;
+  faltaAjudante3?: string;
+  faltaAjudante3Cpf?: string;
+  faltaQtdColaboradores?: number;
+  faltaCrewList?: Array<{
+    id?: string;
+    role: string;
+    name: string;
+    cpf?: string;
+    isExempt?: boolean;
+  }>;
+  mapaDataAnomalia?: string;
+  dataEntrega?: string; // Delivery / alignment date informed in manager registration
+  dataEntregaRecibo?: string;
+  observacaoRecibo?: string;
+  municipioRecibo?: string;
+  nomeRecibo?: string;
+  documentoRecibo?: string;
+  enderecoRecibo?: string;
+
+  // Contingency tracking fields (Promax next month)
+  emContingencia?: boolean;
+  contingenciaBaixada?: boolean;
+  contingenciaBaixadaDate?: string;
+  contingenciaBaixadaUser?: string;
+  valorTotal?: number;
+  customUnitPrice?: number;
+  fatorEmbalagem?: number;
+  solicitacao?: string;
+  cliente?: string;
+  hora?: string;
+  turno?: string;
+  subMotivo?: string;
+  faltaConferente?: string;
+  placaVeiculo?: string;
+  itemPlates?: Record<string, string>;
+  lembreteNotificacao?: boolean;
+  reviewedByControle?: boolean;
+}
+
+export interface CrewMember {
+  nome: string;
+  cargo: string;
+  cpf: string;
+}
+
+export const DEFAULT_LISTA_CREW: CrewMember[] = [
+  { nome: "EDENILSON DE SOUSA SILVA", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "104.695.814-33" },
+  { nome: "GEOVANE ARAUJO DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "099.123.694-75" },
+  { nome: "FELIPE GOMES DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "700.552.584-17" },
+  { nome: "VALDKLEBER DE SOUZA ALEXANDRE", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "058.129.184-06" },
+  { nome: "VITOR MACENA GOMES", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "705.138.374-42" },
+  { nome: "WALLISON PONTES DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "180.471.404-69" },
+  { nome: "IDALMO FELIPE DOS SANTOS", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "067.166.734-31" },
+  { nome: "VALTEIR BATISTA DE OLIVEIRA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "703.583.194-04" },
+  { nome: "ROMARIO RODRIGUES DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "125.316.744-38" },
+  { nome: "CARLOS ALBERTO ROQUE DE OLIVEIRA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "071.040.024-13" },
+  { nome: "DANILLO PEREIRA DOS SANTOS SILVA", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "713.650.714-64" },
+  { nome: "EWERTON RODRIGUES DA SILVA", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "116.515.224-05" },
+  { nome: "ADELSON SANTOS DE ARAUJO", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "101.598.524-63" },
+  { nome: "GILMAR DOS SANTOS FERNANDES", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "058.142.584-70" },
+  { nome: "JEFFERSON SOARES PONTES DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "700.478.734-69" },
+  { nome: "JOALISON JACINTO DOS SANTOS", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "078.444.084-05" },
+  { nome: "MANOEL ALVES DUTRA NETO", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "095.438.274-94" },
+  { nome: "CESARIO FERREIRA DE VASCONCELOS", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "032.354.034-18" },
+  { nome: "DANIEL FIRMINO DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "074.441.964-60" },
+  { nome: "ISAIAS DE OLIVEIRA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "016.308.564-10" },
+  { nome: "ALAN JUNIOR MATIAS DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "152.088.094-43" },
+  { nome: "JOSE DE MESQUITA FABRICIO", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "085.892.124-32" },
+  { nome: "GERLANDO MOREIRA DE AZEVEDO JUNIOR", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "132.603.344-16" },
+  { nome: "JOSE HONORIO DA SILVA", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "111.327.744-03" },
+  { nome: "JOSENILSON INACIO DE ANDRADE", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "098.104.994-00" },
+  { nome: "JOSE CARLOS DE LIMA ARAUJO", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "122.277.104-70" },
+  { nome: "EDILSON DE ANDRADE LIMA JUNIOR", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "068.171.834-05" },
+  { nome: "RONALDO SILVA DE LIMA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "125.745.814-07" },
+  { nome: "KERCY JONES BERNARDINO DOS SANTOS", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "110.833.744-94" },
+  { nome: "JEFFERSON JONES PAULINO COSTA", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "071.317.444-76" },
+  { nome: "DJONAS RODRIGUES DOS SANTOS", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "096.863.654-35" },
+  { nome: "JOAB DA SILVA MONTE", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "086.792.164-10" },
+  { nome: "ABRAAO EVANGELISTA DOS SANTOS", cargo: "AJUDANTE DE DISTRIBUICAO II", cpf: "708.579.944-76" },
+  { nome: "EDSON RODRIGUES FILGUEIRA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "709.551.614-60" },
+  { nome: "ALISSON ROMAO DA TRINDADE", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "102.677.124-21" },
+  { nome: "JOSE MATUZALEM PONTES DE OLIVEIRA", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "702.136.704-02" },
+  { nome: "JOSICLAUDIO DE OLIVEIRA RODRIGUES", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "011.689.864-00" },
+  { nome: "ITALO BRUNO SILVA DE MEDEIROS", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "709.966.924-95" },
+  { nome: "ALBERTO LUCAS ARAUJO DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "166.575.744-28" },
+  { nome: "LEONARDO MAURICIO DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "095.408.544-23" },
+  { nome: "JOALISON IZAIAS DA SILVA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "700.261.874-18" },
+  { nome: "JANDEILSON BEZERRA LINS DA CRUZ", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "080.093.804-66" },
+  { nome: "RENAN DOS SANTOS LIMA", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "154.483.594-93" },
+  { nome: "IRIMARQUE JOSE BATISTA DOS SANTOS", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "095.506.644-14" },
+  { nome: "JORGE DO CARMO DAMIANO", cargo: "AJUDANTE DE DISTRIBUICAO", cpf: "049.127.314-20" },
+  { nome: "THIAGO JOSE SANTINO DOS SANTOS", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "061.720.027-08" },
+  { nome: "X", cargo: "MOTORISTA DE DISTRIBUICAO", cpf: "000.000.000-00" }
+];
+
+export function isDriverX(driverName?: string | null): boolean {
+  if (!driverName) return false;
+  const clean = driverName.trim().toUpperCase();
+  return clean === "X" || clean === "MOTORISTA X" || clean === "X (SEM COBRANÇA)" || clean === "X - SEM COBRANÇA" || clean === "X (ISENTO)";
+}
+
+export interface ValeRateioResult {
+  isDriverX: boolean;
+  count: number;
+  individualValue: number;
+  driverExempt: boolean;
+  crew: Array<{
+    role: string;
+    name: string;
+    cpf?: string;
+    value: number;
+    isExempt: boolean;
+    label: string;
+  }>;
+}
+
+export function calculateValeRateio(
+  totalValue: number,
+  driverName?: string | null,
+  driverCpf?: string | null,
+  ajudante1Name?: string | null,
+  ajudante1Cpf?: string | null,
+  ajudante2Name?: string | null,
+  ajudante2Cpf?: string | null,
+  ajudantesCsv?: string | null,
+  customCrew?: Array<{ role: string; name: string; cpf?: string; isExempt?: boolean }> | null
+): ValeRateioResult {
+  // If customCrew array is provided with items, compute rateio dynamically based on those collaborators
+  if (customCrew && customCrew.length > 0) {
+    const isAnyDriverX = customCrew.some(c => isDriverX(c.name) || c.isExempt);
+    const payingMembers = customCrew.filter(c => !(isDriverX(c.name) || c.isExempt));
+    const payingCount = payingMembers.length;
+    const splitValue = payingCount > 0 ? totalValue / payingCount : 0;
+
+    return {
+      isDriverX: isAnyDriverX,
+      count: customCrew.length,
+      individualValue: splitValue,
+      driverExempt: isAnyDriverX,
+      crew: customCrew.map(member => {
+        const exempt = isDriverX(member.name) || !!member.isExempt;
+        return {
+          role: member.role || "Colaborador",
+          name: member.name || "Não Declarado",
+          cpf: member.cpf || "",
+          value: exempt ? 0 : splitValue,
+          isExempt: exempt,
+          label: exempt
+            ? "0% (ISENTO)"
+            : payingCount === 1
+            ? "100% Integral"
+            : `${((1 / payingCount) * 100).toFixed(0)}% do Valor`
+        };
+      })
+    };
+  }
+
+  const isX = isDriverX(driverName);
+  let h1 = (ajudante1Name || "").trim();
+  let h1Cpf = ajudante1Cpf || "";
+  let h2 = (ajudante2Name || "").trim();
+  let h2Cpf = ajudante2Cpf || "";
+
+  const extraHelpers: Array<{ role: string; name: string; cpf?: string }> = [];
+  if (!h1 && ajudantesCsv && ajudantesCsv.trim() && ajudantesCsv.toUpperCase() !== "NÃO DECLARADOS") {
+    const parts = ajudantesCsv.split(",").map(s => s.trim()).filter(Boolean);
+    if (parts[0]) h1 = parts[0];
+    if (parts[1]) h2 = parts[1];
+    for (let i = 2; i < parts.length; i++) {
+      extraHelpers.push({ role: `Ajudante ${i + 1}`, name: parts[i], cpf: "" });
+    }
+  }
+
+  const helpers: Array<{ role: string; name: string; cpf?: string }> = [];
+  if (h1) helpers.push({ role: "Ajudante 1", name: h1, cpf: h1Cpf });
+  if (h2) helpers.push({ role: "Ajudante 2", name: h2, cpf: h2Cpf });
+  helpers.push(...extraHelpers);
+
+  if (isX) {
+    if (helpers.length > 0) {
+      const splitValue = totalValue / helpers.length;
+      return {
+        isDriverX: true,
+        count: helpers.length,
+        individualValue: splitValue,
+        driverExempt: true,
+        crew: helpers.map((h) => ({
+          role: h.role,
+          name: h.name,
+          cpf: h.cpf,
+          value: splitValue,
+          isExempt: false,
+          label: helpers.length === 1 ? "100% Integral" : `1/${helpers.length} do Valor`
+        }))
+      };
+    } else {
+      // Driver X with no helpers registered yet
+      return {
+        isDriverX: true,
+        count: 1,
+        individualValue: totalValue,
+        driverExempt: true,
+        crew: [{
+          role: "Equipe Ajudante",
+          name: "Ajudante (A Definir)",
+          cpf: "",
+          value: totalValue,
+          isExempt: false,
+          label: "100% Integral"
+        }]
+      };
+    }
+  } else {
+    const fullCrew = [
+      { role: "Motorista", name: (driverName || "Motorista Não Declarado").trim(), cpf: driverCpf || "" },
+      ...helpers
+    ];
+    const splitValue = totalValue / fullCrew.length;
+    return {
+      isDriverX: false,
+      count: fullCrew.length,
+      individualValue: splitValue,
+      driverExempt: false,
+      crew: fullCrew.map(m => ({
+        role: m.role,
+        name: m.name,
+        cpf: m.cpf,
+        value: splitValue,
+        isExempt: false,
+        label: fullCrew.length === 1 ? "100% Integral" : `1/${fullCrew.length} do Valor`
+      }))
+    };
+  }
+}
+
+export const getListaCrew = (): CrewMember[] => {
+  if (typeof window === "undefined") return DEFAULT_LISTA_CREW;
+  const saved = localStorage.getItem("sstr_lista_crew");
+  if (saved) {
+    try {
+      return JSON.parse(saved);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+  // Initialize in localStorage so users can edit it
+  safeSetItem("sstr_lista_crew", JSON.stringify(DEFAULT_LISTA_CREW));
+  return DEFAULT_LISTA_CREW;
+};
+
+export const LISTA_CREW: CrewMember[] = new Proxy([] as CrewMember[], {
+  get(target, prop) {
+    const list = getListaCrew();
+    const val = (list as any)[prop];
+    if (typeof val === "function") {
+      return val.bind(list);
+    }
+    return val;
+  },
+  getOwnPropertyDescriptor(target, prop) {
+    return Reflect.getOwnPropertyDescriptor(getListaCrew(), prop);
+  },
+  ownKeys(target) {
+    return Reflect.ownKeys(getListaCrew());
+  }
+});
+
+export function getCrewDetailByName(name: string): CrewMember | undefined {
+  if (!name) return undefined;
+  const cleanName = name.trim().toUpperCase();
+  let found = LISTA_CREW.find(c => c.nome.toUpperCase() === cleanName);
+  if (!found) {
+    found = LISTA_CREW.find(c => c.nome.toUpperCase().includes(cleanName) || cleanName.includes(c.nome.toUpperCase()));
+  }
+  return found;
+}
+
+
+export interface PdvInfo {
+  codigo: string; // NB
+  razaoSocial: string;
+  nomeFantasia: string;
+  municipio: string;
+  documento?: string;
+  endereco?: string;
+  complemento?: string;
+  bairro?: string;
+  uf?: string;
+  cep?: string;
+}
+
+export const RGB_PRODUCT_CODES = new Set([
+  "1743", "2538", "13205", "35331", "2548", "2546", "982", "1388",
+  "1695", "20530", "29253", "13201", "23186", "988", "20217", "27522",
+  "3733", "20329", "10537", "20533", "16503", "20549", "2006", "10530",
+  "13203", "33857"
+]);
+
+export function isRGBProduct(itemCode?: string | number | null, description?: string | null): boolean {
+  if (itemCode) {
+    const cleanCode = String(itemCode).trim().replace(/^0+/, "");
+    if (RGB_PRODUCT_CODES.has(cleanCode)) return true;
+  }
+  if (description) {
+    const descUpper = String(description).toUpperCase();
+    if (
+      descUpper.includes("ONE WAY") || 
+      descUpper.includes("LONG NECK") || 
+      descUpper.includes("LATA") || 
+      descUpper.includes("SLEEK") || 
+      descUpper.includes(" PET ") || 
+      descUpper.includes("PET ") ||
+      descUpper.includes("473ML") ||
+      descUpper.includes("350ML") ||
+      descUpper.includes("269ML") ||
+      descUpper.includes("250ML")
+    ) {
+      return false;
+    }
+    if (
+      descUpper.includes("RETORN") || 
+      descUpper.includes("RGB") || 
+      descUpper.includes("VASILHAME") ||
+      descUpper.includes("GARRAFEIRA") ||
+      descUpper.includes("600ML") || 
+      descUpper.includes("1 L") || 
+      descUpper.includes("1L") || 
+      descUpper.includes("300ML") || 
+      descUpper.includes("LITRAO") || 
+      descUpper.includes("LITRÃO") || 
+      descUpper.includes("GFA VD") || 
+      descUpper.includes("CX C/23")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function getDisplayCadastroUser(
+  req: PendingRequest,
+  repsList: Record<string, { nome: string; gv?: string }> = {},
+  motoristasList: Record<string, { nome: string; cpf?: string }> = {}
+): string {
+  if (!req) return "Usuário Desconhecido";
+  const setorKey = (req.setor || "").trim();
+  const rotInfo = motoristasList[setorKey] || (getMotoristasRotas && getMotoristasRotas()[setorKey]);
+  const repInfo = repsList[setorKey] || (getRepresentativosSetor && getRepresentativosSetor()[setorKey]);
+  
+  const rawUser = req.cadastroUser ? req.cadastroUser.trim() : "";
+  const isGenericUser = !rawUser || 
+    rawUser === "Responsável pelo Controle" || 
+    rawUser === "Gestor" || 
+    rawUser === "Gestor (Dashboard)" || 
+    rawUser === "Usuário Não Identificado" ||
+    rawUser === "Controle Operacional";
+  
+  // If req has a specific, non-generic cadastroUser name
+  if (!isGenericUser) {
+    return rawUser;
+  }
+  
+  // Try action/settlement user fields if present
+  const reqActionUser = (req as any).usuarioAcao;
+  if (reqActionUser && String(reqActionUser).trim() && String(reqActionUser).trim() !== "Controle Promax") {
+    return String(reqActionUser).trim();
+  }
+  if (req.faltaBaixaUser && req.faltaBaixaUser.trim()) {
+    return req.faltaBaixaUser.trim();
+  }
+
+  // Retroactive resolution for generic or missing cadastroUser
+  if (repInfo?.nome) {
+    return `RN ${repInfo.nome} (${setorKey})`;
+  }
+  if (rotInfo?.nome) {
+    return `Motorista ${rotInfo.nome} (Rota ${setorKey})`;
+  }
+  
+  const loggedManager = typeof sessionStorage !== "undefined" 
+    ? (sessionStorage.getItem("sstr_current_manager_name") || localStorage.getItem("sstr_current_manager_name")) 
+    : null;
+  if (loggedManager && loggedManager.trim() && loggedManager.trim().toLowerCase() !== "gestor") {
+    return loggedManager.trim();
+  }
+
+  if (rawUser && rawUser !== "Responsável pelo Controle") {
+    return rawUser;
+  }
+  
+  return `Setor/Rota ${setorKey || "Operacional"}`;
+}
+
+export function getCreatorRole(
+  req: PendingRequest,
+  repsList: Record<string, { nome: string; gv?: string }> = {},
+  motoristasList: Record<string, { nome: string; cpf?: string }> = {}
+): "motorista" | "rn" | "admin" {
+  if (!req) return "admin";
+  const cast = req as any;
+
+  // 1. Explicit role/origem flag if present
+  if (cast.cadastroRole === "admin" || cast.origem === "admin" || cast.perfilUsuario === "admin") return "admin";
+  if (cast.cadastroRole === "motorista" || cast.origem === "motorista" || cast.perfilUsuario === "motorista") return "motorista";
+  if (cast.cadastroRole === "rn" || cast.origem === "rn" || cast.perfilUsuario === "rn") return "rn";
+
+  // 2. Direct string check on raw cadastroUser
+  const rawUser = (req.cadastroUser || "").trim();
+  const userStr = rawUser.toLowerCase();
+
+  // Explicit keywords for Admin / Gestão / Plataforma (including Alécya and system accounts)
+  if (
+    userStr.includes("alecya") ||
+    userStr.includes("alécya") ||
+    userStr.includes("gestor") ||
+    userStr.includes("admin") ||
+    userStr.includes("controle") ||
+    userStr.includes("operacional") ||
+    userStr.includes("supervis") ||
+    userStr.includes("gerente") ||
+    userStr.includes("diretoria") ||
+    userStr.includes("dashboard") ||
+    userStr.includes("plataforma") ||
+    rawUser === "Responsável pelo Controle"
+  ) {
+    return "admin";
+  }
+
+  // Explicit keywords for Motorista / Rotas
+  if (
+    userStr.startsWith("motorista") ||
+    userStr.includes("rota ") ||
+    userStr.includes("entregador") ||
+    userStr.includes("driver")
+  ) {
+    return "motorista";
+  }
+
+  // Explicit keywords for RN / Representante
+  if (
+    userStr.startsWith("rn ") ||
+    userStr.startsWith("rn-") ||
+    userStr.includes("representante") ||
+    userStr.includes("vendedor") ||
+    userStr.includes("promotor")
+  ) {
+    return "rn";
+  }
+
+  // Match rawUser against registered Reps / Drivers names
+  if (rawUser) {
+    const allReps = Object.values(repsList);
+    const isRepNameMatch = allReps.some(r => r.nome && (
+      userStr.includes(r.nome.toLowerCase()) || r.nome.toLowerCase().includes(userStr)
+    ));
+    if (isRepNameMatch) return "rn";
+
+    const allDrivers = Object.values(motoristasList);
+    const isDriverNameMatch = allDrivers.some(d => d.nome && (
+      userStr.includes(d.nome.toLowerCase()) || d.nome.toLowerCase().includes(userStr)
+    ));
+    if (isDriverNameMatch) return "motorista";
+  }
+
+  // Check resolved display user string
+  const displayUser = getDisplayCadastroUser(req, repsList, motoristasList).toLowerCase();
+  if (displayUser.includes("motorista") || displayUser.includes("rota ")) {
+    return "motorista";
+  }
+  if (displayUser.includes("rn ") || displayUser.includes("representante")) {
+    return "rn";
+  }
+
+  // Default to Admin for all platform / management creations
+  return "admin";
+}
+
+export function isInversaoOrSwapReq(req: any): boolean {
+  if (!req) return false;
+  const m = String(req.motivo || "").toLowerCase().trim();
+  if (m.includes("invers") || m.includes("swap") || m.includes("troca de sku")) return true;
+  if (req.items && Array.isArray(req.items) && req.items.length > 0) {
+    return req.items.some((item: any) => {
+      const itemMotive = String(item.motivo || "").toLowerCase().trim();
+      const isItemSwap = !!item.produtoAhEnviar || !!item.produtoARecolher;
+      return isItemSwap || itemMotive.includes("invers") || itemMotive.includes("swap") || itemMotive.includes("troca de sku");
+    });
+  }
+  return false;
+}
+
+export function isFaltaOrInversaoReq(req: PendingRequest): boolean {
+  if (!req) return false;
+  const checkMotive = (motive: string): boolean => {
+    const m = (motive || "").toLowerCase().trim();
+    if (!m) return false;
+    if (m.includes("falta") || m.includes("invers") || m.includes("swap") || m.includes("troca de sku") || m.includes("completo") || m.includes("fechado") || m.includes("reposi")) return true;
+    return false;
+  };
+
+  if (checkMotive(req.motivo || "")) return true;
+
+  if (req.items && req.items.some(item => {
+    const isItemSwap = !!item.produtoAhEnviar || !!item.produtoARecolher;
+    return checkMotive(item.motivo || "") || isItemSwap;
+  })) {
+    return true;
+  }
+
+  return false;
+}
+
+export function isAllowedInPending(
+  req: PendingRequest,
+  repsList: Record<string, { nome: string; gv?: string }> = {},
+  motoristasList: Record<string, { nome: string; cpf?: string }> = {}
+): boolean {
+  if (!req) return false;
+  if (isFaltaOrInversaoReq(req)) return true;
+  const role = getCreatorRole(req, repsList, motoristasList);
+  return role === "motorista";
+}
+
+
+

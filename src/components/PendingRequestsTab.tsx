@@ -1,0 +1,9687 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback, useDeferredValue } from "react";
+import { PendingRequest, REPRESENTATIVOS_SETOR, ExchangeRecord, RequestItem, MOTORISTAS_ROTAS, LISTA_CREW, DEFAULT_LISTA_CREW, getCrewDetailByName, getRepresentativosSetor, clearRepresentativosCache, getMotoristasRotas, clearMotoristasRotasCache, getDisplayCadastroUser, getCreatorRole, isFaltaOrInversaoReq, isAllowedInPending, isInversaoOrSwapReq, calculateValeRateio, isDriverX } from "../types";
+import AvariasPackagingChart from "./AvariasPackagingChart";
+import { getApiUrl } from "../utils/apiUrl";
+import { safeSetItem } from "../utils/apiSync";
+import { useSstrData } from "../context/SstrDataContext";
+import { PRODUCT_DATABASE, getProductsDatabase, calculateItemValue, calculateItemHL, calculateRequestValueAndHL, getUnitLabel } from "../data/products";
+import { getPdvDatabase } from "../data/pdvData";
+import { getHectoFactor, calculateHL } from "../utils/hectoFactors";
+import { exportRegistrationPdf, generatePdfFilename, NETWORK_REGISTROS_PATH } from "../utils/pdfGenerator";
+import { exportFilteredRequestsExcel } from "../utils/excelExport";
+import { isRequestWithVale } from "../utils/valeCheck";
+import ValesHistoryDashboard, { ValeEntry } from "./ValesHistoryDashboard";
+import PdfDocumentViewer from "./PdfDocumentViewer";
+import { 
+  Clock, 
+  Truck,
+  Search, 
+  MapPin, 
+  User, 
+  FileText, 
+  CheckCircle2, 
+  X, 
+  Upload,
+  AlertCircle, 
+  CheckSquare, 
+  Eye, 
+  Camera, 
+  ExternalLink,
+  Trash2,
+  ListFilter,
+  Layers,
+  ArrowRight,
+  XCircle,
+  Calendar,
+  Printer,
+  ChevronRight,
+  Users,
+  AlertTriangle,
+  FileSpreadsheet,
+  Signature,
+  TrendingUp,
+  PlusCircle,
+  Plus,
+  Copy,
+  Sliders,
+  RotateCcw,
+  Undo2,
+  Download,
+  Maximize2,
+  Minimize2
+} from "lucide-react";
+
+// Helper to check if a request or any of its items is a "Falta de SKU Fechado / Completo"
+const isFaltaSkuCompletoReq = (req: PendingRequest): boolean => {
+  const m = (req.motivo || "").toLowerCase();
+  if (m.includes("completo") || m.includes("fechado")) return true;
+  if (req.items && req.items.some((it: any) => {
+    const im = (it.motivo || "").toLowerCase();
+    return im.includes("completo") || im.includes("fechado");
+  })) return true;
+  return false;
+};
+
+// Helper to check if a request or any of its items is an "Inversão"
+const isInversaoReq = (req: PendingRequest): boolean => {
+  const m = (req.motivo || "").toLowerCase();
+  if (m.includes("invers")) return true;
+  if (req.items && req.items.some((it: any) => {
+    const im = (it.motivo || "").toLowerCase();
+    return im.includes("invers");
+  })) return true;
+  return false;
+};
+
+// Helper to check if a request qualifies for Promax Contingency Alert (MUST NOT be Falta de SKU Fechado/Completo AND MUST NOT be Inversão)
+const isContingenciaAlertReq = (req: PendingRequest): boolean => {
+  if (req.contingenciaBaixada) return false;
+  if (isFaltaSkuCompletoReq(req) || isInversaoReq(req)) return false;
+  if (req.emContingencia !== undefined) {
+    return !!req.emContingencia;
+  }
+  return true;
+};
+
+// Helper to check if a request qualifies as Promax Contingency Occurrence in database (regardless of pending, cadastrada, or baixada)
+export const isContingenciaReq = (req: PendingRequest): boolean => {
+  if (!req) return false;
+  if (req.statusPromax === "reprovado") return false;
+  if (isFaltaSkuCompletoReq(req) || isInversaoReq(req)) return false;
+  if (req.emContingencia === false && !req.contingenciaBaixada) return false;
+  return true;
+};
+
+// Helper to check if a request is "Reposição" (i.e. motivo contains "falta" / product lack)
+const isReposicaoReq = (req: PendingRequest): boolean => {
+  const m = (req.motivo || "").toLowerCase();
+  if (m.includes("falta")) return true;
+  if (req.items && req.items.some((it: any) => (it.motivo || "").toLowerCase().includes("falta"))) return true;
+  return false;
+};
+
+// Helper to check if a request is "Troca" (any motive other than product lack)
+const isTrocaReq = (req: PendingRequest): boolean => {
+  return !isReposicaoReq(req);
+};
+
+// Helper to parse inversion product string into code, full product description, quantity and full formatted text
+export const parseInversionProduct = (str: string | undefined, defaultQty: number = 1) => {
+  if (!str) return { code: "INVERSÃO", name: "Produto Não Especificado", qty: defaultQty, fullText: "INVERSÃO - Produto Não Especificado (Qtd: 1)" };
+  
+  let qty = defaultQty;
+  const qtyMatch = str.match(/\(Qtd:\s*(\d+)/i);
+  if (qtyMatch) {
+    qty = parseInt(qtyMatch[1], 10);
+  }
+
+  const cleanStr = str.replace(/\(Qtd:[^)]+\)/i, "").trim();
+
+  let code = "INVERSÃO";
+  let name = "";
+
+  const match = cleanStr.match(/^#?(\d+)\s*[-:]?\s*(.*)$/);
+  if (match) {
+    code = match[1];
+    name = match[2] ? match[2].trim() : "";
+  } else if (/^\d+$/.test(cleanStr)) {
+    code = cleanStr;
+    name = "";
+  } else {
+    name = cleanStr;
+  }
+
+  if (name.startsWith("-")) {
+    name = name.substring(1).trim();
+  }
+
+  // Lookup in PRODUCT_DATABASE if name is empty, generic, dash, or equal to code
+  const dbP = PRODUCT_DATABASE.find(p => p.codigo === code || p.codigo === code.replace(/^0+/, ""));
+  if (dbP) {
+    if (!name || name === code || name.toUpperCase() === "INVERSÃO" || name === "-" || name.toUpperCase() === "SKU COMPENSADO DE INVERSÃO") {
+      name = dbP.descricao;
+    }
+  }
+
+  if (!name) {
+    name = "PRODUTO SSTR";
+  }
+
+  const codeDisplay = code !== "INVERSÃO" ? `#${code}` : code;
+  const fullText = `${codeDisplay} - ${name} (Qtd: ${qty})`;
+
+  return { code, name, qty, fullText };
+};
+
+// Helper to reliably extract items with codes and descriptions for inspect modal
+const getInspectItems = (req: PendingRequest, promaxRecords: ExchangeRecord[] = []) => {
+  const castReq = req as any;
+  if (req.items && req.items.length > 0) {
+    return req.items.map(it => {
+      const code = String(it.item || it.itemCode || (it as any).codPromax || req.item || castReq.codPromax || "N/A").trim();
+      const cleanCode = code.replace(/^#/, "").replace(/^0+/, "");
+      const dbP = PRODUCT_DATABASE.find(p => p.codigo === code || p.codigo === cleanCode);
+      const promaxMatch = promaxRecords.find(r => r.produto === code || r.produto === cleanCode);
+      const name = (it as any).descricao || (it as any).descricaoSku || (it as any).descricaoProduto || (it as any).name || (it as any).productDesc || dbP?.descricao || promaxMatch?.descricaoProduto || (code !== "N/A" ? `PRODUTO SKU #${code}` : "Produto não discriminado");
+      const qty = Number(it.quantidade) || 1;
+      const um = getUnitLabel(it, req);
+      const rawUm = String(it.unidadeMedida || req.unidadeMedida || (it as any).um || req.um || "").trim();
+      const hl = Number(it.hectolitros) || calculateItemHL({ item: code, quantidade: qty, unidadeMedida: rawUm || um, fatorEmbalagem: it.fatorEmbalagem, fatorHecto: it.fatorHecto, motivo: it.motivo || req.motivo });
+      const val = calculateItemValue({ item: code, quantidade: qty, unidadeMedida: rawUm || um, customUnitPrice: it.customUnitPrice, fatorEmbalagem: it.fatorEmbalagem, precoCalculated: it.precoCalculated, precoSugerido: it.precoSugerido, motivo: it.motivo || req.motivo });
+      return { code, name, qty, um, hl, val };
+    });
+  }
+
+  if (castReq.skus && Array.isArray(castReq.skus) && castReq.skus.length > 0) {
+    return castReq.skus.map((sku: any) => {
+      const code = String(sku.code || sku.item || sku.codPromax || "N/A").trim();
+      const cleanCode = code.replace(/^#/, "").replace(/^0+/, "");
+      const dbP = PRODUCT_DATABASE.find(p => p.codigo === code || p.codigo === cleanCode);
+      const promaxMatch = promaxRecords.find(r => r.produto === code || r.produto === cleanCode);
+      const name = sku.name || sku.descricao || dbP?.descricao || promaxMatch?.descricaoProduto || (code !== "N/A" ? `PRODUTO SKU #${code}` : "Produto não discriminado");
+      const qty = Number(sku.quantity || sku.quantidade) || 1;
+      const um = getUnitLabel(sku, req);
+      const rawUm = String(sku.unit || sku.unidadeMedida || req.unidadeMedida || "").trim();
+      const hl = Number(sku.hectolitros) || 0;
+      const val = Number(sku.valorTotal) || calculateItemValue({ item: code, quantidade: qty, unidadeMedida: rawUm || um });
+      return { code, name, qty, um, hl, val };
+    });
+  }
+
+  // Single item fallback
+  const code = String(req.item || castReq.codPromax || req.produto || castReq.itemCode || "N/A").trim();
+  const cleanCode = code.replace(/^#/, "").replace(/^0+/, "");
+  const dbP = PRODUCT_DATABASE.find(p => p.codigo === code || p.codigo === cleanCode);
+  const promaxMatch = promaxRecords.find(r => r.produto === code || r.produto === cleanCode);
+  
+  let parsedName = "";
+  if (req.observacao && (req.observacao.includes("INVERSÃO") || req.observacao.includes("Item:"))) {
+    const parsed = parseInversionProduct(req.observacao);
+    if (parsed && parsed.name && parsed.name !== "Produto Não Especificado") {
+      parsedName = parsed.name;
+    }
+  }
+
+  const name = castReq.descricaoSku || req.descricaoProduto || req.productDesc || castReq.descricao || parsedName || dbP?.descricao || promaxMatch?.descricaoProduto || (code !== "N/A" ? `PRODUTO SKU #${code}` : "Produto não discriminado");
+  const qty = Number(req.quantidade) || 1;
+  const um = getUnitLabel({ unidadeMedida: req.unidadeMedida || req.unidadeMedia || req.um, motivo: req.motivo }, req);
+  const rawUm = String(req.unidadeMedida || req.unidadeMedia || req.um || "").trim();
+  const hl = Number(req.hectolitros) || calculateItemHL({ item: code, quantidade: qty, unidadeMedida: rawUm || um, fatorHecto: req.fatorHecto, motivo: req.motivo });
+  const val = getRequestValue(req, promaxRecords);
+
+  return [{ code, name, qty, um, hl, val }];
+};
+
+// Helper function to extract or parse request date safely for range filtering and sorting
+export const getReqNormalizedDate = (req: PendingRequest | undefined | null): string | null => {
+  if (!req) return null;
+  const cast = req as any;
+
+  // 1. Prioritize explicit business/operational dates over system creation timestamps
+  const candidates = [
+    req.data,
+    cast.data,
+    cast.faltaBaixaDate,
+    cast.faltaDataBaixa,
+    cast.cadastroDate,
+    cast.dataFalta,
+    cast.dataEmissao,
+    cast.mapaDataAnomalia,
+    cast.dataEntregaRecibo
+  ];
+
+  for (const raw of candidates) {
+    if (!raw) continue;
+    if (typeof raw === "string") {
+      const clean = raw.trim();
+      // Match DD/MM/YYYY or D/M/YYYY or DD-MM-YYYY
+      const ptMatch = clean.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      if (ptMatch) {
+        const day = ptMatch[1].padStart(2, "0");
+        const month = ptMatch[2].padStart(2, "0");
+        const year = ptMatch[3];
+        return `${year}-${month}-${day}`;
+      }
+      // Match YYYY-MM-DD or YYYY/MM/DD
+      const isoMatch = clean.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+      if (isoMatch) {
+        const year = isoMatch[1];
+        const month = isoMatch[2].padStart(2, "0");
+        const day = isoMatch[3].padStart(2, "0");
+        return `${year}-${month}-${day}`;
+      }
+    }
+  }
+
+  // 2. Check id if it contains a unix timestamp (pending_req_1725345678901)
+  if (req.id && req.id.startsWith("pending_req_")) {
+    const ts = parseInt(req.id.replace("pending_req_", ""), 10);
+    if (!isNaN(ts) && ts > 1000000000000) {
+      const d = new Date(ts);
+      if (!isNaN(d.getTime())) {
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, "0");
+        const day = String(d.getDate()).padStart(2, "0");
+        return `${year}-${month}-${day}`;
+      }
+    }
+  }
+
+  // 3. Fallback to timestamp if no operational date string was present
+  if (req.timestamp && typeof req.timestamp === "number" && req.timestamp > 0) {
+    const d = new Date(req.timestamp);
+    if (!isNaN(d.getTime())) {
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    }
+  }
+
+  return null;
+};
+
+export const getReqDate = (req: PendingRequest): Date | null => {
+  const ymd = getReqNormalizedDate(req);
+  if (!ymd) return null;
+  const [year, month, day] = ymd.split("-").map(Number);
+  return new Date(year, month - 1, day, 12, 0, 0);
+};
+
+// Universal helper to determine if a request has been Baixada / Finalizada / Concluída
+export const isRequestBaixada = (req: PendingRequest | undefined | null): boolean => {
+  if (!req) return false;
+  const cast = req as any;
+  if (req.faltaBaixa === true || cast.faltaBaixa === true) return true;
+  if (cast.contingenciaBaixada === true) return true;
+  if (req.status === "baixado" || req.status === "concluido" || cast.status === "baixado" || cast.status === "concluido") return true;
+  if (req.statusPromax === "cadastrado" || cast.status === "cadastrado") return true;
+  if (Boolean(cast.faltaBaixaDate || cast.faltaDataBaixa)) return true;
+  if (Boolean(cast.faltaBaixaReciboUrl || cast.faltaBaixaReciboName)) return true;
+  if (cast.reviewedByControle === true) return true;
+  if (req.id && (req.id.startsWith("req_hist_") || req.id.startsWith("rec_"))) return true;
+  return false;
+};
+
+// Helper to determine if a request contains a shortage ("Falta") or an inversion ("Inversão")
+const isFaltaOrInversao = (req: PendingRequest): boolean => {
+  return isFaltaOrInversaoReq(req);
+};
+
+// Helper to check if request is an inversion / swap request
+const isSwapRequest = (req: PendingRequest): boolean => {
+  if (isInversaoOrSwapReq(req)) return true;
+  const m = (req.motivo || "").toLowerCase().trim();
+  if (m.includes("invers") || m.includes("swap") || m.includes("troca de sku")) return true;
+  if (req.items && req.items.some(item => {
+    const itemMotive = (item.motivo || "").toLowerCase();
+    const isItemSwap = !!item.produtoAhEnviar || !!item.produtoARecolher;
+    return isItemSwap || itemMotive.includes("invers") || itemMotive.includes("swap") || itemMotive.includes("troca de sku");
+  })) {
+    return true;
+  }
+  return false;
+};
+
+// Pricing helper to determine standard request pricing based on platform registered data and promax database
+const getRequestValue = (req: PendingRequest, promaxRecords: ExchangeRecord[] = []): number => {
+  const { valorTotal } = calculateRequestValueAndHL(req, promaxRecords);
+  return valorTotal;
+};
+
+// Calculate accurate HL volume for any request accounting for single vs multi-items and unit of measure
+export const getRequestHL = (req: PendingRequest): number => {
+  if (req.items && req.items.length > 0) {
+    const total = req.items.reduce((sum, item) => sum + calculateItemHL({
+      ...item,
+      unidadeMedida: item.unidadeMedida || (req as any).unidadeMedida || (req as any).um
+    }), 0);
+    if (total > 0) return Number(total.toFixed(2));
+  }
+
+  if (req.item) {
+    const hl = calculateItemHL({
+      item: req.item,
+      quantidade: req.quantidade,
+      unidadeMedida: (req as any).unidadeMedida || (req as any).um,
+      fatorHecto: (req as any).fatorHecto,
+      fatorEmbalagem: (req as any).fatorEmbalagem
+    });
+    if (hl > 0) return Number(hl.toFixed(2));
+  }
+
+  if (req.hectolitros !== undefined && req.hectolitros > 0) {
+    return Number(req.hectolitros.toFixed(2));
+  }
+
+  return 0;
+};
+
+// Smart client detail resolver utilizing both custom PDV database and promax historical cache
+const getClientDetails = (
+  nb: string | undefined,
+  pdvDb: Record<string, any>,
+  promaxRecords: ExchangeRecord[]
+) => {
+  const cleanNb = (nb || "").trim();
+  if (!cleanNb) {
+    return {
+      razaoSocial: "CLIENTE PARCEIRO DE DISTRIBUIÇÃO",
+      nomeFantasia: "CLIENTE PARCEIRO DE DISTRIBUIÇÃO",
+      municipio: "",
+      uf: "PB",
+      documento: "",
+      endereco: "",
+      complemento: "",
+      bairro: "",
+      cep: ""
+    };
+  }
+
+  // 1. Direct match in local PDV database
+  let clientInfo = pdvDb[cleanNb];
+
+  // 2. Normalize leading zeros / key integer matching
+  if (!clientInfo) {
+    const nbAsNum = parseInt(cleanNb, 10);
+    if (!isNaN(nbAsNum)) {
+      const foundKey = Object.keys(pdvDb).find(k => parseInt(k, 10) === nbAsNum);
+      if (foundKey) {
+        clientInfo = pdvDb[foundKey];
+      }
+    }
+  }
+
+  // 3. Match from promaxRecords history
+  if (!clientInfo) {
+    const matchingRecord = promaxRecords.find(r => {
+      const recCd = (r.codigoCliente || "").trim();
+      if (recCd === cleanNb) return true;
+      const recAsNum = parseInt(recCd, 10);
+      const nbAsNum = parseInt(cleanNb, 10);
+      return !isNaN(recAsNum) && !isNaN(nbAsNum) && recAsNum === nbAsNum;
+    });
+
+    if (matchingRecord) {
+      return {
+        razaoSocial: matchingRecord.nomeCliente || `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+        nomeFantasia: matchingRecord.nomeCliente || `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+        municipio: "",
+        uf: "PB",
+        documento: "",
+        endereco: "",
+        complemento: "",
+        bairro: "",
+        cep: ""
+      };
+    }
+  }
+
+  // 4. Return formatted data if found in database
+  if (clientInfo) {
+    return {
+      razaoSocial: clientInfo.razaoSocial,
+      nomeFantasia: clientInfo.nomeFantasia,
+      municipio: clientInfo.municipio || "",
+      uf: clientInfo.uf || "PB",
+      documento: clientInfo.documento || "",
+      endereco: clientInfo.endereco || "",
+      complemento: clientInfo.complemento || "",
+      bairro: clientInfo.bairro || "",
+      cep: clientInfo.cep || ""
+    };
+  }
+
+  // 5. Final fallback
+  return {
+    razaoSocial: `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+    nomeFantasia: `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+    municipio: "",
+    uf: "PB",
+    documento: "",
+    endereco: "",
+    complemento: "",
+    bairro: "",
+    cep: ""
+  };
+};
+
+// Formatting helper
+const formatCurrency = (val: number) => {
+  return new Intl.NumberFormat("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  }).format(val);
+};
+
+// Module-level deduplication set to avoid infinite loops and parallel PDF compile storms across renders
+const globallyAttemptedPdfs = new Set<string>();
+let isPdfWorkerActive = false;
+
+export default function PendingRequestsTab() {
+  const { 
+    pendingRequests: requests, 
+    records: promaxRecords, 
+    vales: valesHistorico, 
+    repsList, 
+    motoristasList,
+    savePendingRequest,
+    deletePendingRequest,
+    saveValeEntry,
+    deleteValeEntry
+  } = useSstrData();
+
+  // Client-side sequential processor for compiling PDFs on demand via server API without saturating streams
+  useEffect(() => {
+    // Find requests that are concluded and need a compiled PDF and haven't been attempted yet
+    const pendingCompilations = requests.filter(req => {
+      const isConcluded = req.statusPromax === "cadastrado" || req.faltaBaixa === true;
+      const hasImage = req.fotoUrl && typeof req.fotoUrl === "string";
+      const isAlreadyPdf = hasImage && (req.fotoUrl.endsWith(".pdf") || req.fotoUrl.includes("pdf_finalizada_"));
+      return isConcluded && hasImage && !isAlreadyPdf && !globallyAttemptedPdfs.has(req.id);
+    });
+
+    if (pendingCompilations.length === 0 || isPdfWorkerActive) return;
+
+    // Run sequential background queue with throttle
+    isPdfWorkerActive = true;
+    (async () => {
+      try {
+        for (const req of pendingCompilations) {
+          const requestId = req.id;
+          globallyAttemptedPdfs.add(requestId); // Mark immediately to prevent loop
+
+          try {
+            const res = await fetch(getApiUrl("/api/compile-pdf"), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ requestId, docData: req })
+            });
+
+            if (res.ok) {
+              const data = await res.json();
+              if (data.success && data.url) {
+                const itemToUpdate = requests.find(item => item.id === requestId);
+                if (itemToUpdate) {
+                  await savePendingRequest({ ...itemToUpdate, fotoUrl: data.url });
+                }
+              }
+            }
+          } catch (err: any) {
+            console.warn(`[PDF-WORKER] Background compile attempt failed for ${requestId}:`, err?.message || err);
+          }
+          // Non-blocking 250ms delay between compilations to keep UI and network smooth
+          await new Promise(resolve => setTimeout(resolve, 250));
+        }
+      } finally {
+        isPdfWorkerActive = false;
+      }
+    })();
+  }, [requests, savePendingRequest]);
+
+  const [searchTerm, setSearchTerm] = useState("");
+  const deferredSearchTerm = useDeferredValue(searchTerm);
+
+  const [activeTab, setActiveTab] = useState<"pendente" | "cadastrado" | "reprovado" | "faltas_inversoes" | "historico_baixas" | "historico_vales" | "espelho">("pendente");
+  const [startDate, setStartDate] = useState<string>("");
+  const [endDate, setEndDate] = useState<string>("");
+  const [sectorFilter, setSectorFilter] = useState<string>("todos");
+  const [createdRoleFilter, setCreatedRoleFilter] = useState<"todos" | "motorista" | "rn" | "admin">("todos");
+  const [processTypeFilter, setProcessTypeFilter] = useState<string>("todos");
+  const [valeFilter, setValeFilter] = useState<"todos" | "sem_vale" | "com_vale">("todos");
+  const [dateSortOrder, setDateSortOrder] = useState<"desc" | "asc">("desc");
+  const [historicoBaixasStatusFilter, setHistoricoBaixasStatusFilter] = useState<"todos" | "aprovados" | "reprovados" | "baixados" | "pendentes" | "duplicatas">("todos");
+  const [onlyContingenciaFilter, setOnlyContingenciaFilter] = useState(false);
+  const [zoomPhoto, setZoomPhoto] = useState<string | null>(null);
+  const [inspectRequest, setInspectRequest] = useState<PendingRequest | null>(null);
+  const [openAvulsoTrigger, setOpenAvulsoTrigger] = useState<number>(0);
+  const [isEditFaltaMaximized, setIsEditFaltaMaximized] = useState(true);
+
+  // Pagination state for ultra-fast rendering & zero tab-switching lag
+  const [currentPage, setCurrentPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(30);
+
+  // Reset page to 1 when filters or tabs change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, startDate, endDate, sectorFilter, createdRoleFilter, processTypeFilter, valeFilter, activeTab, historicoBaixasStatusFilter]);
+
+  // Espelho de Reposições state variables
+  const [searchEspelho, setSearchEspelho] = useState("");
+
+  // Auto-migrate pre-existing non-motorista pending trocas to "cadastrado" so they exit Pending and remain in History
+  const hasMigratedStaleTrocas = useRef(false);
+  useEffect(() => {
+    if (hasMigratedStaleTrocas.current || !requests || requests.length === 0) return;
+    const stalePendingTrocas = requests.filter(req => {
+      return req.statusPromax === "pendente" && !isAllowedInPending(req, repsList, motoristasList);
+    });
+    if (stalePendingTrocas.length > 0) {
+      hasMigratedStaleTrocas.current = true;
+      stalePendingTrocas.forEach(req => {
+        savePendingRequest({
+          ...req,
+          statusPromax: "cadastrado"
+        });
+      });
+    }
+  }, [requests, repsList, motoristasList, savePendingRequest]);
+
+  // Auto-purge any historical vales that were generated for Inversion (inversão não gera vale)
+  const hasPurgedInversionVales = useRef(false);
+  useEffect(() => {
+    if (hasPurgedInversionVales.current || !valesHistorico || valesHistorico.length === 0) return;
+    const reqMap = new Map(requests.map(r => [r.id, r]));
+    let purgedAny = false;
+    valesHistorico.forEach(v => {
+      const targetReq = reqMap.get(v.requestId || v.originalRequest?.id) || v.originalRequest;
+      if (targetReq && (isSwapRequest(targetReq) || isInversaoOrSwapReq(targetReq) || isInversaoOrSwapReq(v))) {
+        deleteValeEntry(v.id);
+        purgedAny = true;
+      }
+    });
+    if (purgedAny) {
+      hasPurgedInversionVales.current = true;
+    }
+  }, [valesHistorico, requests, deleteValeEntry]);
+  const [filterEspelhoDate, setFilterEspelhoDate] = useState(() => {
+    return new Date().toLocaleDateString("pt-BR");
+  });
+  const [isPrintingEspelho, setIsPrintingEspelho] = useState(false);
+  const [espelhoPlates, setEspelhoPlates] = useState<Record<string, string>>({});
+  const [espelhoCityInputs, setEspelhoCityInputs] = useState<Record<string, string>>({});
+  const [espelhoStatusFilter, setEspelhoStatusFilter] = useState<"todos" | "pendentes" | "carregados" | "baixados">("todos");
+
+  // States for returning a card back to PENDENTE status via modal
+  const [returnToPendingModalReq, setReturnToPendingModalReq] = useState<PendingRequest | null>(null);
+  const [returnNewDeliveryDate, setReturnNewDeliveryDate] = useState<string>("");
+
+  const handleOpenReturnModal = (req: PendingRequest) => {
+    const defaultDate = new Date();
+    defaultDate.setDate(defaultDate.getDate() + 1);
+    const formattedDefault = defaultDate.toISOString().split("T")[0];
+
+    let initial = formattedDefault;
+    if (req.dataEntrega) {
+      if (req.dataEntrega.includes("/")) {
+        const [d, m, y] = req.dataEntrega.split("/");
+        if (d && m && y && y.length === 4) {
+          initial = `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+        }
+      } else if (req.dataEntrega.includes("-")) {
+        initial = req.dataEntrega;
+      }
+    }
+
+    setReturnNewDeliveryDate(initial);
+    setReturnToPendingModalReq(req);
+  };
+
+  const executeReturnToPending = async () => {
+    if (!returnToPendingModalReq) return;
+
+    let formattedDisplayDate = returnNewDeliveryDate.trim();
+    if (returnNewDeliveryDate.includes("-")) {
+      const [y, m, d] = returnNewDeliveryDate.trim().split("-");
+      if (y && m && d) {
+        formattedDisplayDate = `${d.padStart(2, "0")}/${m.padStart(2, "0")}/${y}`;
+      }
+    }
+
+    const updatedReq: PendingRequest = {
+      ...returnToPendingModalReq,
+      statusPromax: "pendente",
+      dataEntrega: formattedDisplayDate,
+      faltaBaixa: false,
+      faltaBaixaDate: undefined,
+      faltaBaixaUser: undefined,
+      faltaBaixaObs: undefined,
+      contingenciaBaixada: false,
+      contingenciaBaixadaDate: undefined,
+      contingenciaBaixadaUser: undefined,
+      cadastroUser: returnToPendingModalReq.cadastroUser || (typeof sessionStorage !== "undefined" ? sessionStorage.getItem("sstr_current_manager_name") : null) || undefined,
+      cadastroDate: returnToPendingModalReq.cadastroDate,
+      rejeitadoObs: undefined,
+      reprovadoUser: undefined,
+      reprovadoDate: undefined,
+      notified: false,
+      lembreteNotificacao: true,
+      observacao: (returnToPendingModalReq.observacao || "") + ` [Retornado p/ Pendente em ${new Date().toLocaleDateString("pt-BR")}]`
+    };
+
+    await savePendingRequest(updatedReq);
+    setReturnToPendingModalReq(null);
+    setActiveTab("pendente");
+  };
+
+  const handleOpenPrintEspelho = () => {
+    if (espelhoFiltrado.length === 0) {
+      alert("Nenhum registro encontrado para a visualização de impressão do Espelho.");
+      return;
+    }
+    setIsPrintingEspelho(true);
+  };
+
+  // Faltas & Inversões specific filters
+  const [lackFilterStatus, setLackFilterStatus] = useState<"todos" | "abertos" | "baixados">("abertos");
+  const [lackFilterErrorType, setLackFilterErrorType] = useState<"todos" | "carregamento" | "entrega" | "indefinido">("todos");
+
+  // States for physical settlement ("Dar Baixa" with signed receipt attachment)
+  const [baixandoFalta, setBaixandoFalta] = useState<PendingRequest | null>(null);
+
+  // States for Promax Contingency confirmation and settlement modal
+  const [confirmContingenciaReq, setConfirmContingenciaReq] = useState<PendingRequest | null>(null);
+  const [contingenciaConfirmChecked, setContingenciaConfirmChecked] = useState(false);
+  const [baixaReciboFile, setBaixaReciboFile] = useState<{ name: string; type: string; dataUrl: string } | null>(null);
+  const [baixaObservacao, setBaixaObservacao] = useState("");
+  const [baixaError, setBaixaError] = useState("");
+  const [concludedBaixa, setConcludedBaixa] = useState<any | null>(null);
+
+  // States for physical delivery reminders (Exactly 1 day before delivery date)
+  const [showReminderPopup, setShowReminderPopup] = useState(false);
+  const [dismissedReminderToday, setDismissedReminderToday] = useState(false);
+
+  // States for interactive actions
+  const [modalAction, setModalAction] = useState<{
+    type: "register" | "reject" | "corrigir" | "delete";
+    requestId: string;
+  } | null>(null);
+  const [modalInput, setModalInput] = useState("");
+  const [modalError, setModalError] = useState("");
+
+  // Edit shortage/inversion details states
+  const [editingFalta, setEditingFalta] = useState<PendingRequest | null>(null);
+  const [editFaltaErrorType, setEditFaltaErrorType] = useState<"carregamento" | "entrega" | "">("");
+  const [editFaltaPhoto, setEditFaltaPhoto] = useState("");
+  const [editFaltaMotorista, setEditFaltaMotorista] = useState("");
+  const [editFaltaMotoristaCpf, setEditFaltaMotoristaCpf] = useState("");
+  const [editFaltaAjudantes, setEditFaltaAjudantes] = useState("");
+  const [editFaltaAjudante1, setEditFaltaAjudante1] = useState("");
+  const [editFaltaAjudante1Cpf, setEditFaltaAjudante1Cpf] = useState("");
+  const [editFaltaAjudante2, setEditFaltaAjudante2] = useState("");
+  const [editFaltaAjudante2Cpf, setEditFaltaAjudante2Cpf] = useState("");
+  const [editFaltaDataAnomalia, setEditFaltaDataAnomalia] = useState("");
+  const [editFaltaDataEntrega, setEditFaltaDataEntrega] = useState("");
+  const [editFaltaObservacao, setEditFaltaObservacao] = useState("");
+  const [editFaltaCidade, setEditFaltaCidade] = useState("");
+
+  // Dynamic Crew & Rateio state for editing lack/anomalia in Classification Modal
+  const [editFaltaCrew, setEditFaltaCrew] = useState<Array<{ id: string; role: string; name: string; cpf: string; isExempt?: boolean }>>([
+    { id: "1", role: "Motorista", name: "", cpf: "", isExempt: false },
+    { id: "2", role: "Ajudante 1", name: "", cpf: "", isExempt: false }
+  ]);
+
+  const handleSetEditFaltaCrewQuantity = (qty: number) => {
+    if (qty < 1) return;
+    setEditFaltaCrew(prev => {
+      if (qty === prev.length) return prev;
+      if (qty < prev.length) return prev.slice(0, qty);
+      const next = [...prev];
+      for (let i = prev.length; i < qty; i++) {
+        const role = i === 0 ? "Motorista" : `Ajudante ${i > 1 ? i : ""}`.trim();
+        next.push({ id: `ef_crew_${Date.now()}_${i}`, role: role || `Ajudante ${i}`, name: "", cpf: "", isExempt: false });
+      }
+      return next;
+    });
+  };
+
+  const handleUpdateEditFaltaCrewMember = (index: number, field: "role" | "name" | "cpf" | "isExempt", val: any) => {
+    setEditFaltaCrew(prev => {
+      const next = [...prev];
+      if (!next[index]) return prev;
+      if (field === "name") {
+        const clean = String(val).toUpperCase();
+        const match = getCrewDetailByName(clean);
+        const isX = isDriverX(clean);
+        next[index] = {
+          ...next[index],
+          name: clean,
+          cpf: match?.cpf ? match.cpf : (isX ? "000.000.000-00" : next[index].cpf),
+          isExempt: isX ? true : next[index].isExempt
+        };
+      } else {
+        next[index] = { ...next[index], [field]: val };
+      }
+      return next;
+    });
+  };
+
+  // Document print state
+  const [selectedPrintDoc, setSelectedPrintDoc] = useState<{
+    type: "recibo" | "vale";
+    request: PendingRequest;
+  } | null>(null);
+  const [customPrintCidade, setCustomPrintCidade] = useState("");
+  const [customPrintNome, setCustomPrintNome] = useState("");
+  const [customPrintFantasia, setCustomPrintFantasia] = useState("");
+  const [customPrintDocumento, setCustomPrintDocumento] = useState("");
+  const [customPrintEndereco, setCustomPrintEndereco] = useState("");
+
+  useEffect(() => {
+    if (selectedPrintDoc) {
+      const cast = selectedPrintDoc.request as any;
+      const pdvDb = getPdvDatabase();
+      const clientInfo = getClientDetails(selectedPrintDoc.request.nb, pdvDb, promaxRecords);
+      setCustomPrintCidade(cast.municipioRecibo || clientInfo.municipio || "");
+      setCustomPrintNome(cast.nomeRecibo || clientInfo.razaoSocial || "");
+      setCustomPrintFantasia(cast.nomeFantasiaRecibo || clientInfo.nomeFantasia || clientInfo.razaoSocial || "");
+      setCustomPrintDocumento(cast.documentoRecibo || clientInfo.documento || "");
+      setCustomPrintEndereco(cast.enderecoRecibo || clientInfo.endereco || "");
+    } else {
+      setCustomPrintCidade("");
+      setCustomPrintNome("");
+      setCustomPrintFantasia("");
+      setCustomPrintDocumento("");
+      setCustomPrintEndereco("");
+    }
+  }, [selectedPrintDoc, promaxRecords]);
+
+  const handleUpdatePrintCidade = (newCity: string) => {
+    setCustomPrintCidade(newCity);
+    if (selectedPrintDoc) {
+      const targetReq = requests.find(r => r.id === selectedPrintDoc.request.id);
+      if (targetReq) {
+        savePendingRequest({
+          ...targetReq,
+          municipioRecibo: newCity || undefined,
+        });
+      }
+
+      setSelectedPrintDoc(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          request: {
+            ...prev.request,
+            municipioRecibo: newCity || undefined,
+          }
+        };
+      });
+    }
+  };
+
+  const handleUpdatePrintNome = (newName: string) => {
+    setCustomPrintNome(newName);
+    if (selectedPrintDoc) {
+      const targetReq = requests.find(r => r.id === selectedPrintDoc.request.id);
+      if (targetReq) {
+        savePendingRequest({
+          ...targetReq,
+          nomeRecibo: newName || undefined,
+        });
+      }
+
+      setSelectedPrintDoc(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          request: {
+            ...prev.request,
+            nomeRecibo: newName || undefined,
+          }
+        };
+      });
+    }
+  };
+
+  const handleUpdatePrintDocumento = (newDoc: string) => {
+    setCustomPrintDocumento(newDoc);
+    if (selectedPrintDoc) {
+      const targetReq = requests.find(r => r.id === selectedPrintDoc.request.id);
+      if (targetReq) {
+        savePendingRequest({
+          ...targetReq,
+          documentoRecibo: newDoc || undefined,
+        });
+      }
+
+      setSelectedPrintDoc(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          request: {
+            ...prev.request,
+            documentoRecibo: newDoc || undefined,
+          }
+        };
+      });
+    }
+  };
+
+  const handleUpdatePrintEndereco = (newEnd: string) => {
+    setCustomPrintEndereco(newEnd);
+    if (selectedPrintDoc) {
+      const targetReq = requests.find(r => r.id === selectedPrintDoc.request.id);
+      if (targetReq) {
+        savePendingRequest({
+          ...targetReq,
+          enderecoRecibo: newEnd || undefined,
+        });
+      }
+
+      setSelectedPrintDoc(prev => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          request: {
+            ...prev.request,
+            enderecoRecibo: newEnd || undefined,
+          }
+        };
+      });
+    }
+  };
+
+  // Delete a single voucher from historical log
+  const handleDeleteSingleVale = (id: string) => {
+    deleteValeEntry(id);
+  };
+
+  // Update status of a voucher (Pendente, Assinado, Compensado)
+  const handleUpdateValeStatus = (id: string, newStatus: "pendente" | "assinado" | "compensado") => {
+    const vale = valesHistorico.find(v => v.id === id);
+    if (vale) {
+      saveValeEntry({ ...vale, status: newStatus });
+    }
+  };
+
+  // Open confirmation modal to settle Promax Contingency Alert
+  const handleBaixaContingencia = (reqId: string) => {
+    const req = requests.find(r => r.id === reqId);
+    if (!req) return;
+    setConfirmContingenciaReq(req);
+    setContingenciaConfirmChecked(false);
+  };
+
+  // Execute settlement after user confirmation
+  const executeBaixaContingencia = async (reqId: string) => {
+    const req = requests.find(r => r.id === reqId);
+    if (!req) return;
+    const loggedManager = sessionStorage.getItem("sstr_current_manager_name") || "Gestor";
+    const now = new Date();
+    const dataFormatada = `${now.toLocaleDateString("pt-BR")} às ${now.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
+    const updatedReq: PendingRequest = {
+      ...req,
+      emContingencia: false,
+      contingenciaBaixada: true,
+      contingenciaBaixadaDate: dataFormatada,
+      contingenciaBaixadaUser: loggedManager
+    };
+    await savePendingRequest(updatedReq);
+  };
+
+  // Undo settlement / Revert Contingency
+  const handleDesfazerBaixaContingencia = async (reqId: string) => {
+    const req = requests.find(r => r.id === reqId);
+    if (!req) return;
+
+    const updatedReq: PendingRequest = {
+      ...req,
+      emContingencia: true,
+      contingenciaBaixada: false,
+      contingenciaBaixadaDate: undefined,
+      contingenciaBaixadaUser: undefined
+    };
+
+    await savePendingRequest(updatedReq);
+  };
+
+  // Delete an approved item / request from Espelho do Dia and Approved list
+  const handleDeleteApprovedItem = (requestId: string, productCode?: string) => {
+    const targetReq = requests.find(r => r.id === requestId);
+    if (!targetReq) return;
+
+    if (targetReq.items && targetReq.items.length > 1 && productCode) {
+      const filteredItems = targetReq.items.filter((it: any) => (it.item || it.itemCode) !== productCode);
+      if (filteredItems.length > 0) {
+        savePendingRequest({
+          ...targetReq,
+          items: filteredItems
+        });
+        return;
+      }
+    }
+
+    deletePendingRequest(requestId);
+  };
+
+  // Editable state for Items inside the Reimprimir / Print Modal
+  const [printDocItems, setPrintDocItems] = useState<any[]>([]);
+
+  // Editable state for Crew / Collaborators inside the Vale Print Modal
+  const [printValeCrew, setPrintValeCrew] = useState<Array<{
+    id: string;
+    role: string;
+    name: string;
+    cpf: string;
+    isExempt?: boolean;
+  }>>([]);
+
+  // Initialize printDocItems when selectedPrintDoc changes
+  useEffect(() => {
+    if (selectedPrintDoc) {
+      const req = selectedPrintDoc.request;
+      const baseItems = req.items && req.items.length > 0 ? req.items : [
+        {
+          id: "1",
+          item: req.item || "SKU_GENERIC",
+          descricao: req.productDesc || "PRODUTO EM COMPENSAÇÃO SSTR",
+          quantidade: req.quantidade || 1,
+          unidadeMedida: req.unidadeMedida || "cx",
+          hectolitros: req.hectolitros || 0.1200,
+          motivo: req.motivo || "Falta de SKU"
+        } as RequestItem
+      ];
+
+      const isValeDoc = selectedPrintDoc.type === "vale" || (req.motivo || "").toLowerCase().includes("falta") || (req.motivo || "").toLowerCase().includes("vale");
+
+      setPrintDocItems(baseItems.map((it: any) => {
+        const itemCode = String(it.item || it.itemCode || "SKU_GENERIC").trim();
+        const cleanCode = itemCode.replace(/^#/, "").trim().replace(/^0+/, "");
+        const numericCode = itemCode.replace(/[^0-9]/g, "");
+
+        const dbProduct = PRODUCT_DATABASE.find(p => 
+          p.codigo === itemCode || 
+          p.codigo === cleanCode || 
+          (numericCode && (p.codigo === numericCode || p.codigo.replace(/^0+/, "") === numericCode))
+        );
+
+        const embalagem = dbProduct?.fator && dbProduct.fator > 0 ? dbProduct.fator : (it.fatorEmbalagem || 12);
+        const promaxRecord = promaxRecords.find(r => r.produto === itemCode);
+        const promaxPrice = promaxRecord?.valorUnitario || 0;
+
+        const umStr = (it.unidadeMedida || req.unidadeMedida || req.um || "cx").toLowerCase().trim();
+        const isUnd = umStr === "und" || umStr === "un" || umStr === "unidade" || umStr === "unidades";
+        const um = isUnd ? "und" : "cx";
+
+        // Determine official box price
+        let officialBoxPrice = dbProduct?.valor || 0;
+        if (!officialBoxPrice || officialBoxPrice <= 0) {
+          if (promaxPrice > 0) {
+            officialBoxPrice = promaxPrice < 15 ? (promaxPrice * embalagem) : promaxPrice;
+          } else if (it.customUnitPrice && Number(it.customUnitPrice) > 0) {
+            const cu = Number(it.customUnitPrice);
+            officialBoxPrice = cu < 15 ? (cu * embalagem) : cu;
+          }
+        }
+        if (!officialBoxPrice || officialBoxPrice <= 0) officialBoxPrice = 98.50;
+
+        // Calculate unit price according to unit of measure (UND vs CX/SKU)
+        let displayPrice = 0;
+        if (it.customUnitPrice && Number(it.customUnitPrice) > 0) {
+          const cu = Number(it.customUnitPrice);
+          displayPrice = isUnd ? (cu > 15 ? cu / embalagem : cu) : (cu < 15 ? cu * embalagem : cu);
+        } else {
+          displayPrice = isUnd ? (officialBoxPrice / embalagem) : officialBoxPrice;
+        }
+
+        const qty = Number(it.quantidade) || 1;
+        const hl = calculateItemHL({
+          item: itemCode,
+          quantidade: qty,
+          unidadeMedida: um,
+          fatorEmbalagem: embalagem,
+          fatorHecto: it.fatorHecto
+        });
+
+        return {
+          ...it,
+          itemCode,
+          quantidade: qty,
+          unidadeMedida: um,
+          hectolitros: hl,
+          customUnitPrice: Number(displayPrice.toFixed(2))
+        };
+      }));
+
+      // Initialize Vale Crew if this is a Vale document
+      if (selectedPrintDoc.type === "vale") {
+        const cast = req as any;
+        const reqSetor = req.setor || "";
+        const rotasDb = getMotoristasRotas ? getMotoristasRotas() : {};
+        const routeDefault = rotasDb[reqSetor];
+
+        let crew: Array<{ id: string; role: string; name: string; cpf: string; isExempt?: boolean }> = [];
+
+        if (cast.faltaCrewList && Array.isArray(cast.faltaCrewList) && cast.faltaCrewList.length > 0) {
+          crew = cast.faltaCrewList.map((m: any, idx: number) => ({
+            id: m.id || `crew_${idx}`,
+            role: m.role || (idx === 0 ? "Motorista" : `Ajudante ${idx}`),
+            name: (m.name || "").trim().toUpperCase(),
+            cpf: m.cpf || "",
+            isExempt: !!m.isExempt || isDriverX(m.name)
+          }));
+        } else {
+          const rawDriver = cast.faltaMotorista || (cast.motorista && cast.motorista !== "Não Declarado" ? cast.motorista : "") || routeDefault?.nome || "";
+          const driverName = (rawDriver || "").trim().toUpperCase();
+          const driverCpf = cast.faltaMotoristaCpf || (cast.motoristaCpf || "") || (routeDefault as any)?.cpf || "";
+
+          let h1Name = (cast.faltaAjudante1 || cast.ajudante1 || "").trim().toUpperCase();
+          let h1Cpf = cast.faltaAjudante1Cpf || cast.ajudante1Cpf || "";
+          let h2Name = (cast.faltaAjudante2 || cast.ajudante2 || "").trim().toUpperCase();
+          let h2Cpf = cast.faltaAjudante2Cpf || cast.ajudante2Cpf || "";
+          let h3Name = (cast.faltaAjudante3 || cast.ajudante3 || "").trim().toUpperCase();
+          let h3Cpf = cast.faltaAjudante3Cpf || cast.ajudante3Cpf || "";
+
+          const csvHelpers = cast.faltaAjudantes || cast.ajudantes;
+          if (!h1Name && csvHelpers && csvHelpers.trim() && csvHelpers.toUpperCase() !== "NÃO DECLARADOS") {
+            const parts = csvHelpers.split(",").map((s: string) => s.trim().toUpperCase()).filter(Boolean);
+            if (parts[0]) h1Name = parts[0];
+            if (parts[1]) h2Name = parts[1];
+            if (parts[2]) h3Name = parts[2];
+          }
+
+          crew.push({
+            id: `crew_0`,
+            role: "Motorista",
+            name: driverName,
+            cpf: driverCpf || (getCrewDetailByName(driverName)?.cpf || ""),
+            isExempt: isDriverX(driverName)
+          });
+
+          if (h1Name) {
+            crew.push({
+              id: `crew_1`,
+              role: "Ajudante 1",
+              name: h1Name,
+              cpf: h1Cpf || (getCrewDetailByName(h1Name)?.cpf || ""),
+              isExempt: false
+            });
+          }
+
+          if (h2Name) {
+            crew.push({
+              id: `crew_2`,
+              role: "Ajudante 2",
+              name: h2Name,
+              cpf: h2Cpf || (getCrewDetailByName(h2Name)?.cpf || ""),
+              isExempt: false
+            });
+          }
+
+          if (h3Name) {
+            crew.push({
+              id: `crew_3`,
+              role: "Ajudante 3",
+              name: h3Name,
+              cpf: h3Cpf || (getCrewDetailByName(h3Name)?.cpf || ""),
+              isExempt: false
+            });
+          }
+
+          if (crew.length === 1) {
+            crew.push({
+              id: `crew_1`,
+              role: "Ajudante 1",
+              name: "",
+              cpf: "",
+              isExempt: false
+            });
+          }
+        }
+        setPrintValeCrew(crew);
+      } else {
+        setPrintValeCrew([]);
+      }
+    } else {
+      setPrintDocItems([]);
+      setPrintValeCrew([]);
+    }
+  }, [selectedPrintDoc, promaxRecords]);
+
+  // Handlers for dynamic collaborator selection and quantity in Vale print modal
+  const handleSetPrintValeCrewQuantity = (qty: number) => {
+    if (qty < 1) return;
+    setPrintValeCrew(prev => {
+      if (qty === prev.length) return prev;
+      if (qty < prev.length) {
+        return prev.slice(0, qty);
+      }
+      const next = [...prev];
+      for (let i = prev.length; i < qty; i++) {
+        const role = i === 0 ? "Motorista" : `Ajudante ${i > 1 ? i : ""}`.trim();
+        next.push({
+          id: `crew_${Date.now()}_${i}`,
+          role: role || `Ajudante ${i}`,
+          name: "",
+          cpf: "",
+          isExempt: false
+        });
+      }
+      return next;
+    });
+  };
+
+  const handleUpdatePrintValeCrewMember = (
+    index: number,
+    field: "role" | "name" | "cpf" | "isExempt",
+    value: any
+  ) => {
+    setPrintValeCrew(prev => {
+      const updated = [...prev];
+      if (!updated[index]) return prev;
+
+      if (field === "name") {
+        const cleanVal = String(value).toUpperCase();
+        const match = getCrewDetailByName(cleanVal);
+        const isX = isDriverX(cleanVal);
+        updated[index] = {
+          ...updated[index],
+          name: cleanVal,
+          cpf: match?.cpf ? match.cpf : (isX ? "000.000.000-00" : updated[index].cpf),
+          isExempt: isX ? true : updated[index].isExempt
+        };
+      } else {
+        updated[index] = {
+          ...updated[index],
+          [field]: value
+        };
+      }
+      return updated;
+    });
+  };
+
+  const handleAddPrintValeCrewMember = () => {
+    setPrintValeCrew(prev => [
+      ...prev,
+      {
+        id: `crew_${Date.now()}_${prev.length}`,
+        role: `Ajudante ${prev.length > 1 ? prev.length : ""}`.trim() || `Ajudante ${prev.length}`,
+        name: "",
+        cpf: "",
+        isExempt: false
+      }
+    ]);
+  };
+
+  const handleRemovePrintValeCrewMember = (index: number) => {
+    setPrintValeCrew(prev => {
+      if (prev.length <= 1) return prev;
+      return prev.filter((_, i) => i !== index);
+    });
+  };
+
+  // Handle live updating of quantity, unit, or unit price in print modal
+  const handleUpdatePrintDocItem = (index: number, field: string, value: any) => {
+    setPrintDocItems(prev => {
+      const updated = [...prev];
+      const prevItem = updated[index];
+      const item = { ...prevItem, [field]: value };
+      
+      const code = item.item || item.itemCode || "";
+      const qty = Number(item.quantidade) || 0;
+      const factor = getHectoFactor(code);
+      const cleanCode = String(code).replace(/^#/, "").trim().replace(/^0+/, "");
+      const numericCode = String(code).replace(/[^0-9]/g, "");
+      const dbProduct = PRODUCT_DATABASE.find(p => 
+        p.codigo === code || 
+        p.codigo === cleanCode || 
+        (numericCode && (p.codigo === numericCode || p.codigo.replace(/^0+/, "") === numericCode))
+      );
+      const embalagem = dbProduct?.fator && dbProduct.fator > 0 ? dbProduct.fator : (item.fatorEmbalagem || 12);
+      const boxPrice = dbProduct?.valor || 0;
+
+      const umStr = String(item.unidadeMedida || "cx").toLowerCase().trim();
+      const isUnd = umStr === "und" || umStr === "un" || umStr === "unidade" || umStr === "unidades";
+      item.unidadeMedida = isUnd ? "und" : "cx";
+
+      if (field === "unidadeMedida") {
+        if (boxPrice > 0) {
+          item.customUnitPrice = isUnd ? Number((boxPrice / embalagem).toFixed(2)) : boxPrice;
+        }
+      }
+
+      item.hectolitros = calculateItemHL({
+        codigo: code,
+        quantidade: qty,
+        unidadeMedida: isUnd ? "un" : "cx",
+        fatorEmbalagem: dbProduct?.fator || embalagem,
+        fatorHecto: factor,
+        descricao: item.itemDesc || dbProduct?.descricao,
+        motivo: "falta"
+      });
+
+      updated[index] = item;
+      return updated;
+    });
+  };
+
+  // Handle saving modifications made in the print modal back to storage
+  const handleSavePrintDocEdits = async () => {
+    if (!selectedPrintDoc) return;
+    const req = selectedPrintDoc.request;
+    const reqId = req.id;
+
+    // 1. Process and normalize items from printDocItems
+    const updatedItems = (printDocItems.length > 0 ? printDocItems : (req.items || [])).map((it: any) => {
+      const itemCode = String(it.item || it.itemCode || req.item || "9999").trim();
+      const cleanCode = itemCode.replace(/^#/, "").trim().replace(/^0+/, "");
+      const dbProduct = PRODUCT_DATABASE.find(p => p.codigo === itemCode || p.codigo === cleanCode);
+      const embalagem = dbProduct?.fator && dbProduct.fator > 0 ? dbProduct.fator : (it.fatorEmbalagem || 12);
+      const umStr = String(it.unidadeMedida || req.unidadeMedida || "cx").toLowerCase().trim();
+      const isUnd = umStr === "und" || umStr === "un" || umStr === "unidade" || umStr === "unidades";
+      const um = isUnd ? "und" : "cx";
+
+      let boxPrice = dbProduct?.valor || 0;
+      if (!boxPrice || boxPrice <= 0) {
+        const promaxMatch = promaxRecords.find(r => r.produto === itemCode || r.produto === cleanCode);
+        if (promaxMatch?.valorUnitario && promaxMatch.valorUnitario > 0) {
+          boxPrice = promaxMatch.valorUnitario < 15 ? (promaxMatch.valorUnitario * embalagem) : promaxMatch.valorUnitario;
+        }
+      }
+      if (!boxPrice || boxPrice <= 0) boxPrice = 98.50;
+
+      let displayPrice = 0;
+      if (it.customUnitPrice && Number(it.customUnitPrice) > 0) {
+        const cu = Number(it.customUnitPrice);
+        displayPrice = isUnd ? (cu > 15 ? cu / embalagem : cu) : (cu < 15 ? cu * embalagem : cu);
+      } else {
+        displayPrice = isUnd ? (boxPrice / embalagem) : boxPrice;
+      }
+
+      const qty = Number(it.quantidade) || 1;
+      const hl = calculateItemHL({
+        item: itemCode,
+        quantidade: qty,
+        unidadeMedida: um,
+        fatorEmbalagem: embalagem,
+        fatorHecto: it.fatorHecto
+      });
+
+      return {
+        ...it,
+        item: itemCode,
+        quantidade: qty,
+        unidadeMedida: um,
+        customUnitPrice: displayPrice,
+        hectolitros: hl
+      };
+    });
+
+    const totalQty = updatedItems.reduce((acc, it) => acc + (Number(it.quantidade) || 0), 0);
+    const totalHl = updatedItems.reduce((acc, it) => acc + (Number(it.hectolitros) || 0), 0);
+
+    // 2. Build updated request object and calculate correct valorTotal & hectolitros
+    const intermediateReq: any = {
+      ...req,
+      items: updatedItems,
+      quantidade: totalQty,
+      hectolitros: totalHl,
+      unidadeMedida: updatedItems[0]?.unidadeMedida || req.unidadeMedida || "cx"
+    };
+
+    if (selectedPrintDoc.type === "vale" && printValeCrew.length > 0) {
+      const driverMember = printValeCrew.find(c => c.role.toLowerCase().includes("motorista")) || printValeCrew[0];
+      const helperMembers = printValeCrew.filter(c => c !== driverMember);
+
+      intermediateReq.faltaCrewList = printValeCrew;
+      intermediateReq.faltaQtdColaboradores = printValeCrew.length;
+      intermediateReq.faltaMotorista = driverMember?.name || "";
+      intermediateReq.faltaMotoristaCpf = driverMember?.cpf || "";
+      intermediateReq.faltaAjudante1 = helperMembers[0]?.name || "";
+      intermediateReq.faltaAjudante1Cpf = helperMembers[0]?.cpf || "";
+      intermediateReq.faltaAjudante2 = helperMembers[1]?.name || "";
+      intermediateReq.faltaAjudante2Cpf = helperMembers[1]?.cpf || "";
+      intermediateReq.faltaAjudante3 = helperMembers[2]?.name || "";
+      intermediateReq.faltaAjudante3Cpf = helperMembers[2]?.cpf || "";
+      intermediateReq.faltaAjudantes = helperMembers.map(h => h.name).filter(Boolean).join(", ");
+    }
+
+    const { valorTotal: newCalcValue, hectolitros: newCalcHl } = calculateRequestValueAndHL(intermediateReq, promaxRecords);
+
+    const updatedRequest = {
+      ...intermediateReq,
+      valorTotal: newCalcValue,
+      hectolitros: newCalcHl
+    };
+
+    // 3. Save to pendingRequests if found
+    const targetReq = requests.find(r => r.id === reqId || (r.nf && r.nf !== "N0-NF" && r.nf === req.nf));
+    if (targetReq) {
+      await savePendingRequest({
+        ...targetReq,
+        ...updatedRequest,
+        id: targetReq.id
+      });
+    }
+
+    // 4. Save to valesHistorico if found
+    const targetVale = valesHistorico.find(v =>
+      v.id === reqId ||
+      v.requestId === reqId ||
+      v.originalRequest?.id === reqId ||
+      (v.nf && v.nf !== "N0-NF" && v.nf === req.nf)
+    );
+
+    if (targetVale) {
+      const driverMember = printValeCrew.length > 0 ? (printValeCrew.find(c => c.role.toLowerCase().includes("motorista")) || printValeCrew[0]) : null;
+      const helperMembers = printValeCrew.length > 0 ? printValeCrew.filter(c => c !== driverMember) : [];
+
+      const updatedVale: ValeEntry = {
+        ...targetVale,
+        valorTotal: newCalcValue,
+        hectolitros: newCalcHl,
+        itemsCount: totalQty,
+        ...(selectedPrintDoc.type === "vale" && printValeCrew.length > 0 ? {
+          motorista: driverMember?.name || targetVale.motorista,
+          motoristaCpf: driverMember?.cpf || targetVale.motoristaCpf,
+          ajudante1: helperMembers[0]?.name || "",
+          ajudante1Cpf: helperMembers[0]?.cpf || "",
+          ajudante2: helperMembers[1]?.name || "",
+          ajudante2Cpf: helperMembers[1]?.cpf || "",
+          ajudantes: helperMembers.map(h => h.name).filter(Boolean).join(", "),
+          crewList: printValeCrew,
+          quantidadeColaboradores: printValeCrew.length
+        } : {}),
+        originalRequest: {
+          ...(targetVale.originalRequest || {}),
+          ...updatedRequest
+        }
+      };
+      await saveValeEntry(updatedVale);
+    } else if (selectedPrintDoc.type === "vale") {
+      // Create new vale entry if missing
+      const cast = updatedRequest as any;
+      const deterministicId = `vale_${reqId}`;
+      const driverMember = printValeCrew.find(c => c.role.toLowerCase().includes("motorista")) || printValeCrew[0];
+      const helperMembers = printValeCrew.filter(c => c !== driverMember);
+
+      const newValeEntry: ValeEntry = {
+        id: deterministicId,
+        requestId: reqId,
+        nf: req.nf || "N0-NF",
+        rota: req.setor || "R00",
+        dataEmissao: cast.dataEntregaRecibo || new Date().toLocaleDateString("pt-BR"),
+        motorista: driverMember?.name || cast.faltaMotorista || "Não Declarado",
+        motoristaCpf: driverMember?.cpf || cast.faltaMotoristaCpf || "",
+        ajudantes: helperMembers.map(h => h.name).filter(Boolean).join(", ") || cast.faltaAjudantes || "",
+        ajudante1: helperMembers[0]?.name || cast.faltaAjudante1 || "",
+        ajudante1Cpf: helperMembers[0]?.cpf || cast.faltaAjudante1Cpf || "",
+        ajudante2: helperMembers[1]?.name || cast.faltaAjudante2 || "",
+        ajudante2Cpf: helperMembers[1]?.cpf || cast.faltaAjudante2Cpf || "",
+        hectolitros: newCalcHl,
+        valorTotal: newCalcValue,
+        itemsCount: totalQty,
+        status: "emitido",
+        crewList: printValeCrew,
+        quantidadeColaboradores: printValeCrew.length,
+        originalRequest: updatedRequest
+      };
+      await saveValeEntry(newValeEntry);
+    }
+
+    // 5. Update UI active modal state so it reflects immediately
+    setPrintDocItems(updatedItems);
+    setSelectedPrintDoc({
+      ...selectedPrintDoc,
+      request: updatedRequest
+    });
+
+    window.dispatchEvent(new Event("storage"));
+    alert(`Alterações salvas com sucesso!\nNovo Valor Total: R$ ${newCalcValue.toFixed(2).replace(".", ",")}\nTotal HL: ${newCalcHl.toFixed(4)} HL\nEquipe: ${printValeCrew.length > 0 ? `${printValeCrew.length} colaboradores configurados` : "Salva"}`);
+  };
+
+  // Handler for creating an ad-hoc voucher (Vale Avulso)
+  const handleCreateAvulsoVale = async (data: {
+    mapa: string;
+    itemCode: string;
+    itemDesc?: string;
+    data: string;
+    quantidade: number;
+    unidadeMedida: "cx" | "und";
+    motorista: string;
+    ajudantes: string;
+    observacao: string;
+    crewList?: Array<{ role: string; name: string; cpf?: string; isExempt?: boolean }>;
+    quantidadeColaboradores?: number;
+  }) => {
+    const code = data.itemCode.trim();
+    const cleanCode = code.replace(/^0+/, "");
+    const prodsDb = getProductsDatabase();
+    const dbProduct = prodsDb.find(p => p.codigo === code || p.codigo === cleanCode || p.descricao.toLowerCase().includes(code.toLowerCase()));
+
+    const factor = dbProduct?.fatorHecto || getHectoFactor(code);
+    const embalagem = dbProduct?.fator || 12;
+    const isUnd = data.unidadeMedida === "und";
+    const hl = isUnd ? Number((data.quantidade * (factor / embalagem)).toFixed(4)) : Number((data.quantidade * factor).toFixed(4));
+
+    let boxPrice = dbProduct?.valor || 0;
+    if (!boxPrice || boxPrice <= 0) {
+      const promaxMatch = promaxRecords.find(r => r.produto === code || r.produto === cleanCode);
+      if (promaxMatch?.valorUnitario && promaxMatch.valorUnitario > 0) {
+        boxPrice = promaxMatch.valorUnitario < 15 ? (promaxMatch.valorUnitario * embalagem) : promaxMatch.valorUnitario;
+      }
+    }
+    const unitPrice = isUnd ? Number((boxPrice / embalagem).toFixed(2)) : boxPrice;
+    const totalPrice = Number((unitPrice * data.quantidade).toFixed(2));
+
+    const reqId = `req_avulso_${Date.now()}`;
+    const valeId = `vale_avulso_${Date.now()}`;
+    const loggedUser = sessionStorage.getItem("sstr_current_manager_name") || "Gestor";
+
+    const driverMember = data.crewList && data.crewList.length > 0 
+      ? (data.crewList.find(c => c.role.toLowerCase().includes("motorista")) || data.crewList[0]) 
+      : null;
+    const helperMembers = data.crewList && data.crewList.length > 0 
+      ? data.crewList.filter(c => c !== driverMember) 
+      : [];
+
+    const effectiveMotorista = driverMember?.name || data.motorista || "Não Declarado";
+    const effectiveMotoristaCpf = driverMember?.cpf || (getCrewDetailByName(effectiveMotorista)?.cpf || "");
+    const effectiveAjudantes = helperMembers.length > 0 
+      ? helperMembers.map(h => h.name).filter(Boolean).join(", ") 
+      : data.ajudantes;
+
+    const newRequest: PendingRequest = {
+      id: reqId,
+      timestamp: Date.now(),
+      data: data.data || new Date().toLocaleDateString("pt-BR"),
+      setor: "AVULSO",
+      mapa: data.mapa.trim() || "MAPA-AVULSO",
+      nb: "000000",
+      nf: `VALE-${data.mapa.trim() || Date.now().toString().slice(-4)}`,
+      fotoUrl: "",
+      observacao: `[VALE AVULSO] Motorista: ${effectiveMotorista} | Ajudante: ${effectiveAjudantes}${data.observacao ? ` | Obs: ${data.observacao}` : ""}`,
+      statusPromax: "cadastrado",
+      notified: true,
+      reviewedByControle: true,
+      faltaTipoErro: "entrega",
+      cadastroUser: loggedUser,
+      cadastroDate: new Date().toLocaleDateString("pt-BR") + " " + new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }),
+      quantidade: data.quantidade,
+      hectolitros: hl,
+      valorTotal: totalPrice,
+      unidadeMedida: data.unidadeMedida || "cx",
+      faltaMotorista: effectiveMotorista,
+      faltaMotoristaCpf: effectiveMotoristaCpf,
+      faltaAjudantes: effectiveAjudantes,
+      faltaAjudante1: helperMembers[0]?.name || (effectiveAjudantes.split(",")[0]?.trim() || ""),
+      faltaAjudante1Cpf: helperMembers[0]?.cpf || "",
+      faltaAjudante2: helperMembers[1]?.name || (effectiveAjudantes.split(",")[1]?.trim() || ""),
+      faltaAjudante2Cpf: helperMembers[1]?.cpf || "",
+      faltaAjudante3: helperMembers[2]?.name || (effectiveAjudantes.split(",")[2]?.trim() || ""),
+      faltaAjudante3Cpf: helperMembers[2]?.cpf || "",
+      faltaCrewList: data.crewList,
+      faltaQtdColaboradores: data.crewList?.length || (effectiveAjudantes ? 2 : 1),
+      items: [
+        {
+          id: `item_avulso_1`,
+          item: dbProduct?.codigo || code,
+          itemCode: dbProduct?.codigo || code,
+          descricao: dbProduct?.descricao || data.itemDesc || `SKU ${code}`,
+          quantidade: data.quantidade,
+          unidadeMedida: data.unidadeMedida || "cx",
+          fatorEmbalagem: embalagem,
+          fatorHecto: factor,
+          hectolitros: hl,
+          customUnitPrice: unitPrice,
+          precoCalculated: totalPrice,
+          motivo: "vale avulso"
+        }
+      ]
+    };
+
+    const newVale: ValeEntry = {
+      id: valeId,
+      requestId: reqId,
+      nf: newRequest.nf,
+      rota: "AVULSO",
+      dataEmissao: data.data || new Date().toLocaleDateString("pt-BR"),
+      motorista: effectiveMotorista,
+      motoristaCpf: effectiveMotoristaCpf,
+      ajudantes: effectiveAjudantes,
+      ajudante1: helperMembers[0]?.name || (effectiveAjudantes.split(",")[0]?.trim() || ""),
+      ajudante1Cpf: helperMembers[0]?.cpf || "",
+      ajudante2: helperMembers[1]?.name || (effectiveAjudantes.split(",")[1]?.trim() || ""),
+      ajudante2Cpf: helperMembers[1]?.cpf || "",
+      ajudante3: helperMembers[2]?.name || (effectiveAjudantes.split(",")[2]?.trim() || ""),
+      ajudante3Cpf: helperMembers[2]?.cpf || "",
+      hectolitros: hl,
+      valorTotal: totalPrice,
+      itemsCount: 1,
+      status: "emitido",
+      crewList: data.crewList,
+      quantidadeColaboradores: data.crewList?.length || (effectiveAjudantes ? 2 : 1),
+      originalRequest: newRequest
+    };
+
+    await savePendingRequest(newRequest);
+    await saveValeEntry(newVale);
+
+    window.dispatchEvent(new Event("storage"));
+    setSelectedPrintDoc({ type: "vale", request: newRequest });
+  };
+
+  // Request creation states (modo supervisor / gestor)
+  const [reqSetor, setReqSetor] = useState("");
+  const [reqMotorista, setReqMotorista] = useState("");
+  const [reqAjudante1, setReqAjudante1] = useState("");
+  const [reqAjudante2, setReqAjudante2] = useState("");
+  const [reqNf, setReqNf] = useState("");
+  const [reqNb, setReqNb] = useState("");
+  const [reqMapa, setReqMapa] = useState("");
+  const [reqDataEntrega, setReqDataEntrega] = useState("");
+  const [reqMotiveType, setReqMotiveType] = useState<string>("Produto Avariado");
+  const [reqMotiveText, setReqMotiveText] = useState("");
+  const [reqFotoUrl, setReqFotoUrl] = useState("");
+  const [reqObservacao, setReqObservacao] = useState("");
+  
+  // Single item entry states
+  const [reqItem, setReqItem] = useState("");
+  const [reqQuantidade, setReqQuantidade] = useState("");
+  const [reqUnidade, setReqUnidade] = useState<"sku" | "und">("sku");
+  const [showItemSuggestions, setShowItemSuggestions] = useState(false);
+
+  // Inversion fields
+  const [reqInversaoIr, setReqInversaoIr] = useState("");
+  const [reqInversaoRecolher, setReqInversaoRecolher] = useState("");
+  const [reqInversaoIrQtd, setReqInversaoIrQtd] = useState("");
+  const [reqInversaoRecolherQtd, setReqInversaoRecolherQtd] = useState("");
+  const [showIrSuggestions, setShowIrSuggestions] = useState(false);
+  const [showRecolherSuggestions, setShowRecolherSuggestions] = useState(false);
+
+  // Draft items list
+  const [reqDraftItems, setReqDraftItems] = useState<any[]>([]);
+
+  // Creation notification states
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+  const [uploadingImage, setUploadingImage] = useState(false);
+
+  // Auto-pull Sector / Setor de Venda based on NB from promaxRecords and requests history
+  const sectorLoadingInfo = useMemo(() => {
+    const cleanNb = reqNb.trim();
+    if (!cleanNb) return null;
+
+    // Try to find the sector in promaxRecords
+    let foundSector = "";
+    const foundPromax = promaxRecords.find(r => {
+      const recCd = (r.codigoCliente || "").trim();
+      if (recCd === cleanNb) return true;
+      const recAsNum = parseInt(recCd, 10);
+      const nbAsNum = parseInt(cleanNb, 10);
+      return !isNaN(recAsNum) && !isNaN(nbAsNum) && recAsNum === nbAsNum;
+    });
+
+    if (foundPromax && foundPromax.setorVenda) {
+      foundSector = foundPromax.setorVenda;
+    } else {
+      // Fallback: check in current requests list
+      const foundReq = requests.find(r => {
+        const reqCd = (r.nb || "").trim();
+        if (reqCd === cleanNb) return true;
+        const reqAsNum = parseInt(reqCd, 10);
+        const nbAsNum = parseInt(cleanNb, 10);
+        return !isNaN(reqAsNum) && !isNaN(nbAsNum) && reqAsNum === nbAsNum;
+      });
+      if (foundReq && foundReq.setor) {
+        foundSector = foundReq.setor;
+      }
+    }
+
+    // Check if client is registered in PDV database
+    const db = getPdvDatabase();
+    let client = db[cleanNb];
+    if (!client) {
+      const nbAsNum = parseInt(cleanNb, 10);
+      if (!isNaN(nbAsNum)) {
+        const foundKey = Object.keys(db).find(k => parseInt(k, 10) === nbAsNum);
+        if (foundKey) {
+          client = db[foundKey];
+        }
+      }
+    }
+
+    let clientCity = "";
+    if (client && client.municipio) {
+      clientCity = client.uf ? `${client.municipio} - ${client.uf}` : client.municipio;
+    } else if (foundPromax && ((foundPromax as any).cidadeCliente || (foundPromax as any).cidade)) {
+      clientCity = (foundPromax as any).cidadeCliente || (foundPromax as any).cidade;
+    } else {
+      const foundReq = requests.find(r => {
+        const reqCd = (r.nb || "").trim();
+        return reqCd === cleanNb || parseInt(reqCd, 10) === parseInt(cleanNb, 10);
+      });
+      if (foundReq && ((foundReq as any).cidadeCliente || (foundReq as any).cidade)) {
+        clientCity = (foundReq as any).cidadeCliente || (foundReq as any).cidade;
+      }
+    }
+
+    return {
+      foundSector,
+      isRegistered: !!client,
+      clientName: client ? client.nomeFantasia : null,
+      clientCity: clientCity || null,
+      clientAddress: client ? `${client.endereco || ""}${client.bairro ? `, ${client.bairro}` : ""}` : null
+    };
+  }, [reqNb, promaxRecords, requests]);
+
+  // Apply auto-pulled sector automatically
+  useEffect(() => {
+    if (sectorLoadingInfo && sectorLoadingInfo.foundSector) {
+      setReqSetor(sectorLoadingInfo.foundSector);
+    }
+  }, [sectorLoadingInfo]);
+
+  // Reps array mapped from REPRESENTATIVOS_SETOR
+  const repsArray = useMemo(() => {
+    return Object.keys(repsList).map(key => ({
+      setor: key,
+      ...repsList[key]
+    })).sort((a, b) => a.setor.localeCompare(b.setor));
+  }, [repsList]);
+
+  // Filtered lists for suggestions inside Manager Request form
+  const itemSuggestions = React.useMemo(() => {
+    const q = reqItem.trim().toLowerCase();
+    if (!q) {
+      return PRODUCT_DATABASE.slice(0, 10);
+    }
+    return PRODUCT_DATABASE.filter(
+      p => p.codigo.toLowerCase().includes(q) || p.descricao.toLowerCase().includes(q)
+    ).slice(0, 10);
+  }, [reqItem]);
+
+  const irSuggestions = React.useMemo(() => {
+    const q = reqInversaoIr.trim().toLowerCase();
+    if (!q) {
+      return PRODUCT_DATABASE.slice(0, 10);
+    }
+    return PRODUCT_DATABASE.filter(
+      p => p.codigo.toLowerCase().includes(q) || p.descricao.toLowerCase().includes(q)
+    ).slice(0, 10);
+  }, [reqInversaoIr]);
+
+  const recolherSuggestions = React.useMemo(() => {
+    const q = reqInversaoRecolher.trim().toLowerCase();
+    if (!q) {
+      return PRODUCT_DATABASE.slice(0, 10);
+    }
+    return PRODUCT_DATABASE.filter(
+      p => p.codigo.toLowerCase().includes(q) || p.descricao.toLowerCase().includes(q)
+    ).slice(0, 10);
+  }, [reqInversaoRecolher]);
+
+  const handleAddReqDraftItem = () => {
+    setCreateError(null);
+    if (reqMotiveType === "Inversão") {
+      if (!reqInversaoIr.trim() || !reqInversaoRecolher.trim()) {
+        setCreateError("Especifique o Produto que deve ir e o Produto que deve ser recolhido para Inversão.");
+        return;
+      }
+      const qty = parseInt(reqQuantidade) || 1;
+      const irQtd = parseInt(reqInversaoIrQtd) || qty;
+      const recolherQtd = parseInt(reqInversaoRecolherQtd) || qty;
+
+      // try to locate code
+      const prodCode = reqItem.trim() || "INVERSÃO";
+      const productDef = PRODUCT_DATABASE.find(p => p.codigo === prodCode);
+      const factor = productDef?.fatorHecto || 0;
+      const calculatedHl = Number((qty * factor).toFixed(4));
+
+      const newItem = {
+        id: `req_draft_${Date.now()}_${Math.random()}`,
+        itemCode: prodCode,
+        itemDesc: productDef ? productDef.descricao : `Inversão: ${reqInversaoIr.trim()} 🔄 ${reqInversaoRecolher.trim()}`,
+        quantidade: qty,
+        motivo: "Inversão",
+        fatorHecto: factor,
+        hectolitros: calculatedHl,
+        produtoAhEnviar: `${reqInversaoIr.trim()} (Qtd: ${irQtd} un)`,
+        produtoARecolher: `${reqInversaoRecolher.trim()} (Qtd: ${recolherQtd} un)`
+      };
+
+      setReqDraftItems([...reqDraftItems, newItem]);
+      
+      // Clear item fields
+      setReqInversaoIr("");
+      setReqInversaoRecolher("");
+      setReqInversaoIrQtd("");
+      setReqInversaoRecolherQtd("");
+      setReqItem("");
+      setReqQuantidade("");
+    } else {
+      if (!reqItem.trim()) {
+        setCreateError("Por favor, digite ou selecione um código SKU de produto.");
+        return;
+      }
+      const qty = parseInt(reqQuantidade);
+      if (isNaN(qty) || qty <= 0) {
+        setCreateError("A quantidade deve ser maior do que zero.");
+        return;
+      }
+
+      const productDef = PRODUCT_DATABASE.find(p => p.codigo === reqItem.trim());
+      if (!productDef) {
+        setCreateError(`Produto com código "${reqItem.trim()}" não encontrado.`);
+        return;
+      }
+
+      const embalagem = productDef.fator || 12;
+      const closedBoxPrice = (productDef.valor && productDef.valor > 0)
+        ? productDef.valor
+        : (promaxRecords.find(r => r.produto === reqItem.trim())?.valorUnitario || 0);
+      const unitPrice = embalagem > 0 ? closedBoxPrice / embalagem : closedBoxPrice;
+
+      const factor = productDef.fatorHecto || 0.0800;
+      const isReqCx = reqUnidade === "cx" || reqUnidade === "caixa" || reqUnidade === "sku";
+      const isReqUnd = !isReqCx;
+      const calculatedHl = calculateItemHL({
+        codigo: productDef.codigo,
+        quantidade: qty,
+        unidadeMedida: reqUnidade,
+        fatorEmbalagem: embalagem,
+        fatorHecto: factor,
+        descricao: productDef.descricao
+      });
+
+      const calculatedPrice = isReqUnd
+        ? Number((qty * unitPrice).toFixed(2))
+        : Number((qty * closedBoxPrice).toFixed(2));
+
+      let finalMotive = reqMotiveType;
+      if (reqMotiveType === "Falta de SKU Completo") {
+        finalMotive = reqMotiveText.trim() ? `Falta de SKU Completo - ${reqMotiveText.trim()}` : "Falta de SKU Completo";
+      } else if (reqMotiveType === "Falta no SKU") {
+        finalMotive = reqMotiveText.trim() ? `Falta no SKU - ${reqMotiveText.trim()}` : "Falta no SKU";
+      } else if (reqMotiveType === "Outros") {
+        finalMotive = reqMotiveText.trim() || "Outros";
+      } else {
+        finalMotive = reqMotiveText.trim() ? `${reqMotiveType} - ${reqMotiveText.trim()}` : reqMotiveType;
+      }
+
+      const newItem = {
+        id: `req_draft_${Date.now()}_${Math.random()}`,
+        itemCode: productDef.codigo,
+        itemDesc: productDef.descricao,
+        quantidade: qty,
+        motivo: finalMotive,
+        fatorHecto: factor,
+        hectolitros: calculatedHl,
+        unidadeMedida: reqUnidade,
+        precoSugerido: closedBoxPrice,
+        precoCalculated: calculatedPrice,
+        fatorEmbalagem: embalagem
+      };
+
+      setReqDraftItems([...reqDraftItems, newItem]);
+      
+      // Clear fields
+      setReqItem("");
+      setReqQuantidade("");
+      setReqUnidade("sku");
+    }
+  };
+
+  const handleRemoveReqDraftItem = (id: string) => {
+    setReqDraftItems(reqDraftItems.filter(item => item.id !== id));
+  };
+
+  const handleCreateRequestSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setCreateError(null);
+    setCreateSuccess(null);
+
+    // Setor/RN is optional for gestor creation, default to "600" or auto-identified sector if empty
+    const effectiveSetor = reqSetor.trim() || sectorLoadingInfo?.foundSector || "600";
+
+    // NF, NB, and Mapa are mandatory
+    if (!reqNf.trim() || !reqNb.trim() || !reqMapa.trim()) {
+      setCreateError("O preenchimento de Nota Fiscal, Cód. Cliente (NB) e Mapa de Carga é obrigatório.");
+      return;
+    }
+
+    const finalNf = reqNf.trim();
+
+    // Photo is always optional now as requested
+
+    // Check if Map is empty when Lack/Inversion, NB is optional
+    const isLackOrInversion = reqMotiveType === "Inversão" || reqMotiveType.includes("Falta");
+    if (isLackOrInversion) {
+      if (!reqMapa.trim()) {
+        setCreateError("O número do Mapa de Carga é obrigatório para falta ou inversão.");
+        return;
+      }
+    }
+
+    let finalDrafts = [...reqDraftItems];
+    // Auto-add current input if list is empty and user has filled out fields
+    if (finalDrafts.length === 0) {
+      if (reqMotiveType === "Inversão") {
+        if (!reqInversaoIr.trim() || !reqInversaoRecolher.trim()) {
+          setCreateError("Sua lista de itens está vazia. Adicione o item à lista ou complete os campos de Inversão.");
+          return;
+        }
+        const qty = parseInt(reqQuantidade) || 1;
+        const irQtd = parseInt(reqInversaoIrQtd) || qty;
+        const recolherQtd = parseInt(reqInversaoRecolherQtd) || qty;
+        const prodCode = reqItem.trim() || "INVERSÃO";
+        const productDef = PRODUCT_DATABASE.find(p => p.codigo === prodCode);
+        const factor = productDef?.fatorHecto || 0;
+        const calculatedHl = Number((qty * factor).toFixed(4));
+
+        finalDrafts.push({
+          id: `req_draft_${Date.now()}`,
+          itemCode: prodCode,
+          itemDesc: productDef ? productDef.descricao : `Inversão: ${reqInversaoIr.trim()} 🔄 ${reqInversaoRecolher.trim()}`,
+          quantidade: qty,
+          motivo: "Inversão",
+          fatorHecto: factor,
+          hectolitros: calculatedHl,
+          produtoAhEnviar: `${reqInversaoIr.trim()} (Qtd: ${irQtd} un)`,
+          produtoARecolher: `${reqInversaoRecolher.trim()} (Qtd: ${recolherQtd} un)`
+        });
+      } else {
+        if (!reqItem.trim() || !reqQuantidade.trim()) {
+          setCreateError("Adicione pelo menos um SKU à lista de produtos.");
+          return;
+        }
+        const qty = parseInt(reqQuantidade);
+        const productDef = PRODUCT_DATABASE.find(p => p.codigo === reqItem.trim());
+        if (!productDef || isNaN(qty) || qty <= 0) {
+          setCreateError("O SKU ou quantidade digitados são inválidos. Adicione o item de forma válida.");
+          return;
+        }
+
+        const embalagem = productDef.fator || 12;
+        const closedBoxPrice = (productDef.valor && productDef.valor > 0)
+          ? productDef.valor
+          : (promaxRecords.find(r => r.produto === reqItem.trim())?.valorUnitario || 0);
+        const unitPrice = embalagem > 0 ? closedBoxPrice / embalagem : closedBoxPrice;
+
+        const factor = productDef.fatorHecto || 0.0800;
+        const isReqCx = reqUnidade === "cx" || reqUnidade === "caixa" || reqUnidade === "sku";
+        const isReqUnd = !isReqCx;
+        const calculatedHl = calculateItemHL({
+          codigo: productDef.codigo,
+          quantidade: qty,
+          unidadeMedida: reqUnidade,
+          fatorEmbalagem: embalagem,
+          fatorHecto: factor,
+          descricao: productDef.descricao
+        });
+
+        const calculatedPrice = isReqUnd
+          ? Number((qty * unitPrice).toFixed(2))
+          : Number((qty * closedBoxPrice).toFixed(2));
+
+        let finalMotive = reqMotiveType;
+        if (reqMotiveType === "Falta de SKU Completo") {
+          finalMotive = reqMotiveText.trim() ? `Falta de SKU Completo - ${reqMotiveText.trim()}` : "Falta de SKU Completo";
+        } else if (reqMotiveType === "Falta no SKU") {
+          finalMotive = reqMotiveText.trim() ? `Falta no SKU - ${reqMotiveText.trim()}` : "Falta no SKU";
+        } else if (reqMotiveType === "Outros") {
+          finalMotive = reqMotiveText.trim() || "Outros";
+        } else {
+          finalMotive = reqMotiveText.trim() ? `${reqMotiveType} - ${reqMotiveText.trim()}` : reqMotiveType;
+        }
+
+        finalDrafts.push({
+          id: `req_draft_${Date.now()}`,
+          itemCode: productDef.codigo,
+          itemDesc: productDef.descricao,
+          quantidade: qty,
+          motivo: finalMotive,
+          fatorHecto: factor,
+          hectolitros: calculatedHl,
+          unidadeMedida: reqUnidade,
+          precoSugerido: closedBoxPrice,
+          precoCalculated: calculatedPrice,
+          fatorEmbalagem: embalagem
+        });
+      }
+    }
+
+    try {
+      const now = new Date();
+      const dataFormatada = `${now.toLocaleDateString("pt-BR")} às ${now.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`;
+
+      const firstItem = finalDrafts[0];
+      const totalAccumulatedHl = Number(finalDrafts.reduce((acc, curr) => acc + curr.hectolitros, 0).toFixed(4));
+
+      // Retrieve driver detail
+      let driverCpf = "";
+      if (reqMotorista) {
+        const found = LISTA_CREW.find(c => c.nome === reqMotorista);
+        if (found) driverCpf = found.cpf;
+      }
+
+      // CLOUD FILE UPLOAD FOR EVIDENCE!!!
+      let finalFotoUrl = reqFotoUrl;
+      if (reqFotoUrl && reqFotoUrl.startsWith("data:image/")) {
+        setUploadingImage(true);
+        try {
+          const upRes = await fetch(getApiUrl("/api/upload"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ image: reqFotoUrl })
+          });
+          if (upRes.ok) {
+            const upData = await upRes.json();
+            if (upData.url) {
+              finalFotoUrl = upData.url;
+            }
+          }
+        } catch (uploadErr) {
+          console.error("Error uploading image evidence to cloud server:", uploadErr);
+        } finally {
+          setUploadingImage(false);
+        }
+      }
+
+      // Calculate contingency status and financial total value
+      const isFaltaSkuCompletoOrInversao = 
+        reqMotiveType.toLowerCase().includes("falta de sku completo") || 
+        reqMotiveType.toLowerCase().includes("falta de sku fechado") || 
+        reqMotiveType.toLowerCase().includes("invers");
+      const isContingencia = !isFaltaSkuCompletoOrInversao;
+
+      const calcTotalVal = finalDrafts.reduce((acc, curr) => {
+        const val = calculateItemValue({
+          ...curr,
+          unidadeMedida: curr.unidadeMedida || reqUnidade
+        });
+        if (val > 0) return acc + val;
+        if (curr.precoCalculated !== undefined && curr.precoCalculated > 0) return acc + curr.precoCalculated;
+        if (curr.precoSugerido !== undefined && curr.precoSugerido > 0) {
+          const rawUm = (curr.unidadeMedida || "").toLowerCase().trim();
+          const isUnd = rawUm === "un" || rawUm === "und" || rawUm === "unidade" || rawUm === "unidades";
+          const unitVal = isUnd ? (curr.precoSugerido / (curr.fatorEmbalagem || 12)) : curr.precoSugerido;
+          return acc + (unitVal * curr.quantidade);
+        }
+        return acc;
+      }, 0);
+
+      const newRequest: PendingRequest = {
+        id: `pending_req_${Date.now()}`,
+        timestamp: Date.now(),
+        data: dataFormatada,
+        setor: effectiveSetor,
+        mapa: reqMapa.trim(),
+        nb: reqNb.trim() || "000000",
+        nf: finalNf,
+        fotoUrl: finalFotoUrl || "",
+        observacao: reqObservacao.trim(),
+        statusPromax: "pendente",
+        notified: false,
+        cadastroRole: "admin",
+        origem: "admin",
+        cadastroUser: (() => {
+          const loggedManager = sessionStorage.getItem("sstr_current_manager_name");
+          if (loggedManager && loggedManager.trim()) {
+            return loggedManager.trim();
+          }
+          return "Gestor (Controle Operacional)";
+        })(),
+        cadastroDate: dataFormatada,
+        dataEntrega: reqDataEntrega.trim() || undefined,
+        emContingencia: isContingencia,
+        contingenciaBaixada: false,
+        valorTotal: calcTotalVal > 0 ? calcTotalVal : undefined,
+        
+        // Shortage fields
+        ...(reqMotorista ? { faltaMotorista: reqMotorista } : {}),
+        ...(driverCpf ? { faltaMotoristaCpf: driverCpf } : {}),
+        ...([reqAjudante1, reqAjudante2].filter(Boolean).length > 0 ? { faltaAjudantes: [reqAjudante1, reqAjudante2].filter(Boolean).join(", ") } : {}),
+        ...(reqAjudante1 ? { faltaAjudante1: reqAjudante1 } : {}),
+        ...(reqAjudante2 ? { faltaAjudante2: reqAjudante2 } : {}),
+
+        // Compat fallbacks
+        item: firstItem.itemCode,
+        quantidade: finalDrafts.reduce((sum, current) => sum + current.quantidade, 0),
+        fatorHecto: firstItem.fatorHecto,
+        hectolitros: totalAccumulatedHl,
+        motivo: firstItem.motivo,
+        
+        items: finalDrafts.map(d => ({
+          id: d.id,
+          item: d.itemCode,
+          descricao: d.itemDesc,
+          quantidade: d.quantidade,
+          motivo: d.motivo,
+          fatorHecto: d.fatorHecto,
+          hectolitros: d.hectolitros,
+          produtoAhEnviar: d.produtoAhEnviar,
+          produtoARecolher: d.produtoARecolher,
+          unidadeMedida: d.unidadeMedida,
+          precoSugerido: d.precoSugerido,
+          precoCalculated: d.precoCalculated,
+          fatorEmbalagem: d.fatorEmbalagem
+        }))
+      };
+
+      await savePendingRequest(newRequest);
+
+      // Clear all form states
+      setReqNf("");
+      setReqNb("");
+      setReqMapa("");
+      setReqObservacao("");
+      setReqFotoUrl("");
+      setReqDraftItems([]);
+      setReqItem("");
+      setReqQuantidade("");
+      setReqInversaoIr("");
+      setReqInversaoRecolher("");
+      
+      setCreateSuccess(`SUCESSO! Solicitação criada com sucesso para o Setor ${reqSetor} (NF: ${newRequest.nf}). Ela já está disponível no controle para aprovação e armazenada na nuvem.`);
+      
+      // Auto switch back to pendentes after 2 seconds so they can see their new request!
+      setTimeout(() => {
+        setActiveTab("pendente");
+        setCreateSuccess(null);
+      }, 2000);
+    } catch (e: any) {
+      setCreateError("Erro ao salvar nova solicitação: " + e.message);
+    }
+  };
+
+  const handleImageCaptureInForm = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.size > 10 * 1024 * 1024) {
+      setCreateError("A imagem é muito grande. Escolha uma foto menor (máximo de 10MB) para evitar problemas de memória.");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setReqFotoUrl(reader.result as string);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Helper to create and save a Vale automatically when classified as delivery/unloading error ("entrega")
+  const createAndSaveVale = useCallback((req: PendingRequest) => {
+    // Inversions NEVER generate vales
+    if (isSwapRequest(req) || isInversaoOrSwapReq(req)) {
+      const deterministicId = `vale_${req.id}`;
+      deleteValeEntry(deterministicId);
+      return;
+    }
+
+    const cast = req as any;
+    const printableItems = req.items && req.items.length > 0 ? req.items : [
+      {
+        produto: cast.produto || cast.item || "9999",
+        quantidade: cast.quantidade || 1,
+        hectolitros: cast.hectolitros || 0.12,
+        um: cast.unidadeMedia || cast.um || "CX",
+        motivo: cast.motivo || "Falta de Entrega SSTR"
+      }
+    ];
+
+    const { valorTotal: calculatedValTotal, hectolitros: calculatedHl } = calculateRequestValueAndHL(req, promaxRecords);
+
+    const existingVale = valesHistorico.find(v => 
+      v.requestId === req.id || 
+      v.originalRequest?.id === req.id || 
+      v.id === `vale_${req.id}` ||
+      (v.nf && v.nf !== "N0-NF" && v.nf === req.nf && v.originalRequest?.mapa === req.mapa)
+    );
+    const deterministicId = existingVale ? existingVale.id : `vale_${req.id}`;
+    const driverMember = (req as any).faltaCrewList?.find((c: any) => c.role.toLowerCase().includes("motorista")) || (req as any).faltaCrewList?.[0];
+    const helperMembers = (req as any).faltaCrewList?.filter((c: any) => c !== driverMember) || [];
+
+    const newValeEntry: ValeEntry = {
+      id: deterministicId,
+      requestId: req.id,
+      nf: req.nf || "N0-NF",
+      rota: req.setor || "R00",
+      dataEmissao: cast.dataEntregaRecibo || new Date().toLocaleDateString("pt-BR"),
+      motorista: driverMember?.name || cast.faltaMotorista || "Não Declarado",
+      motoristaCpf: driverMember?.cpf || cast.faltaMotoristaCpf || "",
+      ajudantes: helperMembers.length > 0 ? helperMembers.map((h: any) => h.name).filter(Boolean).join(", ") : (cast.faltaAjudantes || ""),
+      ajudante1: helperMembers[0]?.name || cast.faltaAjudante1 || "",
+      ajudante1Cpf: helperMembers[0]?.cpf || cast.faltaAjudante1Cpf || "",
+      ajudante2: helperMembers[1]?.name || cast.faltaAjudante2 || "",
+      ajudante2Cpf: helperMembers[1]?.cpf || cast.faltaAjudante2Cpf || "",
+      ajudante3: helperMembers[2]?.name || cast.faltaAjudante3 || "",
+      ajudante3Cpf: helperMembers[2]?.cpf || cast.faltaAjudante3Cpf || "",
+      hectolitros: calculatedHl || req.hectolitros || printableItems.reduce((s: any, c: any) => s + (c.hectolitros || 0), 0),
+      valorTotal: calculatedValTotal,
+      itemsCount: printableItems.reduce((s: any, c: any) => s + (c.quantidade || 1), 0),
+      status: existingVale?.status || "emitido",
+      crewList: (req as any).faltaCrewList || undefined,
+      quantidadeColaboradores: (req as any).faltaQtdColaboradores || (req as any).faltaCrewList?.length || undefined,
+      originalRequest: { ...req }
+    };
+
+    saveValeEntry(newValeEntry);
+  }, [promaxRecords, valesHistorico, saveValeEntry, deleteValeEntry]);
+
+  // Filter vales displayed in tab to ONLY those whose request was reviewed and classified as "entrega" (Erro de Descarregamento) or avulso and NOT inversion
+  const displayVales = useMemo(() => {
+    const reqMap = new Map(requests.map(r => [r.id, r]));
+    return valesHistorico.filter(v => {
+      if (isInversaoOrSwapReq(v)) return false;
+      if (v.id?.startsWith("vale_avulso_") || v.rota === "AVULSO" || (v.originalRequest as any)?.setor === "AVULSO") return true;
+      const targetReq = reqMap.get(v.requestId || v.originalRequest?.id) || v.originalRequest;
+      if (targetReq) {
+        if (isSwapRequest(targetReq) || isInversaoOrSwapReq(targetReq)) return false;
+        if ((targetReq as any).setor === "AVULSO" || (targetReq as any).faltaTipoErro === "entrega") return true;
+        return (targetReq as any).reviewedByControle === true && (targetReq as any).faltaTipoErro === "entrega";
+      }
+      return (v.originalRequest as any)?.reviewedByControle === true && (v.originalRequest as any)?.faltaTipoErro === "entrega";
+    });
+  }, [valesHistorico, requests]);
+
+  const handleLogAndPrint = (req: PendingRequest, type: "recibo" | "vale") => {
+    let printedWithNewTab = false;
+    const printElement = document.getElementById("printable-document-root");
+    if (printElement) {
+      try {
+        const printWindow = window.open("", "_blank");
+        if (printWindow) {
+          // Gather styles
+          const styles = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'))
+            .map(el => el.outerHTML)
+            .join('\n');
+          
+          printWindow.document.write(`
+            <!DOCTYPE html>
+            <html>
+              <head>
+                <title>SSTR - Imprimir ${type === "vale" ? "Vale Coletivo" : "Recibo"}</title>
+                ${styles}
+                <style>
+                  body {
+                    background-color: white !important;
+                    color: black !important;
+                    padding: 12px 16px !important;
+                    font-size: 10px !important;
+                    line-height: 1.25 !important;
+                  }
+                  #printable-document-root {
+                    display: block !important;
+                    position: relative !important;
+                    box-shadow: none !important;
+                    border: none !important;
+                    width: 100% !important;
+                    max-width: 100% !important;
+                    padding: 0 !important;
+                    margin: 0 !important;
+                    font-size: 10px !important;
+                  }
+                  h1 { font-size: 13px !important; margin: 2px 0 !important; }
+                  h2 { font-size: 14px !important; }
+                  p, td, th, div { font-size: 10px !important; line-height: 1.25 !important; }
+                  .my-6, .my-4 { margin-top: 4px !important; margin-bottom: 4px !important; }
+                  .p-4, .p-8, .p-10 { padding: 6px 10px !important; }
+                  .py-3 { padding-top: 3px !important; padding-bottom: 3px !important; }
+                  .mb-6 { margin-bottom: 6px !important; }
+                  .mb-10 { margin-bottom: 6px !important; }
+                  .mt-12 { margin-top: 8px !important; }
+                  .pt-8 { padding-top: 4px !important; }
+                  .space-y-10 > :not([hidden]) ~ :not([hidden]) { margin-top: 10px !important; }
+                  .space-y-6 > :not([hidden]) ~ :not([hidden]) { margin-top: 6px !important; }
+                  .space-y-4 > :not([hidden]) ~ :not([hidden]) { margin-top: 4px !important; }
+                  .pb-4 { padding-bottom: 4px !important; }
+                  table td, table th { padding: 4px 6px !important; }
+                </style>
+              </head>
+              <body class="bg-white text-black">
+                <div id="printable-document-root" class="w-full">
+                  ${printElement.innerHTML}
+                </div>
+                <script>
+                  window.onload = function() {
+                    window.focus();
+                    setTimeout(function() {
+                      window.print();
+                    }, 400);
+                  };
+                </script>
+              </body>
+            </html>
+          `);
+          printWindow.document.close();
+          printedWithNewTab = true;
+        }
+      } catch (e) {
+        console.warn("Could not print in a new tab, falling back to window.print()", e);
+      }
+    }
+
+    if (!printedWithNewTab) {
+      try {
+        window.focus();
+        window.print();
+      } catch (e) {
+        console.warn("Iframe blocked print dialog:", e);
+      }
+    }
+
+    if (type === "vale") {
+      // Check if already in history first
+      const alreadyExists = valesHistorico.some(v => v.requestId === req.id);
+      if (!alreadyExists) {
+        const cast = req as any;
+        const printableItems = req.items && req.items.length > 0 ? req.items : [
+          {
+            produto: cast.produto || cast.item || "9999",
+            quantidade: cast.quantidade || 1,
+            hectolitros: cast.hectolitros || 0.12,
+            um: cast.unidadeMedia || cast.um || "CX",
+            motivo: cast.motivo || "Falta de Entrega SSTR"
+          }
+        ];
+
+        const { valorTotal: calculatedValTotal, hectolitros: calculatedHl } = calculateRequestValueAndHL(req, promaxRecords);
+
+        const newValeEntry = {
+          id: `vale_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          requestId: req.id,
+          nf: req.nf || "N0-NF",
+          rota: req.setor || "R00",
+          dataEmissao: cast.dataEntregaRecibo || new Date().toLocaleDateString("pt-BR"),
+          motorista: cast.faltaMotorista || "Não Declarado",
+          motoristaCpf: cast.faltaMotoristaCpf || "",
+          ajudantes: cast.faltaAjudantes || "",
+          ajudante1: cast.faltaAjudante1 || "",
+          ajudante1Cpf: cast.faltaAjudante1Cpf || "",
+          ajudante2: cast.faltaAjudante2 || "",
+          ajudante2Cpf: cast.ajudante2Cpf || "",
+          hectolitros: calculatedHl || req.hectolitros || printableItems.reduce((s: any, c: any) => s + (c.hectolitros || 0), 0),
+          valorTotal: calculatedValTotal,
+          itemsCount: printableItems.reduce((s: any, c: any) => s + c.quantidade, 0),
+          originalRequest: { ...req, fotoUrl: req.fotoUrl ? "imagem_no_vale_detalhes" : "" }
+        };
+
+        saveValeEntry(newValeEntry);
+      }
+    }
+  };
+
+  const now = Date.now();
+  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+
+
+
+  // Memoized tomorrow's reminders (exactly 1 day before delivery date)
+  const tomorrowReminders = useMemo(() => {
+    const todayMidnight = new Date();
+    todayMidnight.setHours(0, 0, 0, 0);
+
+    const parsePtDate = (ptStr?: string): Date | null => {
+      if (!ptStr) return null;
+      const parts = ptStr.trim().split("/");
+      if (parts.length < 3) return null;
+      const day = parseInt(parts[0], 10);
+      const month = parseInt(parts[1], 10) - 1;
+      const year = parseInt(parts[2], 10);
+      return new Date(year, month, day);
+    };
+
+    return requests.filter(req => {
+      // Must be a shortage of full SKU or an inversion
+      const isFalta = (req.motivo || "").toLowerCase().includes("falta") || 
+        (req.motivo || "").toLowerCase().includes("inver") ||
+        (req.items && req.items.some(sub => {
+          const m = (sub.motivo || "").toLowerCase();
+          return m.includes("falta") || m.includes("inver") || !!sub.produtoAhEnviar;
+        }));
+      
+      if (!isFalta) return false;
+
+      // Must not be physical settled yet
+      const cast = req as any;
+      if (cast.faltaBaixa) return false;
+
+      // Must have a set delivery date
+      if (!cast.dataEntregaRecibo) return false;
+
+      const delivDate = parsePtDate(cast.dataEntregaRecibo);
+      if (!delivDate) return false;
+      delivDate.setHours(0, 0, 0, 0);
+
+      // Diff calculation in days
+      const diffTime = delivDate.getTime() - todayMidnight.getTime();
+      const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+      return diffDays === 1; // 1 day before (Tomorrow!)
+    });
+  }, [requests]);
+
+  // Approved replacements list Memo (flattened and filtered by date) - Includes ALL launched requests
+  const approvedReplacements = useMemo(() => {
+    const approved = requests;
+    const flattened: any[] = [];
+    const db = getPdvDatabase();
+
+    for (const req of approved) {
+      const pdv = getClientDetails(req.nb, db, promaxRecords);
+      const cast = req as any;
+      const displayMunicipio = cast.municipioRecibo || pdv.municipio || "Guarabira";
+
+      const rawDateStr = req.cadastroDate || req.data || "";
+      const dateOnly = rawDateStr ? rawDateStr.split(" ")[0] : "";
+
+      if (req.items && req.items.length > 0) {
+        for (const item of req.items) {
+          const isFaltaSkuCompleto = (item.motivo || req.motivo || "").toLowerCase().includes("completo") || (item.motivo || req.motivo || "").toLowerCase().includes("fechado");
+          const rawUm = (item.unidadeMedida || (item as any).um || req.unidadeMedida || (req as any).um || "").toLowerCase().trim();
+          const isUnd = rawUm === "und" || rawUm === "un" || rawUm === "unidade" || rawUm === "unid" || rawUm.startsWith("un");
+          const isSkuUnit = (rawUm === "sku" || rawUm === "cx" || rawUm === "caixa" || isFaltaSkuCompleto) && !isUnd;
+          
+          const prodCode = item.item || item.itemCode || "SKU_GENERIC";
+          const itemPlate = (cast.itemPlates && cast.itemPlates[prodCode]) || req.placaVeiculo || cast.placa || "";
+
+          flattened.push({
+            requestId: req.id,
+            cadastroDate: req.cadastroDate || req.data || "",
+            dateOnly,
+            nb: req.nb,
+            razaoSocial: pdv.razaoSocial,
+            nomeFantasia: pdv.nomeFantasia,
+            municipio: displayMunicipio,
+            productCode: prodCode,
+            productDesc: item.descricao || item.itemDesc || req.descricaoProduto || "Produto SSTR",
+            quantidade: item.quantidade || 1,
+            unidadeType: isSkuUnit ? "SKU" : "UN",
+            solicitante: req.setor,
+            nf: req.nf,
+            mapa: req.mapa,
+            placaVeiculo: itemPlate
+          });
+        }
+      } else if (req.item) {
+        const isFaltaSkuCompleto = (req.motivo || "").toLowerCase().includes("completo") || (req.motivo || "").toLowerCase().includes("fechado");
+        const rawUm = (req.unidadeMedida || (req as any).um || "").toLowerCase().trim();
+        const isUnd = rawUm === "und" || rawUm === "un" || rawUm === "unidade" || rawUm === "unid" || rawUm.startsWith("un");
+        const isSkuUnit = (rawUm === "sku" || rawUm === "cx" || rawUm === "caixa" || isFaltaSkuCompleto) && !isUnd;
+        
+        const itemPlate = (cast.itemPlates && cast.itemPlates[req.item]) || req.placaVeiculo || cast.placa || "";
+
+        flattened.push({
+          requestId: req.id,
+          cadastroDate: req.cadastroDate || req.data || "",
+          dateOnly,
+          nb: req.nb,
+          razaoSocial: pdv.razaoSocial,
+          nomeFantasia: pdv.nomeFantasia,
+          municipio: displayMunicipio,
+          productCode: req.item,
+          productDesc: req.descricaoProduto || req.productDesc || "Produto SSTR",
+          quantidade: req.quantidade || 0,
+          unidadeType: isSkuUnit ? "SKU" : "UN",
+          solicitante: req.setor,
+          nf: req.nf,
+          mapa: req.mapa,
+          placaVeiculo: itemPlate
+        });
+      }
+    }
+
+    return flattened.sort((a, b) =>
+      (a.municipio || "").localeCompare(b.municipio || "", "pt-BR", { sensitivity: "base" }) ||
+      (a.razaoSocial || "").localeCompare(b.razaoSocial || "", "pt-BR", { sensitivity: "base" })
+    );
+  }, [requests, promaxRecords]);
+
+  // Filtered Approved Replacements Base Memo (based on selected date and search text)
+  const espelhoFiltradoBase = useMemo(() => {
+    const normalizeDateStr = (dStr: string) => {
+      if (!dStr) return "";
+      const clean = dStr.split(" ")[0].trim();
+      if (clean.includes("-")) {
+        const parts = clean.split("-");
+        if (parts.length === 3) {
+          const [y, m, d] = parts;
+          return `${d.padStart(2, "0")}/${m.padStart(2, "0")}/${y}`;
+        }
+      }
+      return clean;
+    };
+
+    const targetDateNorm = normalizeDateStr(filterEspelhoDate);
+
+    return approvedReplacements.filter((item: any) => {
+      // Date filter
+      const itemDateNorm = normalizeDateStr(item.dateOnly || item.cadastroDate);
+      const matchesDate = !targetDateNorm || itemDateNorm === targetDateNorm || item.dateOnly === filterEspelhoDate;
+      if (!matchesDate) return false;
+
+      // Search filter
+      if (!searchEspelho) return true;
+      const q = searchEspelho.toLowerCase();
+      return (
+        (item.nb || "").toLowerCase().includes(q) ||
+        (item.razaoSocial || "").toLowerCase().includes(q) ||
+        (item.nomeFantasia || "").toLowerCase().includes(q) ||
+        (item.productCode || "").toLowerCase().includes(q) ||
+        (item.productDesc || "").toLowerCase().includes(q) ||
+        (item.municipio || "").toLowerCase().includes(q)
+      );
+    }).sort((a: any, b: any) =>
+      (a.municipio || "").localeCompare(b.municipio || "", "pt-BR", { sensitivity: "base" }) ||
+      (a.razaoSocial || "").localeCompare(b.razaoSocial || "", "pt-BR", { sensitivity: "base" })
+    );
+  }, [approvedReplacements, filterEspelhoDate, searchEspelho]);
+
+  // Filtered list according to espelhoStatusFilter and sorted by city alphabetically
+  const espelhoFiltrado = useMemo(() => {
+    return espelhoFiltradoBase.filter((item: any) => {
+      const itemReq = requests.find(r => r.id === item.requestId);
+      const isBaixado = isRequestBaixada(itemReq);
+
+      const itemKey = `${item.requestId}_${item.productCode}`;
+      const currentPlate = espelhoPlates[itemKey] !== undefined 
+        ? espelhoPlates[itemKey] 
+        : (item.placaVeiculo || item.placa || "");
+      const isCarregado = Boolean(currentPlate && currentPlate.trim());
+
+      if (espelhoStatusFilter === "pendentes") return !isBaixado && !isCarregado;
+      if (espelhoStatusFilter === "carregados") return !isBaixado && isCarregado;
+      if (espelhoStatusFilter === "baixados") return isBaixado;
+      return true;
+    }).sort((a: any, b: any) =>
+      (a.municipio || "").localeCompare(b.municipio || "", "pt-BR", { sensitivity: "base" }) ||
+      (a.razaoSocial || "").localeCompare(b.razaoSocial || "", "pt-BR", { sensitivity: "base" })
+    );
+  }, [espelhoFiltradoBase, espelhoPlates, espelhoStatusFilter, requests]);
+
+  // Unique cities for the FILTERED Espelho view and their item count
+  const espelhoCidadesDoDia = useMemo(() => {
+    const cityMap = new Map<string, { count: number; items: any[] }>();
+    espelhoFiltrado.forEach(item => {
+      const city = (item.municipio || "OUTRAS").toUpperCase().trim();
+      const existing = cityMap.get(city) || { count: 0, items: [] };
+      existing.count += 1;
+      existing.items.push(item);
+      cityMap.set(city, existing);
+    });
+    return Array.from(cityMap.entries()).map(([city, data]) => ({
+      city,
+      count: data.count,
+      items: data.items
+    })).sort((a, b) => a.city.localeCompare(b.city, "pt-BR", { sensitivity: "base" }));
+  }, [espelhoFiltrado]);
+
+  // Counts for pending vs loaded vs baixados items
+  const espelhoCounts = useMemo(() => {
+    let pendentes = 0;
+    let carregados = 0;
+    let baixados = 0;
+    espelhoFiltradoBase.forEach(item => {
+      const req = requests.find(r => r.id === item.requestId);
+      if (isRequestBaixada(req)) {
+        baixados++;
+        return;
+      }
+      const itemKey = `${item.requestId}_${item.productCode}`;
+      const currentPlate = espelhoPlates[itemKey] !== undefined 
+        ? espelhoPlates[itemKey] 
+        : (item.placaVeiculo || item.placa || "");
+      if (currentPlate && currentPlate.trim()) {
+        carregados++;
+      } else {
+        pendentes++;
+      }
+    });
+    return { total: espelhoFiltradoBase.length, pendentes, carregados, baixados };
+  }, [espelhoFiltradoBase, espelhoPlates, requests]);
+
+  // Helper to calculate request/item age in days
+  const getItemAgeInDays = (item: any, req?: any): number => {
+    let reqDate: Date | null = null;
+    if (req) {
+      reqDate = getReqDate(req);
+    }
+    if (!reqDate && item.cadastroDate) {
+      const parts = item.cadastroDate.split(" ")[0].split("/");
+      if (parts.length === 3) {
+        reqDate = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]));
+      }
+    }
+    if (!reqDate && item.dateOnly) {
+      const parts = item.dateOnly.split("/");
+      if (parts.length === 3) {
+        reqDate = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]));
+      }
+    }
+    if (!reqDate) return 0;
+    
+    const diffMs = Date.now() - reqDate.getTime();
+    return Math.max(0, Math.floor(diffMs / (1000 * 60 * 60 * 24)));
+  };
+
+  // Delayed items loaded in Espelho do Dia for over 1 week (>7 days) without baixa
+  const delayedCarregados = useMemo(() => {
+    return approvedReplacements.filter(item => {
+      const req = requests.find(r => r.id === item.requestId);
+      if (isRequestBaixada(req)) return false;
+
+      const itemKey = `${item.requestId}_${item.productCode}`;
+      const currentPlate = espelhoPlates[itemKey] !== undefined 
+        ? espelhoPlates[itemKey] 
+        : (item.placaVeiculo || item.placa || "");
+      const isCarregado = !!currentPlate.trim();
+      if (!isCarregado) return false;
+
+      const ageInDays = getItemAgeInDays(item, req);
+      return ageInDays >= 7;
+    });
+  }, [approvedReplacements, requests, espelhoPlates]);
+
+  // Apply license plate to all items of a specific city on the FILTERED view
+  const handleApplyPlateToCity = (cityName: string, plateValue: string) => {
+    const val = plateValue.trim().toUpperCase();
+    if (!val) return;
+    const targetCityUpper = cityName.toUpperCase().trim();
+    
+    // Target strictly items present in the current filtered Espelho list
+    const cityItems = espelhoFiltrado.filter(
+      item => (item.municipio || "OUTRAS").toUpperCase().trim() === targetCityUpper
+    );
+
+    if (cityItems.length === 0) return;
+
+    const newPlates = { ...espelhoPlates };
+    const affectedReqIds = new Set<string>();
+
+    cityItems.forEach(item => {
+      const k = `${item.requestId}_${item.productCode}`;
+      newPlates[k] = val;
+      affectedReqIds.add(item.requestId);
+    });
+
+    setEspelhoPlates(newPlates);
+
+    // Save changes to pending requests state
+    affectedReqIds.forEach(reqId => {
+      const targetReq = requests.find(r => r.id === reqId);
+      if (targetReq) {
+        const existingItemPlates = (targetReq as any).itemPlates || {};
+        const updatedItemPlates = { ...existingItemPlates };
+        
+        cityItems.filter(i => i.requestId === reqId).forEach(i => {
+          updatedItemPlates[i.productCode] = val;
+        });
+
+        savePendingRequest({
+          ...targetReq,
+          placaVeiculo: val,
+          itemPlates: updatedItemPlates
+        });
+      }
+    });
+  };
+
+  // Prompt the reminder card once
+  useEffect(() => {
+    if (tomorrowReminders.length > 0 && !dismissedReminderToday) {
+      setShowReminderPopup(true);
+    }
+  }, [tomorrowReminders, dismissedReminderToday]);
+
+  const uniqueSectors = useMemo(() => {
+    const list = new Set(requests.map(r => r.setor));
+    return Array.from(list).sort();
+  }, [requests]);
+
+  // Detection and analysis of duplicate request registrations across the platform
+  const duplicateAnalysis = useMemo(() => {
+    const groups: Record<string, PendingRequest[]> = {};
+
+    requests.forEach(r => {
+      const nb = (r.nb || "").toString().trim().toLowerCase();
+      const nf = (r.nf || "").toString().trim().toLowerCase();
+      const mapa = (r.mapa || "").toString().trim().toLowerCase();
+      
+      let itemSig = (r.item || "").toString().trim().toLowerCase();
+      if (!itemSig && r.items && r.items.length > 0) {
+        itemSig = r.items.map(i => `${i.item}_${i.quantidade}`).sort().join("|");
+      }
+
+      if (!nb || (!nf && !mapa)) return;
+
+      const key = `${nb}_${nf}_${mapa}_${itemSig}`;
+
+      if (!groups[key]) {
+        groups[key] = [];
+      }
+      groups[key].push(r);
+    });
+
+    const duplicateGroups = Object.entries(groups).filter(([_, items]) => items.length > 1);
+
+    const duplicateMap = new Map<string, { groupKey: string; groupIndex: number; totalInGroup: number; duplicateCount: number; isExcess: boolean }>();
+    let totalDuplicateCount = 0;
+    let totalExcessCount = 0;
+
+    duplicateGroups.forEach(([key, items], gIdx) => {
+      totalDuplicateCount += items.length;
+      totalExcessCount += (items.length - 1);
+
+      items.forEach((req, idx) => {
+        duplicateMap.set(req.id, {
+          groupKey: key,
+          groupIndex: gIdx + 1,
+          totalInGroup: items.length,
+          duplicateCount: items.length,
+          isExcess: idx > 0
+        });
+      });
+    });
+
+    return {
+      duplicateGroups,
+      duplicateMap,
+      totalDuplicateCount,
+      totalExcessCount
+    };
+  }, [requests]);
+
+  const handlePurgeExcessDuplicates = useCallback(() => {
+    if (duplicateAnalysis.totalExcessCount === 0) {
+      alert("Nenhuma duplicata excedente identificada para exclusão.");
+      return;
+    }
+
+    const confirmPurge = window.confirm(
+      `🚨 ATENÇÃO: Deseja excluir permanentemente as ${duplicateAnalysis.totalExcessCount} cópias duplicadas no histórico?\n\nEsta operação manterá 1 registro original de cada solicitação e excluirá apenas as cópias repetidas.`
+    );
+
+    if (!confirmPurge) return;
+
+    let purgedCount = 0;
+    duplicateAnalysis.duplicateGroups.forEach(([_, items]) => {
+      for (let i = 1; i < items.length; i++) {
+        deletePendingRequest(items[i].id);
+        purgedCount++;
+      }
+    });
+
+    alert(`✅ Limpeza concluída! ${purgedCount} solicitações duplicadas foram excluídas com sucesso.`);
+  }, [duplicateAnalysis, deletePendingRequest]);
+
+  const handlePermanentDelete = useCallback((requestId: string) => {
+    const targetReq = requests.find(r => r.id === requestId);
+    const clientName = targetReq ? targetReq.nb : "";
+    const nf = targetReq ? targetReq.nf : "";
+    
+    if (window.confirm(`Tem certeza que deseja excluir permanentemente esta solicitação (NF ${nf || "N/A"} - NB ${clientName}) do histórico? Esta ação removerá o registro definitivamente.`)) {
+      deletePendingRequest(requestId);
+    }
+  }, [requests, deletePendingRequest]);
+
+  // Pre-indexed Maps for O(1) lightning fast Promax and Client lookups (eliminates 10,000x loops)
+  const promaxLookup = useMemo(() => {
+    const byNf = new Map<string, ExchangeRecord>();
+    const bySol = new Map<string, ExchangeRecord>();
+    const byMap = new Map<string, ExchangeRecord>();
+    const byClientNb = new Map<string, ExchangeRecord>();
+
+    for (let i = 0; i < promaxRecords.length; i++) {
+      const r = promaxRecords[i];
+      if (r.nf) {
+        const clean = r.nf.trim();
+        byNf.set(clean, r);
+        const withoutZeros = clean.replace(/^0+/, "");
+        if (withoutZeros) byNf.set(withoutZeros, r);
+      }
+      if (r.solicitacao) bySol.set(r.solicitacao.trim(), r);
+      if (r.mapa) byMap.set(r.mapa.trim(), r);
+      if (r.codigoCliente) {
+        const cd = r.codigoCliente.trim();
+        byClientNb.set(cd, r);
+        const cdNum = parseInt(cd, 10);
+        if (!isNaN(cdNum)) byClientNb.set(String(cdNum), r);
+      }
+    }
+    return { byNf, bySol, byMap, byClientNb };
+  }, [promaxRecords]);
+
+  const pdvDatabase = useMemo(() => getPdvDatabase(), []);
+
+  const getResolvedClientDetails = useCallback((nb: string | undefined) => {
+    const cleanNb = (nb || "").trim();
+    if (!cleanNb) {
+      return {
+        razaoSocial: "CLIENTE PARCEIRO DE DISTRIBUIÇÃO",
+        nomeFantasia: "CLIENTE PARCEIRO DE DISTRIBUIÇÃO",
+        municipio: "",
+        uf: "PB",
+        documento: "",
+        endereco: "",
+        complemento: "",
+        bairro: "",
+        cep: ""
+      };
+    }
+
+    // 1. Direct match in local PDV database
+    let clientInfo = pdvDatabase[cleanNb];
+    if (!clientInfo) {
+      const nbAsNum = parseInt(cleanNb, 10);
+      if (!isNaN(nbAsNum)) {
+        clientInfo = pdvDatabase[String(nbAsNum)];
+      }
+    }
+    if (clientInfo) return clientInfo;
+
+    // 2. Lookup in promaxLookup
+    const hit = promaxLookup.byClientNb.get(cleanNb) || promaxLookup.byClientNb.get(String(parseInt(cleanNb, 10)));
+    if (hit) {
+      return {
+        razaoSocial: hit.nomeCliente || `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+        nomeFantasia: hit.nomeCliente || `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+        municipio: "",
+        uf: "PB",
+        documento: "",
+        endereco: "",
+        complemento: "",
+        bairro: "",
+        cep: ""
+      };
+    }
+
+    return {
+      razaoSocial: `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+      nomeFantasia: `CLIENTE PARCEIRO DE DISTRIBUIÇÃO (#${cleanNb})`,
+      municipio: "",
+      uf: "PB",
+      documento: "",
+      endereco: "",
+      complemento: "",
+      bairro: "",
+      cep: ""
+    };
+  }, [pdvDatabase, promaxLookup]);
+
+  const getMatchedPromax = useCallback((req: PendingRequest): ExchangeRecord | undefined => {
+    if (req.nf) {
+      const cleanNf = req.nf.trim();
+      const hit = promaxLookup.byNf.get(cleanNf) || promaxLookup.byNf.get(cleanNf.replace(/^0+/, ""));
+      if (hit) return hit;
+    }
+    if ((req as any).solicitacao) {
+      const hit = promaxLookup.bySol.get(String((req as any).solicitacao).trim());
+      if (hit) return hit;
+    }
+    if (req.mapa) {
+      const hit = promaxLookup.byMap.get(req.mapa.trim());
+      if (hit) return hit;
+    }
+    if (req.nb) {
+      const cleanNb = req.nb.trim();
+      const hit = promaxLookup.byClientNb.get(cleanNb) || promaxLookup.byClientNb.get(String(parseInt(cleanNb, 10)));
+      if (hit) return hit;
+    }
+    return undefined;
+  }, [promaxLookup]);
+
+  // Filter requests according to tabs
+  const filteredRequests = useMemo(() => {
+    const text = (deferredSearchTerm || "").trim().toLowerCase();
+
+    return requests.filter(req => {
+      // 1. Search filter with comprehensive multi-field matching
+      let matchSearch = true;
+      if (text) {
+        const nf = (req.nf || "").toLowerCase();
+        const mapa = (req.mapa || "").toLowerCase();
+        const nb = (req.nb || "").toLowerCase();
+        const id = (req.id || "").toLowerCase();
+        const sol = ((req as any).solicitacao || "").toLowerCase();
+        const obs = (req.observacao || "").toLowerCase();
+        const mot = (req.motivo || "").toLowerCase();
+        const prod = (req.descricaoProduto || "").toLowerCase();
+        const itm = (req.item || "").toLowerCase();
+        const motr = (req.faltaMotorista || (req as any).motorista || "").toLowerCase();
+        const aj1 = (req.faltaAjudante1 || (req as any).ajudante1 || "").toLowerCase();
+        const aj2 = (req.faltaAjudante2 || (req as any).ajudante2 || "").toLowerCase();
+        const ajs = (req.faltaAjudantes || "").toLowerCase();
+        const set = (req.setor || "").toLowerCase();
+
+        const matchMain = nf.includes(text) ||
+          mapa.includes(text) ||
+          nb.includes(text) ||
+          id.includes(text) ||
+          sol.includes(text) ||
+          obs.includes(text) ||
+          mot.includes(text) ||
+          prod.includes(text) ||
+          itm.includes(text) ||
+          motr.includes(text) ||
+          aj1.includes(text) ||
+          aj2.includes(text) ||
+          ajs.includes(text) ||
+          set.includes(text);
+
+        const matchItems = !matchMain && req.items && req.items.some((i: any) => 
+          (i.item && i.item.toLowerCase().includes(text)) ||
+          (i.descricao && i.descricao.toLowerCase().includes(text)) ||
+          (i.itemDesc && i.itemDesc.toLowerCase().includes(text))
+        );
+
+        matchSearch = matchMain || !!matchItems;
+      }
+
+      if (!matchSearch) return false;
+
+      // 2. Sector filter
+      const matchSector = sectorFilter === "todos" || req.setor === sectorFilter;
+      if (!matchSector) return false;
+
+      // 2.5 Creator / Origem role filter (Motoristas, RNs, Login Admin)
+      if (createdRoleFilter !== "todos") {
+        const creatorRole = getCreatorRole(req, repsList, motoristasList);
+        if (creatorRole !== createdRoleFilter) return false;
+      }
+
+      // 3. Date range filter (ultra-precise normalized string comparison YYYY-MM-DD)
+      if (startDate || endDate) {
+        const reqYmd = getReqNormalizedDate(req);
+        if (reqYmd) {
+          if (startDate && reqYmd < startDate) return false;
+          if (endDate && reqYmd > endDate) return false;
+        } else {
+          return false;
+        }
+      }
+
+      // 3.5 Process Type filter (Reposição vs Troca vs Troca Exceto SKU Fechado)
+      // When in 'historico_baixas', process filter only applies if specifically chosen (not by default)
+      if (activeTab !== "historico_baixas" || processTypeFilter !== "todos") {
+        const motiveLower = (req.motivo || "").toLowerCase();
+        const hasFaltaItem = req.items && req.items.some((it: any) => (it.motivo || "").toLowerCase().includes("falta"));
+        const isFaltaSkuCompleto = motiveLower.includes("completo") || motiveLower.includes("fechado") ||
+          (req.items && req.items.some((it: any) => {
+            const m = (it.motivo || "").toLowerCase();
+            return m.includes("completo") || m.includes("fechado");
+          }));
+
+        const isReposicao = motiveLower.includes("falta") || hasFaltaItem;
+        const isTroca = !isReposicao;
+
+        if (processTypeFilter === "reposicao") {
+          if (!isReposicao) return false;
+        } else if (processTypeFilter === "troca") {
+          if (!isTroca) return false;
+        } else if (processTypeFilter === "troca_exceto_sku_fechado") {
+          if (isFaltaSkuCompleto) return false;
+        } else if (processTypeFilter === "alto_volume") {
+          if (getRequestHL(req) < 1.0) return false;
+        } else if (processTypeFilter === "alto_valor") {
+          if (getRequestValue(req, promaxRecords) < 500) return false;
+        }
+      }
+
+      // 3.6 Contingency Alert Filter (Promax)
+      if (onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") {
+        if (!isContingenciaReq(req)) return false;
+      }
+
+      // 3.7 Vale filter (Anti-duplicação: desmarcar/ocultar ocorrências que já constam na Guia de Vales)
+      if (valeFilter !== "todos") {
+        const hasVale = isRequestWithVale(req, valesHistorico) || isRequestWithVale(req, displayVales);
+        if (valeFilter === "sem_vale" && hasVale) return false;
+        if (valeFilter === "com_vale" && !hasVale) return false;
+      }
+
+      // 4. Tab filters
+      if (activeTab === "historico_baixas") {
+        const cast = req as any;
+        const isCadastrado = req.statusPromax === "cadastrado" || cast.status === "cadastrado";
+        const isReprovado = req.statusPromax === "reprovado" || req.statusPromax === "corrigir" || cast.status === "reprovado";
+        const hasReciboAssinado = !!cast.faltaBaixaReciboUrl || !!cast.faltaBaixaReciboName || (!!cast.faltaBaixa && !!cast.fotoUrl);
+        const isBaixadoDirect = !!cast.faltaBaixa || !!cast.contingenciaBaixada || cast.status === "baixado" || cast.status === "concluido" || isCadastrado || !!cast.faltaBaixaDate;
+        const isPendente = req.statusPromax === "pendente" && !isBaixadoDirect;
+
+        let matchesStatus = true;
+        if (historicoBaixasStatusFilter === "aprovados") {
+          matchesStatus = isCadastrado;
+        } else if (historicoBaixasStatusFilter === "reprovados") {
+          matchesStatus = isReprovado;
+        } else if (historicoBaixasStatusFilter === "baixados") {
+          matchesStatus = isBaixadoDirect || hasReciboAssinado;
+        } else if (historicoBaixasStatusFilter === "pendentes") {
+          matchesStatus = isPendente;
+        } else if (historicoBaixasStatusFilter === "duplicatas") {
+          matchesStatus = duplicateAnalysis.duplicateMap.has(req.id);
+        } else {
+          // "todos": Show all historical records in this date/sector filter
+          matchesStatus = true;
+        }
+
+        return matchesStatus;
+      }
+
+      if (activeTab === "faltas_inversoes") {
+        const cast = req as any;
+        const isFalta = isFaltaOrInversao(req);
+        if (!isFalta) return false;
+
+        // Faltas specificity status filter
+        const isBaixada = !!cast.faltaBaixa || !!cast.contingenciaBaixada || cast.status === "baixado" || !!cast.faltaBaixaDate;
+        if (lackFilterStatus === "abertos" && isBaixada) return false;
+        if (lackFilterStatus === "baixados" && !isBaixada) return false;
+
+        // Faltas typo erro filter
+        const errType = (req as any).faltaTipoErro;
+        if (lackFilterErrorType === "carregamento" && errType !== "carregamento") return false;
+        if (lackFilterErrorType === "entrega" && errType !== "entrega") return false;
+        if (lackFilterErrorType === "indefinido" && errType) return false;
+
+        return true;
+      } else {
+        let matchStatus = req.statusPromax === activeTab;
+        if (onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") {
+          // Exibe todas as ocorrências de contingência do período (pendentes, cadastradas ou baixadas)
+          matchStatus = true;
+        } else if (activeTab === "pendente") {
+          if (!isAllowedInPending(req, repsList, motoristasList)) {
+            matchStatus = false;
+          }
+        } else if (activeTab === "reprovado") {
+          matchStatus = req.statusPromax === "reprovado" || req.statusPromax === "corrigir";
+        }
+        return matchStatus;
+      }
+    }).sort((a, b) => {
+      // Custom process sorting by Volume (HL) or Financial Value (R$)
+      if (processTypeFilter === "maior_hl") {
+        return getRequestHL(b) - getRequestHL(a);
+      }
+      if (processTypeFilter === "menor_hl") {
+        return getRequestHL(a) - getRequestHL(b);
+      }
+      if (processTypeFilter === "maior_reais") {
+        return (b.valorTotal || 0) - (a.valorTotal || 0);
+      }
+      if (processTypeFilter === "menor_reais") {
+        return (a.valorTotal || 0) - (b.valorTotal || 0);
+      }
+
+      // Default sorting: Ultra-fast Normalized Date sort order
+      const ymdA = getReqNormalizedDate(a) || "1970-01-01";
+      const ymdB = getReqNormalizedDate(b) || "1970-01-01";
+      const dateDiff = dateSortOrder === "desc" 
+        ? ymdB.localeCompare(ymdA) 
+        : ymdA.localeCompare(ymdB);
+      if (dateDiff !== 0) return dateDiff;
+
+      const cityA = (a as any).municipioRecibo || "";
+      const cityB = (b as any).municipioRecibo || "";
+      return cityA.localeCompare(cityB, "pt-BR", { sensitivity: "base" });
+    });
+  }, [requests, deferredSearchTerm, activeTab, sectorFilter, createdRoleFilter, startDate, endDate, lackFilterStatus, lackFilterErrorType, processTypeFilter, dateSortOrder, historicoBaixasStatusFilter, onlyContingenciaFilter, valeFilter, valesHistorico, promaxRecords, duplicateAnalysis]);
+
+  // Paginated window for instant rendering without browser freeze
+  const totalFilteredCount = filteredRequests.length;
+  const totalPages = pageSize > 0 ? Math.max(1, Math.ceil(totalFilteredCount / pageSize)) : 1;
+  const safeCurrentPage = Math.min(Math.max(1, currentPage), totalPages);
+
+  const displayedRequests = useMemo(() => {
+    if (pageSize <= 0) return filteredRequests;
+    const start = (safeCurrentPage - 1) * pageSize;
+    return filteredRequests.slice(start, start + pageSize);
+  }, [filteredRequests, safeCurrentPage, pageSize]);
+
+  // Process type summary breakdown for dashboard cards (Reposição vs. Troca vs. Contingências)
+  // Strictly respects active date period, sector, creator, and vale filters as requested:
+  // "identificar o valor correto dos recibos em contingência apenas do periodo filtrado"
+  // "filtro com vale ou sem vale, pois se houver alguma reposição que já tenha sido gerado vale não entre nos dados e na soma, identifique pelo mapa e o sku cadastrado"
+  const processSummary = useMemo(() => {
+    let reposicaoCount = 0;
+    let reposicaoVal = 0;
+    let trocaCount = 0;
+    let trocaVal = 0;
+    let excetoSkuFechadoCount = 0;
+    let excetoSkuFechadoVal = 0;
+    let cadastradosContingenciaCount = 0;
+
+    // Filter requests matching the active date period and active operational filters
+    const filteredForSummary = requests.filter(r => {
+      // 1. Date period filter (MANDATORY for "apenas do periodo filtrado")
+      if (startDate) {
+        const reqDate = getReqDate(r);
+        if (reqDate) {
+          const start = new Date(startDate + "T00:00:00");
+          if (reqDate < start) return false;
+        } else {
+          return false;
+        }
+      }
+      if (endDate) {
+        const reqDate = getReqDate(r);
+        if (reqDate) {
+          const end = new Date(endDate + "T23:59:59");
+          if (reqDate > end) return false;
+        } else {
+          return false;
+        }
+      }
+
+      // 2. Sector filter if applied
+      if (sectorFilter !== "todos") {
+        const sec = (r.setor || "").trim().toLowerCase();
+        const sf = sectorFilter.trim().toLowerCase();
+        if (sec !== sf && !sec.includes(sf) && !sf.includes(sec)) return false;
+      }
+
+      // 3. Search term filter if applied
+      if (searchTerm.trim()) {
+        const term = searchTerm.toLowerCase().trim();
+        const isNumericTerm = /^\d+$/.test(term);
+        const nfMatch = (r.nf || "").toLowerCase().includes(term);
+        const nbRaw = (r.nb || "").toLowerCase().trim();
+        const nbMatch = isNumericTerm
+          ? (nbRaw === term || nbRaw.startsWith(term) || nbRaw.replace(/^0+/, "") === term.replace(/^0+/, "") || nbRaw.replace(/^0+/, "").startsWith(term.replace(/^0+/, "")))
+          : nbRaw.includes(term);
+        const mapMatch = (r.mapa || "").toLowerCase().includes(term);
+        const obsMatch = (r.observacao || "").toLowerCase().includes(term);
+        const idMatch = (r.id || "").toLowerCase().includes(term);
+        const prodMatch = (r.produto || r.item || r.descricaoProduto || "").toLowerCase().includes(term);
+        if (!nfMatch && !nbMatch && !mapMatch && !obsMatch && !idMatch && !prodMatch) return false;
+      }
+
+      // 4. Role filter if applied
+      if (createdRoleFilter !== "todos") {
+        const role = (r.cadastroRole || r.origem || "").toLowerCase();
+        if (createdRoleFilter === "motorista" && !role.includes("motorista") && !role.includes("rota")) return false;
+        if (createdRoleFilter === "rn" && !role.includes("rn") && !role.includes("vendedor")) return false;
+        if (createdRoleFilter === "admin" && !role.includes("admin") && !role.includes("gest")) return false;
+      }
+
+      // 5. Vale Filter: "pois se houver alguma reposição que já tenha sido gerado vale não entre nos dados e na soma, identifique pelo mapa e o sku cadastrado"
+      if (valeFilter !== "todos") {
+        const hasVale = isRequestWithVale(r, valesHistorico) || isRequestWithVale(r, displayVales);
+        if (valeFilter === "sem_vale" && hasVale) return false;
+        if (valeFilter === "com_vale" && !hasVale) return false;
+      }
+
+      // 6. Contingency alert filter if applied
+      if ((onlyContingenciaFilter || processTypeFilter === "contingencia") && !isContingenciaReq(r)) return false;
+
+      return true;
+    });
+
+    // Dedicated Period Contingency Metrics (Calculated across the period for data analyst conciliation)
+    let contingenciasTotalCount = 0;
+    let contingenciasTotalVal = 0;
+    let contingenciasComValeCount = 0;
+    let contingenciasComValeVal = 0;
+    let contingenciasSemValeCount = 0;
+    let contingenciasSemValeVal = 0;
+
+    requests.forEach(r => {
+      // Check date filter
+      if (startDate || endDate) {
+        const reqYmd = getReqNormalizedDate(r);
+        if (reqYmd) {
+          if (startDate && reqYmd < startDate) return;
+          if (endDate && reqYmd > endDate) return;
+        } else {
+          return;
+        }
+      }
+      if (sectorFilter !== "todos" && r.setor.trim() !== sectorFilter.trim()) return;
+      if (isContingenciaReq(r)) {
+        const val = getRequestValue(r, promaxRecords);
+        contingenciasTotalCount++;
+        contingenciasTotalVal += val;
+        const hasVale = isRequestWithVale(r, valesHistorico) || isRequestWithVale(r, displayVales);
+        if (hasVale) {
+          contingenciasComValeCount++;
+          contingenciasComValeVal += val;
+        } else {
+          contingenciasSemValeCount++;
+          contingenciasSemValeVal += val;
+        }
+      }
+    });
+
+    filteredForSummary.forEach(r => {
+      const val = getRequestValue(r, promaxRecords);
+      const isRep = isReposicaoReq(r);
+      const isFechado = isFaltaSkuCompletoReq(r);
+      const isReprovado = r.statusPromax === "reprovado";
+
+      // Active operational goals (Reposição & Troca)
+      const isBaixadaOrConcluded = !!(r as any).faltaBaixa || r.statusPromax === "cadastrado" || isReprovado;
+      if (!isBaixadaOrConcluded && isAllowedInPending(r, repsList, motoristasList)) {
+        if (isRep || isFaltaOrInversaoReq(r)) {
+          reposicaoCount++;
+          reposicaoVal += val;
+        } else {
+          trocaCount++;
+          trocaVal += val;
+        }
+      }
+
+      // RECIBO PDV CONTINGÊNCIA Card:
+      // Accounts for EVERYTHING registered (cadastrado) OR pending in contingency, EVEN IF IN HISTORY/CADASTRO (not reprovado & not Falta SKU Fechado)
+      if (!isReprovado && !isFechado) {
+        excetoSkuFechadoCount++;
+        excetoSkuFechadoVal += val;
+        if (r.statusPromax === "cadastrado") {
+          cadastradosContingenciaCount++;
+        }
+      }
+    });
+
+    return {
+      reposicaoCount,
+      reposicaoVal,
+      trocaCount,
+      trocaVal,
+      excetoSkuFechadoCount,
+      excetoSkuFechadoVal,
+      cadastradosContingenciaCount,
+      contingenciasTotalCount,
+      contingenciasTotalVal,
+      contingenciasComValeCount,
+      contingenciasComValeVal,
+      contingenciasSemValeCount,
+      contingenciasSemValeVal,
+      isPeriodFiltered: !!(startDate || endDate),
+      filteredCount: filteredForSummary.length
+    };
+  }, [requests, promaxRecords, repsList, motoristasList, startDate, endDate, sectorFilter, searchTerm, createdRoleFilter, valeFilter, onlyContingenciaFilter, processTypeFilter, valesHistorico, displayVales]);
+
+  // Trigger handlers to open custom interactive modals
+  const triggerRegister = (id: string) => {
+    const loggedUser = sessionStorage.getItem("sstr_current_manager_name") || "Gestor";
+    setModalAction({ type: "register", requestId: id });
+    setModalInput(loggedUser);
+    setModalError("");
+  };
+
+  const triggerReject = (id: string) => {
+    setModalAction({ type: "reject", requestId: id });
+    setModalInput("");
+    setModalError("");
+  };
+
+  const triggerCorrigir = (id: string) => {
+    setModalAction({ type: "corrigir", requestId: id });
+    setModalInput("");
+    setModalError("");
+  };
+
+  const triggerDelete = (id: string) => {
+    setModalAction({ type: "delete", requestId: id });
+    setModalInput("");
+    setModalError("");
+  };
+
+  const handleModalConfirm = async () => {
+    if (!modalAction) return;
+    const { type, requestId } = modalAction;
+
+      const loggedUser = sessionStorage.getItem("sstr_current_manager_name") || "Gestor";
+      if (type === "reject" || type === "corrigir") {
+        if (!modalInput.trim()) {
+          const errMsg = type === "reject" ? "O motivo da reprovação é obrigatório!" : "Descreva o que preencher ou corrigir (Obrigatório)!";
+          setModalError(errMsg);
+          return;
+        }
+        const targetReq = requests.find(r => r.id === requestId);
+        if (targetReq) {
+          savePendingRequest({
+            ...targetReq,
+            statusPromax: type === "reject" ? ("reprovado" as const) : ("corrigir" as const),
+            notified: false,
+            rejeitadoObs: modalInput.trim(),
+            reprovadoUser: loggedUser,
+            reprovadoDate: new Date().toLocaleDateString("pt-BR") + " " + new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+          });
+        }
+      } else if (type === "register") {
+        const name = modalInput.trim() || loggedUser;
+      const targetReq = requests.find(r => r.id === requestId);
+      if (targetReq) {
+        const reqToExport = {
+          ...targetReq,
+          statusPromax: "cadastrado" as const,
+          cadastroUser: name,
+          cadastroDate: new Date().toLocaleDateString("pt-BR") + " " + new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+        };
+
+        try {
+          // Export registration PDF immediately (includes request details + attached evidence photos)
+          const pdfResult = await exportRegistrationPdf(reqToExport, { autoDownload: true });
+          if (!pdfResult || !pdfResult.filename) {
+            throw new Error("Erro na compilação do arquivo PDF.");
+          }
+        } catch (pdfErr: any) {
+          console.error("Erro ao gerar PDF no lançamento:", pdfErr);
+          alert("❌ ATENÇÃO: O lançamento NÃO foi concluído pois ocorreu um erro ao gerar/baixar o PDF oficial com as evidências.\n\nDetalhes: " + (pdfErr?.message || pdfErr));
+          setModalError("O lançamento foi bloqueado pois o PDF de evidências não pôde ser gerado.");
+          return;
+        }
+
+        // Save status as cadastrado and convert fotoUrl to the network path (archived in PDF on network folder)
+        const networkPath = targetReq.pdfFilePath || `${NETWORK_REGISTROS_PATH}\\${generatePdfFilename(targetReq.mapa, targetReq.nb, targetReq.nf, targetReq.data)}`;
+
+        savePendingRequest({
+          ...reqToExport,
+          notified: false,
+          fotoUrl: networkPath
+        });
+      }
+    } else if (type === "delete") {
+      deletePendingRequest(requestId);
+    }
+
+    setModalAction(null);
+    setModalInput("");
+    setModalError("");
+  };
+
+  // Open Edit Shortage sliding details editor
+  const handleOpenEditFalta = (req: PendingRequest) => {
+    setIsEditFaltaMaximized(true);
+    const cast = req as any;
+    setEditingFalta(req);
+    setEditFaltaErrorType(cast.faltaTipoErro || "");
+    
+    // Check if an existing Vale is already linked to this request in valesHistorico
+    const matchingVale = valesHistorico.find(v => 
+      v.requestId === req.id || 
+      v.originalRequest?.id === req.id || 
+      v.id === `vale_${req.id}` || 
+      (v.nf && v.nf !== "N0-NF" && v.nf === req.nf)
+    );
+
+    // Guess default driver from Promax records if empty
+    let inferredDriver = "";
+    if (promaxRecords.length > 0) {
+      const matched = promaxRecords.find(r => r.nf === req.nf || r.mapa === req.mapa);
+      if (matched) {
+        inferredDriver = matched.nomeMotorista || matched.motorista || "";
+      }
+    }
+
+    let defaultMotorista = cast.faltaMotorista || cast.motorista || matchingVale?.motorista || "";
+    if (!defaultMotorista || defaultMotorista === "Não Declarado") {
+      const sectorKey = req.setor ? req.setor.replace("ROTA - ", "").trim() : "";
+      const routeDriver = motoristasList[sectorKey];
+      if (routeDriver) {
+        defaultMotorista = routeDriver.nome;
+      } else if (inferredDriver) {
+        defaultMotorista = inferredDriver;
+      }
+    }
+
+    let defaultMotoristaCpf = cast.faltaMotoristaCpf || cast.motoristaCpf || matchingVale?.motoristaCpf || "";
+    if (defaultMotorista && !defaultMotoristaCpf) {
+      const detail = getCrewDetailByName(defaultMotorista);
+      if (detail) {
+        defaultMotoristaCpf = detail.cpf;
+      }
+    }
+
+    setEditFaltaMotorista(defaultMotorista);
+    setEditFaltaMotoristaCpf(defaultMotoristaCpf);
+    setEditFaltaAjudantes(cast.faltaAjudantes || cast.ajudantes || matchingVale?.ajudantes || "");
+    
+    let defaultAjudante1 = cast.faltaAjudante1 || cast.ajudante1 || matchingVale?.ajudante1 || (cast.faltaAjudantes ? cast.faltaAjudantes.split(",")[0]?.trim() || "" : (cast.ajudantes ? cast.ajudantes.split(",")[0]?.trim() || "" : (matchingVale?.ajudantes ? matchingVale.ajudantes.split(",")[0]?.trim() || "" : "")));
+    let defaultAjudante1Cpf = cast.faltaAjudante1Cpf || cast.ajudante1Cpf || matchingVale?.ajudante1Cpf || "";
+    if (defaultAjudante1 && !defaultAjudante1Cpf) {
+      const detail = getCrewDetailByName(defaultAjudante1);
+      if (detail) {
+        defaultAjudante1Cpf = detail.cpf;
+      }
+    }
+
+    let defaultAjudante2 = cast.faltaAjudante2 || cast.ajudante2 || matchingVale?.ajudante2 || (cast.faltaAjudantes ? cast.faltaAjudantes.split(",")[1]?.trim() || "" : (cast.ajudantes ? cast.ajudantes.split(",")[1]?.trim() || "" : (matchingVale?.ajudantes ? matchingVale.ajudantes.split(",")[1]?.trim() || "" : "")));
+    let defaultAjudante2Cpf = cast.faltaAjudante2Cpf || cast.ajudante2Cpf || matchingVale?.ajudante2Cpf || "";
+    if (defaultAjudante2 && !defaultAjudante2Cpf) {
+      const detail = getCrewDetailByName(defaultAjudante2);
+      if (detail) {
+        defaultAjudante2Cpf = detail.cpf;
+      }
+    }
+
+    setEditFaltaAjudante1(defaultAjudante1);
+    setEditFaltaAjudante1Cpf(defaultAjudante1Cpf);
+    setEditFaltaAjudante2(defaultAjudante2);
+    setEditFaltaAjudante2Cpf(defaultAjudante2Cpf);
+    setEditFaltaDataAnomalia(cast.mapaDataAnomalia || req.data.split(" ")[0] || "");
+    setEditFaltaDataEntrega(cast.dataEntregaRecibo || new Date().toLocaleDateString("pt-BR"));
+    setEditFaltaObservacao(cast.observacaoRecibo || req.observacao || "");
+    setEditFaltaPhoto(req.fotoUrl || "");
+    const pdvDb = getPdvDatabase();
+    const clientInfo = getClientDetails(req.nb, pdvDb, promaxRecords);
+    setEditFaltaCidade(cast.municipioRecibo || clientInfo.municipio || "");
+
+    // Initialize dynamic crew model for classification & rateio from source request or matching vale
+    const sourceCrew = (cast.faltaCrewList && Array.isArray(cast.faltaCrewList) && cast.faltaCrewList.length > 0)
+      ? cast.faltaCrewList
+      : (matchingVale?.crewList && Array.isArray(matchingVale.crewList) && matchingVale.crewList.length > 0)
+        ? matchingVale.crewList
+        : null;
+
+    if (sourceCrew) {
+      setEditFaltaCrew(sourceCrew.map((m: any, idx: number) => ({
+        id: m.id || `ef_crew_${idx}`,
+        role: m.role || (idx === 0 ? "Motorista" : `Ajudante ${idx}`),
+        name: (m.name || "").trim().toUpperCase(),
+        cpf: m.cpf || "",
+        isExempt: !!m.isExempt || isDriverX(m.name)
+      })));
+    } else {
+      const initialCrew: Array<{ id: string; role: string; name: string; cpf: string; isExempt?: boolean }> = [
+        {
+          id: "1",
+          role: "Motorista",
+          name: (defaultMotorista || "").trim().toUpperCase(),
+          cpf: defaultMotoristaCpf,
+          isExempt: isDriverX(defaultMotorista)
+        }
+      ];
+      if (defaultAjudante1.trim()) {
+        initialCrew.push({
+          id: "2",
+          role: "Ajudante 1",
+          name: defaultAjudante1.trim().toUpperCase(),
+          cpf: defaultAjudante1Cpf,
+          isExempt: false
+        });
+      }
+      if (defaultAjudante2.trim()) {
+        initialCrew.push({
+          id: "3",
+          role: "Ajudante 2",
+          name: defaultAjudante2.trim().toUpperCase(),
+          cpf: defaultAjudante2Cpf,
+          isExempt: false
+        });
+      }
+      if (initialCrew.length === 1) {
+        initialCrew.push({
+          id: "2",
+          role: "Ajudante 1",
+          name: "",
+          cpf: "",
+          isExempt: false
+        });
+      }
+      setEditFaltaCrew(initialCrew);
+    }
+  };
+
+  // Save customized shortage parameters
+  const handleSaveFaltaDetails = async (openVale = false) => {
+    if (!editingFalta) return;
+
+    const targetReq = requests.find(r => r.id === editingFalta.id) || editingFalta;
+    if (targetReq) {
+      const driverMember = editFaltaCrew.find(c => c.role.toLowerCase().includes("motorista")) || editFaltaCrew[0];
+      const helperMembers = editFaltaCrew.filter(c => c !== driverMember);
+      const cleanDriverName = (driverMember?.name || editFaltaMotorista || "").trim().toUpperCase();
+      const cleanDriverCpf = isDriverX(cleanDriverName) ? "000.000.000-00" : (driverMember?.cpf || editFaltaMotoristaCpf || "").trim();
+      const combinedHelpers = helperMembers.map(h => h.name.trim()).filter(Boolean).join(", ");
+
+      const updatedReq = {
+        ...targetReq,
+        faltaTipoErro: editFaltaErrorType || (openVale ? "entrega" : (targetReq as any).faltaTipoErro),
+        reviewedByControle: true,
+        faltaCrewList: editFaltaCrew,
+        faltaQtdColaboradores: editFaltaCrew.length,
+        ...(cleanDriverName ? { faltaMotorista: cleanDriverName, motorista: cleanDriverName } : {}),
+        ...(cleanDriverCpf ? { faltaMotoristaCpf: cleanDriverCpf, motoristaCpf: cleanDriverCpf } : {}),
+        ...(combinedHelpers ? { faltaAjudantes: combinedHelpers, ajudantes: combinedHelpers } : {}),
+        ...(helperMembers[0]?.name ? { faltaAjudante1: helperMembers[0].name.trim().toUpperCase(), ajudante1: helperMembers[0].name.trim().toUpperCase() } : {}),
+        ...(helperMembers[0]?.cpf ? { faltaAjudante1Cpf: helperMembers[0].cpf.trim() } : {}),
+        ...(helperMembers[1]?.name ? { faltaAjudante2: helperMembers[1].name.trim().toUpperCase(), ajudante2: helperMembers[1].name.trim().toUpperCase() } : {}),
+        ...(helperMembers[1]?.cpf ? { faltaAjudante2Cpf: helperMembers[1].cpf.trim() } : {}),
+        ...(helperMembers[2]?.name ? { faltaAjudante3: helperMembers[2].name.trim().toUpperCase(), ajudante3: helperMembers[2].name.trim().toUpperCase() } : {}),
+        ...(helperMembers[2]?.cpf ? { faltaAjudante3Cpf: helperMembers[2].cpf.trim() } : {}),
+        ...(editFaltaDataAnomalia.trim() ? { mapaDataAnomalia: editFaltaDataAnomalia.trim() } : {}),
+        ...(editFaltaDataEntrega.trim() ? { dataEntregaRecibo: editFaltaDataEntrega.trim() } : {}),
+        ...(editFaltaObservacao.trim() ? { observacaoRecibo: editFaltaObservacao.trim() } : {}),
+        ...(editFaltaCidade.trim() ? { municipioRecibo: editFaltaCidade.trim() } : {}),
+        ...(editFaltaPhoto ? { fotoUrl: editFaltaPhoto } : {}),
+      } as PendingRequest;
+
+      await savePendingRequest(updatedReq);
+
+      if (editFaltaErrorType === "carregamento") {
+        const existingVale = valesHistorico.find(v => v.requestId === updatedReq.id || v.originalRequest?.id === updatedReq.id || v.id === `vale_${updatedReq.id}`);
+        if (existingVale) {
+          await deleteValeEntry(existingVale.id);
+        }
+      } else if (editFaltaErrorType === "entrega" || openVale || valesHistorico.some(v => v.requestId === updatedReq.id || v.originalRequest?.id === updatedReq.id || v.id === `vale_${updatedReq.id}`)) {
+        await createAndSaveVale(updatedReq);
+      }
+
+      setEditingFalta(null);
+
+      if (openVale) {
+        setSelectedPrintDoc({ type: "vale", request: updatedReq });
+      }
+    }
+  };
+
+  // Process physical settlement confirmation modal with uploaded document/photo
+  const handleConfirmarBaixaShortage = async () => {
+    if (!baixandoFalta) return;
+    const isWarehouseError = baixandoFalta.faltaTipoErro === "carregamento";
+    if (!baixaReciboFile && !isWarehouseError) {
+      setBaixaError("Por favor, anexe a foto ou o PDF do recibo assinado pelo cliente para poder efetuar a baixa.");
+      return;
+    }
+
+    setBaixaError("Gerando PDF de Evidência Completo... Por favor, aguarde.");
+
+    // Resolve client details for PDF metadata
+    const pdvDb = getPdvDatabase();
+    const clientDetails = getClientDetails(baixandoFalta.nb, pdvDb, promaxRecords);
+    const clientNameResolved = clientDetails.razaoSocial || clientDetails.nomeFantasia || "Cliente Especial";
+
+    // Prepare docData for compiling
+    const docDataForPdf = {
+      ...baixandoFalta,
+      nomeCliente: clientNameResolved,
+      cadastroUser: "Controle Operacional",
+      cadastroDate: new Date().toLocaleDateString("pt-BR") + " " + new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+    };
+
+    let compiledPdfUrl = "";
+    try {
+      const compileRes = await fetch(getApiUrl("/api/compile-pdf"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          requestId: baixandoFalta.id,
+          docData: docDataForPdf
+        })
+      });
+
+      if (!compileRes.ok) {
+        const errData = await compileRes.json();
+        throw new Error(errData.error || "Erro desconhecido no servidor");
+      }
+
+      const compileData = await compileRes.json();
+      if (compileData.success && compileData.url) {
+        compiledPdfUrl = compileData.url;
+      } else {
+        throw new Error("A resposta do servidor de compilação de PDF não retornou uma URL válida.");
+      }
+    } catch (compileErr: any) {
+      console.warn("Servidor de PDF indisponível ou erro no processamento do backend, gerando PDF localmente...", compileErr);
+      try {
+        await exportRegistrationPdf(baixandoFalta, { autoDownload: true, isBaixa: true });
+      } catch (localPdfErr: any) {
+        console.error("Erro na geração local de PDF:", localPdfErr);
+      }
+    }
+
+    // PDF compiled successfully! Now offer the download of this document with a standard naming convention
+    const formattedDate = new Date().toLocaleDateString("pt-BR").replace(/\//g, "-");
+    const cleanClientNameForFile = clientNameResolved
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // remove accents
+      .replace(/[^a-zA-Z0-9]/g, "_")
+      .substring(0, 30);
+    const suggestedPdfName = `SSTR_EVIDENCIA_${baixandoFalta.id}_NF_${baixandoFalta.nf}_${cleanClientNameForFile}_${formattedDate}.pdf`;
+
+    try {
+      const link = document.createElement("a");
+      link.href = compiledPdfUrl;
+      link.download = suggestedPdfName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (dlErr) {
+      console.error("Falha ao iniciar o download automático do PDF:", dlErr);
+    }
+
+    // Now upload physical settlement receipt image/file (PDF or Image) if needed
+    let finalReciboUrl = baixaReciboFile?.dataUrl || baixandoFalta.fotoUrl || "";
+    if (baixaReciboFile?.dataUrl && (baixaReciboFile.dataUrl.startsWith("data:image/") || baixaReciboFile.dataUrl.startsWith("data:application/pdf"))) {
+      try {
+        const upRes = await fetch(getApiUrl("/api/upload"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: baixaReciboFile.dataUrl })
+        });
+        if (upRes.ok) {
+          const upData = await upRes.json();
+          if (upData.url) {
+            finalReciboUrl = upData.url;
+          }
+        }
+      } catch (uploadErr) {
+        console.error("Error uploading physical settlement image/pdf:", uploadErr);
+      }
+    }
+
+    // Trigger user attachment download if attached file exists
+    if (baixaReciboFile?.dataUrl) {
+      try {
+        const fileLink = document.createElement("a");
+        fileLink.href = baixaReciboFile.dataUrl;
+        fileLink.download = baixaReciboFile.name || `COMPROVANTE_${baixandoFalta.id}.pdf`;
+        document.body.appendChild(fileLink);
+        fileLink.click();
+        document.body.removeChild(fileLink);
+      } catch (e) {
+        console.warn("Could not auto-download user attached file:", e);
+      }
+    }
+
+    const updatedRequestObj = {
+      ...baixandoFalta,
+      status: "baixado" as const,
+      statusPromax: "cadastrado" as const,
+      faltaBaixa: true,
+      faltaBaixaDate: new Date().toLocaleDateString("pt-BR") + " às " + new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }),
+      faltaBaixaUser: "Controle Operacional",
+      faltaBaixaReciboName: baixaReciboFile?.name || "Baixa Interna (Erro de Armazém)",
+      faltaBaixaReciboUrl: finalReciboUrl,
+      faltaBaixaReciboType: baixaReciboFile?.type || "application/pdf",
+      faltaBaixaObs: baixaObservacao.trim() || undefined,
+      fotoUrl: compiledPdfUrl || finalReciboUrl || baixandoFalta.fotoUrl
+    } as PendingRequest;
+
+    savePendingRequest(updatedRequestObj);
+
+    // Save to concludedBaixa to display the success copy path modal
+    setConcludedBaixa(updatedRequestObj);
+
+    setBaixandoFalta(null);
+    setBaixaReciboFile(null);
+    setBaixaObservacao("");
+    setBaixaError("");
+  };
+
+  // Undoing "Dar Baixa" on shortage request if mistakes were made
+  const handleReverterBaixaShortage = (id: string) => {
+    const targetReq = requests.find(r => r.id === id);
+    if (targetReq) {
+      savePendingRequest({
+        ...targetReq,
+        faltaBaixa: false,
+        faltaBaixaDate: undefined,
+        faltaBaixaUser: undefined,
+        faltaBaixaReciboName: undefined,
+        faltaBaixaReciboUrl: undefined,
+        faltaBaixaReciboType: undefined,
+        faltaBaixaObs: undefined
+      } as PendingRequest);
+    }
+  };
+
+  // Count active requests by status category
+  const pendingCount = useMemo(() => {
+    return requests.filter(r => r.statusPromax === "pendente" && isAllowedInPending(r, repsList, motoristasList)).length;
+  }, [requests, repsList, motoristasList]);
+
+  const approvedCount = useMemo(() => {
+    return requests.filter(r => r.statusPromax === "cadastrado").length;
+  }, [requests]);
+
+  const rejectedCount = useMemo(() => {
+    return requests.filter(r => r.statusPromax === "reprovado" || r.statusPromax === "corrigir").length;
+  }, [requests]);
+
+  const lackCount = useMemo(() => {
+    return requests.filter(isFaltaOrInversao).length;
+  }, [requests]);
+
+  const lackActiveCount = useMemo(() => {
+    return requests.filter(r => isFaltaOrInversao(r) && !isRequestBaixada(r)).length;
+  }, [requests]);
+
+  const lackHistoryCount = useMemo(() => {
+    return requests.filter(r => isFaltaOrInversao(r) && isRequestBaixada(r)).length;
+  }, [requests]);
+
+  // Monthly limit metric calculation (R$ 12.000 limit)
+  const MONTHLY_LIMIT = 12000;
+
+  const budgetProjection = useMemo(() => {
+    const officialRecords = promaxRecords.filter(r => r.sistemaOrigem !== "Portal de Campo SSTR");
+
+    // Dynamic active evaluation month based on official records if available
+    const dObj = new Date();
+    let evalMonth = dObj.getMonth() + 1; // 1-indexed (1-12)
+    let evalYear = dObj.getFullYear();
+
+    if (officialRecords.length > 0) {
+      let maxTime = 0;
+      let bestMonth = evalMonth;
+      let bestYear = evalYear;
+
+      officialRecords.forEach(r => {
+        if (r.dataSolicitacao) {
+          const parts = r.dataSolicitacao.split("/");
+          if (parts.length === 3) {
+            const d = parseInt(parts[0], 10);
+            const m = parseInt(parts[1], 10);
+            const y = parseInt(parts[2], 10);
+            const t = new Date(y, m - 1, d).getTime();
+            if (t > maxTime) {
+              maxTime = t;
+              bestMonth = m;
+              bestYear = y;
+            }
+          }
+        }
+      });
+      evalMonth = bestMonth;
+      evalYear = bestYear;
+    }
+
+    const monthNamesList = [
+      "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+      "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro"
+    ];
+    const evalMonthName = monthNamesList[evalMonth - 1];
+
+    // Filter current evaluation month/year approved official records
+    const currentMonthOfficialApproved = officialRecords.filter(r => {
+      const isApproved = r.status.toLowerCase().includes("aprov") || r.status.toLowerCase().includes("cadastrado");
+      if (!isApproved) return false;
+
+      if (r.dataSolicitacao) {
+        const parts = r.dataSolicitacao.split("/");
+        if (parts.length === 3) {
+          const m = parseInt(parts[1], 10);
+          const y = parseInt(parts[2], 10);
+          return m === evalMonth && y === evalYear;
+        }
+      }
+      return false;
+    });
+
+    const approvedOfficialSum = currentMonthOfficialApproved.reduce((sum, r) => sum + r.valorTotal, 0);
+
+    // Sum of all currently pending requests
+    const pendingReqs = requests.filter(r => r.statusPromax === "pendente");
+    const totalPendingSum = pendingReqs.reduce((sum, r) => {
+      if (isSwapRequest(r)) {
+        const errType = (r as any).faltaTipoErro || "";
+        if (errType !== "entrega") {
+          return sum; // Exclude inversion if not classified as delivery error (erro da entrega)
+        }
+      }
+      return sum + getRequestValue(r, promaxRecords);
+    }, 0);
+
+    const projectedAccumulated = approvedOfficialSum + totalPendingSum;
+    const currentAtingimento = (approvedOfficialSum / MONTHLY_LIMIT) * 100;
+    const projectedAtingimento = (projectedAccumulated / MONTHLY_LIMIT) * 100;
+    const isProjectedOverLimit = projectedAccumulated > MONTHLY_LIMIT;
+    const projectedOverflow = isProjectedOverLimit ? projectedAccumulated - MONTHLY_LIMIT : 0;
+
+    return {
+      evalMonthName,
+      evalYear,
+      approvedOfficialSum,
+      totalPendingSum,
+      projectedAccumulated,
+      currentAtingimento,
+      projectedAtingimento,
+      isProjectedOverLimit,
+      projectedOverflow
+    };
+  }, [promaxRecords, requests]);
+
+
+  // Substats count for Faltas tab overview
+  const lackSubstats = useMemo(() => {
+    const list = requests.filter(isFaltaOrInversao);
+    const abertos = list.filter(r => !isRequestBaixada(r)).length;
+    const baixados = list.filter(r => isRequestBaixada(r)).length;
+    
+    const carregamento = list.filter(r => (r as any).faltaTipoErro === "carregamento").length;
+    const entrega = list.filter(r => (r as any).faltaTipoErro === "entrega").length;
+    const indefinido = list.filter(r => !(r as any).faltaTipoErro).length;
+
+    return { abertos, baixados, carregamento, entrega, indefinido };
+  }, [requests]);
+
+  const handlePrintEspelho = () => {
+    let printedWithNewTab = false;
+    const printElement = document.getElementById("espelho-printable-content");
+    if (printElement) {
+      try {
+        const printWindow = window.open("", "_blank");
+        if (printWindow) {
+          const styles = Array.from(document.querySelectorAll('style, link[rel="stylesheet"]'))
+            .map(el => el.outerHTML)
+            .join('\n');
+          
+          printWindow.document.write(`
+            <!DOCTYPE html>
+            <html>
+              <head>
+                <title>SSTR - Imprimir Espelho de Reposições</title>
+                ${styles}
+                <style>
+                  body {
+                    background-color: white !important;
+                    color: black !important;
+                    padding: 24px 32px !important;
+                    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+                    -webkit-print-color-adjust: exact !important;
+                    print-color-adjust: exact !important;
+                  }
+                  #espelho-printable-content {
+                    display: block !important;
+                    color: black !important;
+                  }
+                  table {
+                    border-collapse: collapse !important;
+                    width: 100% !important;
+                    margin-top: 16px !important;
+                    margin-bottom: 16px !important;
+                  }
+                  th, td {
+                    border: 1px solid #94a3b8 !important;
+                    padding: 8px !important;
+                    color: black !important;
+                  }
+                  th {
+                    background-color: #f1f5f9 !important;
+                    font-weight: bold !important;
+                  }
+                </style>
+              </head>
+              <body class="bg-white text-black">
+                <div id="espelho-printable-content" class="space-y-6">
+                  ${printElement.innerHTML}
+                </div>
+                <script>
+                  window.onload = function() {
+                    window.focus();
+                    setTimeout(function() {
+                      window.print();
+                    }, 450);
+                  };
+                </script>
+              </body>
+            </html>
+          `);
+          printWindow.document.close();
+          printedWithNewTab = true;
+        }
+      } catch (e) {
+        console.warn("Could not print in a new tab, falling back to window.print()", e);
+      }
+    }
+
+    if (!printedWithNewTab) {
+      try {
+        window.focus();
+        window.print();
+      } catch (e) {
+        console.warn("Iframe blocked print dialog:", e);
+      }
+    }
+  };
+
+  if (isPrintingEspelho) {
+    return (
+      <div className="fixed inset-0 bg-white text-black z-[9999] overflow-y-auto p-8 font-sans" id="espelho-impressao-overlay">
+        <div className="max-w-4xl mx-auto space-y-6">
+          {/* Print controls */}
+          <div className="flex justify-between items-center border-b pb-4 mb-4 no-print">
+            <span className="text-sm font-bold text-slate-800">Visualização de Impressão do Espelho</span>
+            <div className="flex gap-2">
+              <button
+                onClick={handlePrintEspelho}
+                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-mono rounded flex items-center gap-1.5 cursor-pointer"
+              >
+                <Printer className="w-3.5 h-3.5 text-white" /> Confirmar Impressão
+              </button>
+              <button
+                onClick={() => setIsPrintingEspelho(false)}
+                className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-mono rounded cursor-pointer"
+              >
+                Voltar
+              </button>
+            </div>
+          </div>
+
+          <div id="espelho-printable-content" className="space-y-6">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b-2 border-slate-900 pb-4">
+              <div className="space-y-1">
+                <h1 className="text-xl font-black uppercase tracking-tight">ESPELHO DE REPOSIÇÕES E TROCAS DO DIA</h1>
+                <p className="text-xs text-slate-600 uppercase font-mono">SSTR Ambev - Relatório Operacional de Conformidade</p>
+              </div>
+              <div className="text-right">
+                <p className="text-xs font-bold font-mono">DATA DE REFERÊNCIA: {filterEspelhoDate}</p>
+                <p className="text-[10px] text-slate-500">Emitido em: {new Date().toLocaleString("pt-BR")}</p>
+              </div>
+            </div>
+
+            {/* Table */}
+            <table className="w-full text-xs border-collapse border border-slate-400">
+              <thead>
+                <tr className="bg-slate-100 border-b-2 border-slate-400 text-[10px] font-bold uppercase">
+                  <th className="p-2 border border-slate-300 text-left">NB</th>
+                  <th className="p-2 border border-slate-300 text-left">Razão Social / Cliente</th>
+                  <th className="p-2 border border-slate-300 text-left">Produto (SKU - Descrição)</th>
+                  <th className="p-2 border border-slate-300 text-center">Qtd / Medida</th>
+                  <th className="p-2 border border-slate-300 text-center bg-sky-100 font-extrabold text-sky-950">📍 CIDADE DESTINO</th>
+                  <th className="p-2 border border-slate-300 text-center">Status Encaminhamento</th>
+                  <th className="p-2 border border-slate-300 text-center bg-amber-50">Placa Veículo</th>
+                  <th className="p-2 border border-slate-300 text-left">N.F. / Mapa</th>
+                  <th className="p-2 border border-slate-300 text-left">Setor</th>
+                </tr>
+              </thead>
+              <tbody>
+                {espelhoFiltrado.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="p-8 text-center text-slate-500 italic">
+                      Nenhuma reposição cadastrada/aprovada na data {filterEspelhoDate}.
+                    </td>
+                  </tr>
+                ) : (
+                  espelhoFiltrado.map((item, idx) => {
+                    const itemKey = `${item.requestId}_${item.productCode}`;
+                    const currentPlate = espelhoPlates[itemKey] || item.placaVeiculo || item.placa || "";
+                    const isCarregado = Boolean(currentPlate && currentPlate.trim());
+
+                    return (
+                      <tr key={idx} className="border-b border-slate-300 hover:bg-slate-50">
+                        <td className="p-2 border border-slate-300 font-mono font-bold text-slate-900">{item.nb}</td>
+                        <td className="p-2 border border-slate-300 uppercase">
+                          <p className="font-bold">{item.razaoSocial}</p>
+                          <p className="text-[9px] text-slate-500 font-mono">{item.nomeFantasia}</p>
+                        </td>
+                        <td className="p-2 border border-slate-300">
+                          <strong className="font-mono text-slate-900">#{item.productCode}</strong> - <span className="uppercase text-slate-750">{item.productDesc}</span>
+                        </td>
+                        <td className="p-2 border border-slate-300 text-center font-mono font-bold text-slate-900">
+                          {item.quantidade}/{item.unidadeType === "SKU" ? "SKU" : "UND"}
+                        </td>
+                        {/* HIGHLY HIGHLIGHTED CITY NAME FOR PRINT */}
+                        <td className="p-2 border border-slate-400 uppercase font-mono font-black text-xs text-sky-950 bg-sky-100 text-center">
+                          📍 {item.municipio}
+                        </td>
+                        <td className="p-2 border border-slate-300 text-center font-mono text-[10px]">
+                          {isCarregado ? (
+                            <span className="font-extrabold text-blue-900 bg-blue-50 px-1.5 py-0.5 border border-blue-300 rounded block">
+                              ✅ CARREGADO
+                            </span>
+                          ) : (
+                            <span className="font-bold text-amber-800 bg-amber-50 px-1.5 py-0.5 border border-amber-300 rounded block">
+                              ⏳ PENDENTE ENVIOS
+                            </span>
+                          )}
+                        </td>
+                        <td className="p-2 border border-slate-300 text-center font-mono font-bold text-slate-900 uppercase bg-amber-50/50">
+                          {currentPlate || "NÃO ATRIBUÍDA"}
+                        </td>
+                        <td className="p-2 border border-slate-300 font-mono">
+                          <p>NF: {item.nf || "N/A"}</p>
+                          <p className="text-[9px] text-slate-500">Mapa: {item.mapa || "N/A"}</p>
+                        </td>
+                        <td className="p-2 border border-slate-300 font-mono text-slate-600">{item.solicitante}</td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+
+            {/* Footer signature lines */}
+            <div className="grid grid-cols-2 gap-8 pt-12 text-center text-[10px] uppercase font-mono">
+              <div className="space-y-1">
+                <div className="border-t border-slate-400 w-48 mx-auto mt-6"></div>
+                <p className="font-bold">CONFERENTE OPERACIONAL</p>
+                <p className="text-[9px] text-slate-500">SSTR LOGÍSTICA</p>
+              </div>
+              <div className="space-y-1">
+                <div className="border-t border-slate-400 w-48 mx-auto mt-6"></div>
+                <p className="font-bold">SUPERVISÃO / GESTÃO</p>
+                <p className="text-[9px] text-slate-500">CONTROLE SSTR</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 text-slate-100 animate-fade-in">
+      
+      {/* Introduction bar */}
+      <div className="bg-slate-900/90 border border-slate-800 p-5 rounded-2xl shadow-xl flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="space-y-1">
+          <h2 className="text-lg font-bold font-display text-white flex items-center gap-2">
+            <Clock className="w-5 h-5 text-amber-500 animate-pulse" />
+            Guia de Solicitações e Controle Promax SSTR
+          </h2>
+          <p className="text-xs text-slate-400 max-w-2xl font-sans">
+            Visualize as solicitações enviadas pelos representantes de vendas (RN) de campo e faça a gestão de lançamentos ou controle de perdas e faltas física diretamente no Promax PW.
+          </p>
+        </div>
+
+        {/* Dynamic status overview badge */}
+        <div className="bg-slate-950/40 border border-slate-850 px-4 py-2.5 rounded-xl text-center shrink-0 min-w-[150px]">
+          <span className="text-[10px] font-mono text-slate-400 uppercase font-bold block">Status Selecionado</span>
+          <span className="text-sm font-bold font-mono text-white flex items-center justify-center gap-1.5 mt-1">
+            <span className={`w-2 h-2 rounded-full ${
+              activeTab === "pendente" ? "bg-amber-500 animate-pulse" : 
+              activeTab === "cadastrado" ? "bg-emerald-500" : 
+              activeTab === "faltas_inversoes" ? "bg-indigo-400" : 
+              activeTab === "historico_baixas" ? "bg-teal-500" :
+              "bg-red-500"}`}></span>
+            {activeTab === "pendente" ? `${pendingCount} Pendentes` : 
+             activeTab === "cadastrado" ? `${approvedCount} Aprovadas` : 
+             activeTab === "faltas_inversoes" ? `${lackCount} Faltas / Inversões` : 
+             activeTab === "historico_baixas" ? `${lackHistoryCount} Baixadas Fisicamente` :
+             `${rejectedCount} Reprovadas`}
+          </span>
+        </div>
+      </div>
+
+      {/* Visual Monthly Budget Limit & Projection Panel */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        {/* Card 1: Monthly limit/Goal */}
+        <div className="bg-slate-900 border border-slate-850 p-4 rounded-xl space-y-1 text-left relative overflow-hidden">
+          <div className="absolute right-3 top-3 opacity-15">
+            <Layers className="w-8 h-8 text-slate-400" />
+          </div>
+          <span className="text-[10px] font-mono text-slate-400 uppercase font-bold block">Meta de Verba Mensal</span>
+          <p className="text-xl font-extrabold text-white font-mono">{formatCurrency(MONTHLY_LIMIT)}</p>
+          <span className="text-[10px] text-slate-500 block font-semibold">Referente a {budgetProjection.evalMonthName} / {budgetProjection.evalYear}</span>
+        </div>
+
+        {/* Card 2: Officially Approved */}
+        <div className="bg-slate-900 border border-slate-850 p-4 rounded-xl space-y-1 text-left relative overflow-hidden">
+          <div className="absolute right-3 top-3 opacity-15">
+            <CheckCircle2 className="w-8 h-8 text-emerald-400" />
+          </div>
+          <span className="text-[10px] font-mono text-slate-400 uppercase font-bold block">Acumulado Aprovado Oficial</span>
+          <p className="text-xl font-extrabold text-emerald-400 font-mono">{formatCurrency(budgetProjection.approvedOfficialSum)}</p>
+          <span className="text-[10px] font-mono text-slate-500 block font-semibold">
+            Atingimento: <strong className="text-emerald-500 font-bold">{budgetProjection.currentAtingimento.toFixed(1)}%</strong>
+          </span>
+        </div>
+
+        {/* Card 3: Requested Pending Sum */}
+        <div className="bg-slate-900 border border-slate-850 p-4 rounded-xl space-y-1 text-left relative overflow-hidden">
+          <div className="absolute right-3 top-3 opacity-15">
+            <Clock className="w-8 h-8 text-amber-500" />
+          </div>
+          <span className="text-[10px] font-mono text-slate-400 uppercase font-bold block">Valor Total das Pendências</span>
+          <p className="text-xl font-extrabold text-amber-500 font-mono">{formatCurrency(budgetProjection.totalPendingSum)}</p>
+          <span className="text-[10px] text-slate-500 block font-semibold">Base local do SSTR de Campo</span>
+        </div>
+
+        {/* Card 4: Projection if all approved & status indicator */}
+        <div className={`p-4 rounded-xl space-y-1 text-left relative overflow-hidden border ${
+          budgetProjection.isProjectedOverLimit 
+            ? "bg-rose-950/25 border-rose-900/50 animate-pulse" 
+            : "bg-slate-900 border border-slate-850"
+        }`}>
+          <div className="absolute right-3 top-3 opacity-15">
+            <AlertCircle className={`w-8 h-8 ${budgetProjection.isProjectedOverLimit ? "text-rose-400" : "text-blue-400"}`} />
+          </div>
+          <span className="text-[10px] font-mono text-slate-400 uppercase font-bold block">Projeção com as Pendentes</span>
+          <p className={`text-xl font-extrabold font-mono ${
+            budgetProjection.isProjectedOverLimit ? "text-rose-455 font-bold animate-bounce" : "text-blue-400"
+          }`}>
+            {formatCurrency(budgetProjection.projectedAccumulated)}
+          </p>
+          <div className="flex flex-col gap-0.5 text-[9.5px]">
+            <span className="text-slate-400 font-semibold">
+              Atingimento: <strong className={budgetProjection.isProjectedOverLimit ? "text-rose-404 font-bold" : "text-blue-400"}>{budgetProjection.projectedAtingimento.toFixed(1)}%</strong>
+            </span>
+            {budgetProjection.isProjectedOverLimit ? (
+              <span className="text-rose-400 font-extrabold block">
+                ⚠️ Estouro de Verba: +{formatCurrency(budgetProjection.projectedOverflow)}
+              </span>
+            ) : (
+              <span className="text-slate-500 block font-semibold">
+                Dentro do limite mensal
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* PROCESS TYPE BREAKDOWN DASHBOARD PANEL (Reposição vs. Troca vs. Contingências) */}
+      <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl space-y-3 text-left">
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 border-b border-slate-800 pb-2">
+          <div>
+            <h3 className="text-xs font-bold font-mono uppercase text-slate-300 flex items-center gap-1.5">
+              <Sliders className="w-4 h-4 text-indigo-400" />
+              <span>Dashboard Geral de Processos (Reposição vs. Troca)</span>
+            </h3>
+            <p className="text-[10px] text-slate-400">
+              Classificação por motivo do lançamento e liberação de Recibo PDV de Contingência
+            </p>
+          </div>
+          
+          {processTypeFilter !== "todos" && (
+            <button
+              onClick={() => setProcessTypeFilter("todos")}
+              className="text-[10px] font-mono text-indigo-400 hover:text-indigo-300 underline font-bold cursor-pointer"
+            >
+              Exibindo filtro: {processTypeFilter.toUpperCase()} (Limpar)
+            </button>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          {/* Card 1: Reposição */}
+          <button
+            onClick={() => setProcessTypeFilter(processTypeFilter === "reposicao" ? "todos" : "reposicao")}
+            className={`p-3.5 rounded-xl text-left border transition-all cursor-pointer relative overflow-hidden ${
+              processTypeFilter === "reposicao"
+                ? "bg-indigo-950/80 border-indigo-500 shadow-lg shadow-indigo-950/50 ring-1 ring-indigo-500"
+                : "bg-slate-950/60 hover:bg-slate-950 border-slate-850 hover:border-slate-750"
+            }`}
+          >
+            <div className="flex justify-between items-start">
+              <span className="text-[10px] font-mono text-indigo-400 font-bold uppercase tracking-wider block">
+                📦 Reposição (Falta de Produto)
+              </span>
+              <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
+                {processSummary.reposicaoCount} reg.
+              </span>
+            </div>
+            <p className="text-lg font-black font-mono text-white mt-1">
+              {formatCurrency(processSummary.reposicaoVal)}
+            </p>
+            <span className="text-[9.5px] text-slate-400 block mt-1 font-sans leading-tight">
+              Lançamentos motivados oficialmente por falta de produto física na entrega/carga
+            </span>
+          </button>
+
+          {/* Card 2: Troca */}
+          <button
+            onClick={() => setProcessTypeFilter(processTypeFilter === "troca" ? "todos" : "troca")}
+            className={`p-3.5 rounded-xl text-left border transition-all cursor-pointer relative overflow-hidden ${
+              processTypeFilter === "troca"
+                ? "bg-emerald-950/80 border-emerald-500 shadow-lg shadow-emerald-950/50 ring-1 ring-emerald-500"
+                : "bg-slate-950/60 hover:bg-slate-950 border-slate-850 hover:border-slate-750"
+            }`}
+          >
+            <div className="flex justify-between items-start">
+              <span className="text-[10px] font-mono text-emerald-400 font-bold uppercase tracking-wider block">
+                🔁 Troca (Outros Motivos)
+              </span>
+              <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                {processSummary.trocaCount} reg.
+              </span>
+            </div>
+            <p className="text-lg font-black font-mono text-white mt-1">
+              {formatCurrency(processSummary.trocaVal)}
+            </p>
+            <span className="text-[9.5px] text-slate-400 block mt-1 font-sans leading-tight">
+              Avaria, inversão de SKU, data vencida, defeito, erro de pedido e qualidade
+            </span>
+          </button>
+
+          {/* Card 3: Exceto SKU Fechado / Recibo PDV Contingência */}
+          <button
+            onClick={() => setProcessTypeFilter(processTypeFilter === "troca_exceto_sku_fechado" ? "todos" : "troca_exceto_sku_fechado")}
+            className={`p-3.5 rounded-xl text-left border transition-all cursor-pointer relative overflow-hidden ${
+              processTypeFilter === "troca_exceto_sku_fechado"
+                ? "bg-amber-950/80 border-amber-500 shadow-lg shadow-amber-950/50 ring-1 ring-amber-500"
+                : "bg-slate-950/60 hover:bg-slate-950 border-slate-850 hover:border-slate-750"
+            }`}
+          >
+            <div className="flex justify-between items-start">
+              <span className="text-[10px] font-mono text-amber-400 font-bold uppercase tracking-wider block flex items-center gap-1">
+                <span>⚠️ Recibo PDV Contingência</span>
+              </span>
+              <span className="text-xs font-mono font-bold px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                {processSummary.excetoSkuFechadoCount} reg.
+              </span>
+            </div>
+            <p className="text-lg font-black font-mono text-white mt-1">
+              {formatCurrency(processSummary.excetoSkuFechadoVal)}
+            </p>
+            <span className="text-[9.5px] text-slate-400 block mt-1 font-sans leading-tight">
+              Aprovados com emissão de Recibo PDV (Exceto Falta SKU Fechado)
+              {processSummary.cadastradosContingenciaCount > 0 && (
+                <span className="block text-emerald-400 font-semibold mt-0.5">
+                  ({processSummary.cadastradosContingenciaCount} cadastrados/histórico incluídos)
+                </span>
+              )}
+              {processSummary.isPeriodFiltered && (
+                <span className="inline-block mt-1 mr-1 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono text-[9px] font-bold">
+                  📅 Período: {startDate ? startDate.split("-").reverse().join("/") : "Início"} até {endDate ? endDate.split("-").reverse().join("/") : "Fim"}
+                </span>
+              )}
+              {valeFilter === "sem_vale" && (
+                <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-mono text-[9px] font-bold">
+                  🛡️ Apenas Sem Vale
+                </span>
+              )}
+              {valeFilter === "com_vale" && (
+                <span className="inline-block mt-1 px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-mono text-[9px] font-bold">
+                  🎫 Apenas Com Vale
+                </span>
+              )}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      {/* CRITICAL OPERATIONAL ALERT BANNER FOR CARREGADO ITEMS > 1 WEEK WITHOUT BAIXA */}
+      {delayedCarregados.length > 0 && (
+        <div className="bg-rose-950/90 border-2 border-rose-500/80 p-4 rounded-2xl shadow-xl shadow-rose-950/60 card-3d flex flex-col md:flex-row items-start md:items-center justify-between gap-4 animate-pulse no-print my-2">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-rose-600/30 border border-rose-400/50 rounded-xl text-rose-300 shrink-0 badge-3d">
+              <AlertTriangle className="w-6 h-6 animate-bounce text-rose-400" />
+            </div>
+            <div>
+              <h4 className="text-sm font-extrabold font-mono text-rose-300 uppercase tracking-wide flex items-center gap-2">
+                <span>🚨 ALERTA OPERACIONAL: REPOSIÇÕES CARREGADAS SEM BAIXA (&gt; 1 SEMANA)</span>
+                <span className="px-2.5 py-0.5 bg-rose-600 text-white text-xs font-black rounded-full font-mono shadow-sm">
+                  {delayedCarregados.length} {delayedCarregados.length === 1 ? "item" : "itens"}
+                </span>
+              </h4>
+              <p className="text-xs text-slate-300 mt-1 font-sans leading-relaxed">
+                Atenção! Existem <strong className="text-rose-200">{delayedCarregados.length}</strong> reposições/trocas que já foram carregadas em veículo há mais de 1 semana (≥7 dias) e ainda <strong>não receberam baixa no sistema</strong>.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setActiveTab("espelho")}
+            className="px-4 py-2.5 bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold font-mono rounded-xl border border-rose-400 shadow-md transition-all cursor-pointer btn-3d whitespace-nowrap shrink-0 flex items-center gap-2"
+          >
+            <span>Ver no Espelho do Dia</span>
+            <ArrowRight className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* CRITICAL OPERATIONAL ALERT BANNER FOR DUPLICATES IN HISTORICAL REGISTRATIONS */}
+      {duplicateAnalysis.totalDuplicateCount > 0 && (
+        <div className="bg-amber-955/90 border-2 border-amber-500/80 p-4 rounded-2xl shadow-xl shadow-amber-950/60 card-3d flex flex-col md:flex-row items-start md:items-center justify-between gap-4 animate-fadeIn no-print my-2">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-amber-600/30 border border-amber-400/50 rounded-xl text-amber-300 shrink-0 badge-3d">
+              <Copy className="w-6 h-6 animate-pulse text-amber-400" />
+            </div>
+            <div>
+              <h4 className="text-sm font-extrabold font-mono text-amber-300 uppercase tracking-wide flex items-center gap-2">
+                <span>⚠️ REGISTROS DUPLICADOS IDENTIFICADOS NO HISTÓRICO</span>
+                <span className="px-2.5 py-0.5 bg-amber-500 text-slate-950 text-xs font-black rounded-full font-mono shadow-sm">
+                  {duplicateAnalysis.totalDuplicateCount} registros ({duplicateAnalysis.totalExcessCount} cópias excedentes)
+                </span>
+              </h4>
+              <p className="text-xs text-slate-300 mt-1 font-sans leading-relaxed">
+                Foram identificados <strong>{duplicateAnalysis.duplicateGroups.length} grupos de solicitações idênticas</strong> (mesmo Código NB, Nota Fiscal e SKU/Mapa) cadastrados na plataforma.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              onClick={() => {
+                setActiveTab("historico_baixas");
+                setHistoricoBaixasStatusFilter("duplicatas");
+              }}
+              className="px-3.5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-extrabold font-mono rounded-xl border border-amber-400 shadow-md transition-all cursor-pointer btn-3d whitespace-nowrap flex items-center gap-1.5"
+            >
+              <ListFilter className="w-3.5 h-3.5" />
+              <span>Filtrar Duplicatas</span>
+            </button>
+            <button
+              onClick={handlePurgeExcessDuplicates}
+              className="px-3.5 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold font-mono rounded-xl border border-rose-400 shadow-md transition-all cursor-pointer btn-3d whitespace-nowrap flex items-center gap-1.5"
+              title="Excluir automaticamente todas as cópias excedentes mantendo 1 registro original de cada grupo"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Excluir {duplicateAnalysis.totalExcessCount} Excedentes</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* SIX FILTER SUB-TABS (ALIGNED GRID) */}
+      <div className="bg-slate-950 p-2 rounded-2xl border border-slate-850/80 grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-2 no-print">
+        <button
+          onClick={() => setActiveTab("pendente")}
+          className={`w-full px-3.5 py-2.5 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 relative cursor-pointer truncate ${
+            activeTab === "pendente"
+              ? "bg-amber-600 text-white shadow-lg shadow-amber-900/20"
+              : "bg-slate-900 text-slate-400 hover:text-slate-200 hover:bg-slate-850 border border-slate-850"
+          }`}
+        >
+          <Clock className="w-3.5 h-3.5 text-amber-400 animate-pulse shrink-0" />
+          <span className="truncate">Pendentes ({pendingCount})</span>
+          {pendingCount > 0 && (
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 absolute top-2 right-2 animate-ping"></span>
+          )}
+        </button>
+
+        <button
+          onClick={() => setActiveTab("faltas_inversoes")}
+          className={`w-full px-3.5 py-2.5 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+            activeTab === "faltas_inversoes"
+              ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/20"
+              : "bg-slate-900 text-slate-400 hover:text-slate-200 hover:bg-slate-850 border border-slate-850"
+          }`}
+          title="Faltas de carregar ou entregar não faturadas"
+        >
+          <Layers className="w-3.5 h-3.5 text-indigo-350 shrink-0" />
+          <span className="truncate">Faltas/Inversões</span>
+          {lackActiveCount > 0 ? (
+            <span className="px-1.5 py-0.5 bg-rose-600 text-[9px] font-mono text-white rounded-full font-bold shrink-0 animate-pulse">
+              {lackActiveCount}
+            </span>
+          ) : (
+            <span className="text-[10px] text-slate-500 font-mono">(0)</span>
+          )}
+        </button>
+
+        <button
+          onClick={() => setActiveTab("historico_baixas")}
+          className={`w-full px-3.5 py-2.5 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer truncate ${
+            activeTab === "historico_baixas"
+              ? "bg-emerald-650 text-white shadow-lg shadow-emerald-950 border border-emerald-900/30"
+              : "bg-slate-900 text-slate-400 hover:text-slate-200 hover:bg-slate-850 border border-slate-850"
+          }`}
+          title="Consulte todos os recibos físicos digitados e liquidados com comprovante assinado"
+        >
+          <FileText className="w-3.5 h-3.5 text-emerald-450 shrink-0" />
+          <span className="truncate">Histórico ({requests.length - pendingCount})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab("historico_vales")}
+          className={`w-full px-3.5 py-2.5 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer truncate ${
+            activeTab === "historico_vales"
+              ? "bg-amber-600 text-white shadow-lg shadow-amber-900/20 border border-amber-800"
+              : "bg-slate-900 text-slate-400 hover:text-slate-200 hover:bg-slate-850 border border-slate-850"
+          }`}
+          title="Consulte o financeiro de vales emitidos, rankings de equipes e reimpressões"
+        >
+          <TrendingUp className="w-3.5 h-3.5 text-amber-500 animate-pulse shrink-0" />
+          <span className="truncate">Vales ({displayVales.length})</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab("criar_solicitacao")}
+          className={`w-full px-3.5 py-2.5 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer relative truncate ${
+            activeTab === "criar_solicitacao"
+              ? "bg-emerald-600 text-white shadow-lg shadow-emerald-900/20 border border-emerald-550"
+              : "bg-slate-900 text-slate-450 hover:text-slate-200 hover:bg-slate-850 border border-slate-850"
+          }`}
+          title="Criar nova solicitação de troca, falta ou reposição diretamente pelo controle"
+        >
+          <PlusCircle className="w-3.5 h-3.5 text-emerald-450 shrink-0" />
+          <span className="truncate">Criar Solicitação 🆕</span>
+        </button>
+
+        <button
+          onClick={() => setActiveTab("espelho")}
+          className={`w-full px-3.5 py-2.5 rounded-xl font-bold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer relative truncate ${
+            activeTab === "espelho"
+              ? "bg-indigo-600 text-white shadow-lg shadow-indigo-900/20 border border-indigo-550"
+              : "bg-slate-900 text-slate-450 hover:text-slate-200 hover:bg-slate-850 border border-slate-850"
+          }`}
+          title="Consulte o espelho consolidado de reposições e trocas homologadas e liquidadas do dia"
+        >
+          <FileText className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          <span className="truncate">Espelho do Dia 📋</span>
+        </button>
+      </div>
+
+      {/* Quick Action Bar for Gerar Vale Avulso & Rateio */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/80 p-3.5 rounded-2xl border border-slate-800 shadow-md no-print">
+        <div className="flex items-center gap-2.5 text-xs text-slate-300">
+          <div className="w-8 h-8 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0 font-bold border border-amber-500/30">
+            <PlusCircle className="w-4 h-4" />
+          </div>
+          <div>
+            <span className="font-mono font-bold text-white uppercase text-[11px] block">Gestão de Vales e Rateio:</span>
+            <span className="text-[10px] text-slate-400">Classifique faltas de entrega ou emita vales avulsos diretamente com cálculo de rateio entre motorista e ajudantes.</span>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTab("historico_vales");
+            setOpenAvulsoTrigger(Date.now());
+          }}
+          className="px-4 py-2 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-black rounded-xl text-xs font-mono flex items-center justify-center gap-1.5 shadow-lg shadow-amber-950/40 cursor-pointer transition-all shrink-0 hover:scale-[1.02]"
+          title="Abrir modal para gerar vale avulso com seleção de colaboradores e rateio automático"
+        >
+          <PlusCircle className="w-4 h-4" />
+          <span>+ Gerar Vale Avulso</span>
+        </button>
+      </div>
+
+      {/* Main Grid: Filters & Lists */}
+      <div className="space-y-4">
+        
+        {/* Controls Layout with 12-column responsive design and Date range filter */}
+        {activeTab !== "historico_vales" && activeTab !== "criar_solicitacao" && activeTab !== "espelho" && (
+          <div className="bg-slate-900 p-4.5 rounded-2xl border border-slate-800 grid grid-cols-1 md:grid-cols-12 gap-3.5 text-left no-print">
+            
+            {/* Search bar */}
+            <div className="md:col-span-3 relative space-y-1">
+              <span className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Pesquisa de Documento:</span>
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-505 w-3.5 h-3.5" />
+                <input
+                  type="text"
+                  placeholder="NF, Código NB, Mapa, Solicitação..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 h-10 rounded-xl pl-9 pr-3 py-2 text-xs font-mono text-slate-205 placeholder:text-slate-650 placeholder:font-sans focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
+
+            {/* Start Date filter */}
+            <div className="md:col-span-2 space-y-1">
+              <span className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Data Inicial:</span>
+              <div className="relative">
+                <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 w-3.5 h-3.5 pointer-events-none" />
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 h-10 text-xs font-mono text-slate-205 cursor-pointer focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
+
+            {/* End Date filter */}
+            <div className="md:col-span-2 space-y-1">
+              <span className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Data Final:</span>
+              <div className="relative">
+                <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-505 w-3.5 h-3.5 pointer-events-none" />
+                <input
+                  type="date"
+                  value={endDate}
+                  onChange={(e) => setEndDate(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 h-10 text-xs font-mono text-slate-250 cursor-pointer focus:outline-none focus:border-blue-500"
+                />
+              </div>
+            </div>
+
+            {/* Sector filter */}
+            <div className="md:col-span-2 space-y-1">
+              <span className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Setor / Rota RN:</span>
+              <select
+                value={sectorFilter}
+                onChange={(e) => setSectorFilter(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2.5 h-10 text-xs text-slate-350 font-semibold cursor-pointer focus:outline-none"
+              >
+                <option value="todos">Todos os Setores</option>
+                {uniqueSectors.map(sec => {
+                  const rep = repsList[sec.trim()];
+                  const rot = motoristasList[sec.trim()];
+                  const label = rep 
+                    ? `Setor ${sec} (${rep.nome})` 
+                    : rot 
+                      ? `Rota ${sec} (${rot.nome})` 
+                      : `Setor/Rota ${sec}`;
+                  return (
+                    <option key={sec} value={sec}>
+                      {label}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+
+            {/* Subtle Date Sort order selector */}
+            <div className="md:col-span-1 space-y-1">
+              <span className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Ordem:</span>
+              <button
+                type="button"
+                onClick={() => setDateSortOrder(prev => prev === "desc" ? "asc" : "desc")}
+                className="w-full h-10 px-1 bg-slate-950 border border-slate-800 hover:border-slate-700 rounded-xl text-[10px] font-mono font-bold text-slate-300 flex items-center justify-center gap-1 cursor-pointer transition-all"
+                title="Alternar ordenação por data (Mais Recentes vs Mais Antigos)"
+              >
+                <span>{dateSortOrder === "desc" ? "⬇️ Recente" : "⬆️ Antigo"}</span>
+              </button>
+            </div>
+
+            {/* Contingency Filter Toggle */}
+            <div className="md:col-span-2 space-y-1">
+              <span className="text-[10px] font-bold text-amber-400 font-mono uppercase tracking-wider block">Base Promax:</span>
+              <button
+                type="button"
+                onClick={() => {
+                  const nextState = !onlyContingenciaFilter;
+                  setOnlyContingenciaFilter(nextState);
+                  if (nextState) {
+                    setProcessTypeFilter("contingencia");
+                  } else {
+                    if (processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") {
+                      setProcessTypeFilter("todos");
+                    }
+                  }
+                }}
+                className={`w-full h-10 px-2 rounded-xl text-[10.5px] font-mono font-bold uppercase border transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado"
+                    ? "bg-amber-500/25 border-amber-400 text-amber-300 shadow-md ring-2 ring-amber-500/40"
+                    : "bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700"
+                }`}
+                title="Filtrar todas as contingências do período selecionado"
+              >
+                <span>🚨 Contingências</span>
+                {(onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") && (
+                  <span className="text-[9px] bg-amber-500 text-slate-950 px-1.5 py-0.2 rounded font-black">
+                    {processSummary.contingenciasTotalCount > 0 ? processSummary.contingenciasTotalCount : "ON"}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {/* BOTTOM ROW: Creator / Origem Filter (Motoristas, RN, Admin) & Clear Button */}
+            <div className="md:col-span-12 pt-2.5 mt-0.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
+              
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] font-bold text-indigo-400 font-mono uppercase tracking-wider mr-1">
+                  Cadastrado Por:
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => setCreatedRoleFilter("todos")}
+                  className={`h-9 px-3 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                    createdRoleFilter === "todos"
+                      ? "bg-indigo-600 border-indigo-400 text-white shadow-md shadow-indigo-950/60 ring-1 ring-indigo-300/40"
+                      : "bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900"
+                  }`}
+                  title="Exibir todos os cadastros"
+                >
+                  <span>👥</span>
+                  <span>Todos</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCreatedRoleFilter("motorista")}
+                  className={`h-9 px-3 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                    createdRoleFilter === "motorista"
+                      ? "bg-blue-600 border-blue-400 text-white shadow-md shadow-blue-950/60 ring-1 ring-blue-300/40"
+                      : "bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900"
+                  }`}
+                  title="Cadastros efetuados pelos Motoristas / Entregadores"
+                >
+                  <span>🚚</span>
+                  <span>Motoristas / Rotas</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCreatedRoleFilter("rn")}
+                  className={`h-9 px-3 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                    createdRoleFilter === "rn"
+                      ? "bg-emerald-600 border-emerald-400 text-white shadow-md shadow-emerald-950/60 ring-1 ring-emerald-300/40"
+                      : "bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900"
+                  }`}
+                  title="Cadastros efetuados pelos RNs / Vendedores"
+                >
+                  <span>💼</span>
+                  <span>RNs / Vendedores</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCreatedRoleFilter("admin")}
+                  className={`h-9 px-3 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                    createdRoleFilter === "admin"
+                      ? "bg-purple-600 border-purple-400 text-white shadow-md shadow-purple-950/60 ring-1 ring-purple-300/40"
+                      : "bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900"
+                  }`}
+                  title="Cadastros efetuados no Login Administrativo / Gestão"
+                >
+                  <span>🖥️</span>
+                  <span>Login Admin / Gestão</span>
+                </button>
+
+                {/* DIVIDER */}
+                <div className="h-6 w-px bg-slate-800 mx-1 hidden lg:block" />
+
+                {/* FILTRO DE VALE (Anti-duplicação de bases) */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[10px] font-bold text-amber-400 font-mono uppercase tracking-wider mr-1 flex items-center gap-1">
+                    <span>Filtro de Vale:</span>
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => setValeFilter("todos")}
+                    className={`h-9 px-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                      valeFilter === "todos"
+                        ? "bg-amber-600 border-amber-400 text-white shadow-md shadow-amber-950/60 ring-1 ring-amber-300/40"
+                        : "bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-900"
+                    }`}
+                    title="Exibir todos os registros (com ou sem vale emitido)"
+                  >
+                    <span>📋</span>
+                    <span>Todos</span>
+                    {(onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") && processSummary.contingenciasTotalCount > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.2 bg-black/40 rounded-full font-mono">
+                        {processSummary.contingenciasTotalCount}
+                      </span>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setValeFilter("sem_vale")}
+                    className={`h-9 px-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                      valeFilter === "sem_vale"
+                        ? "bg-emerald-600 border-emerald-400 text-white shadow-md shadow-emerald-950/60 ring-2 ring-emerald-300/60"
+                        : "bg-slate-950 border-emerald-800/60 text-emerald-400 hover:text-white hover:bg-emerald-950/40"
+                    }`}
+                    title="Desmarcar/ocultar ocorrências que estão na Guia de Vales para não duplicar com a Base de Vales na exportação"
+                  >
+                    <span>🛡️</span>
+                    <span>Desmarcar Vales (Sem Vale)</span>
+                    {(onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") && processSummary.contingenciasSemValeCount > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.2 bg-black/40 rounded-full font-mono">
+                        {processSummary.contingenciasSemValeCount}
+                      </span>
+                    )}
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setValeFilter("com_vale")}
+                    className={`h-9 px-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 border cursor-pointer ${
+                      valeFilter === "com_vale"
+                        ? "bg-purple-600 border-purple-400 text-white shadow-md shadow-purple-950/60 ring-1 ring-purple-300/40"
+                        : "bg-slate-950 border-purple-800/60 text-purple-400 hover:text-white hover:bg-purple-950/40"
+                    }`}
+                    title="Exibir apenas ocorrências que estão na Guia de Vales"
+                  >
+                    <span>🎫</span>
+                    <span>Com Vale</span>
+                    {(onlyContingenciaFilter || processTypeFilter === "contingencia" || processTypeFilter === "troca_exceto_sku_fechado") && processSummary.contingenciasComValeCount > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.2 bg-black/40 rounded-full font-mono">
+                        {processSummary.contingenciasComValeCount}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* ACTION BUTTONS: Export Filtered Database + Clear filters */}
+              <div className="flex items-center gap-2 flex-wrap">
+                {/* BOTÃO EXPORTAR BASE FILTRADA (.XLSX) */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    const isContingencia = onlyContingenciaFilter || processTypeFilter === "troca_exceto_sku_fechado" || processTypeFilter === "contingencia";
+                    exportFilteredRequestsExcel(filteredRequests, valesHistorico, promaxRecords, {
+                      startDate,
+                      endDate,
+                      sectorFilter,
+                      processTypeFilter: isContingencia ? "contingencia" : processTypeFilter,
+                      valeFilter,
+                      onlyContingencia: isContingencia
+                    });
+                  }}
+                  className="h-9 px-3.5 bg-emerald-600 hover:bg-emerald-500 active:scale-95 border border-emerald-400 text-white text-xs font-mono font-bold rounded-xl cursor-pointer flex items-center gap-1.5 shadow-md shadow-emerald-950/60 transition-all hover:scale-[1.02]"
+                  title={`Exportar planilha Excel com as ${filteredRequests.length} ocorrências do período filtrado`}
+                >
+                  <Download className="w-3.5 h-3.5 shrink-0 text-emerald-100" />
+                  <span>
+                    {(onlyContingenciaFilter || processTypeFilter === "troca_exceto_sku_fechado" || processTypeFilter === "contingencia")
+                      ? valeFilter === "sem_vale"
+                        ? `Exportar Contingências Limpas (${filteredRequests.length})`
+                        : `Exportar Base Contingências (${filteredRequests.length})`
+                      : `Exportar Base (${filteredRequests.length})`}
+                  </span>
+                </button>
+
+                {(searchTerm || startDate || endDate || sectorFilter !== "todos" || processTypeFilter !== "todos" || createdRoleFilter !== "todos" || onlyContingenciaFilter || valeFilter !== "todos") ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchTerm("");
+                      setStartDate("");
+                      setEndDate("");
+                      setSectorFilter("todos");
+                      setProcessTypeFilter("todos");
+                      setCreatedRoleFilter("todos");
+                      setOnlyContingenciaFilter(false);
+                      setValeFilter("todos");
+                      setHistoricoBaixasStatusFilter("todos");
+                    }}
+                    className="h-9 px-3 bg-rose-955/60 hover:bg-rose-900 border border-rose-800/40 text-rose-300 text-xs font-mono font-bold rounded-xl cursor-pointer flex items-center justify-center transition-all hover:scale-[1.02]"
+                  >
+                    Limpar Filtros
+                  </button>
+                ) : (
+                  <div className="h-9 px-3 border border-dashed border-slate-800/80 rounded-xl flex items-center justify-center text-[10px] text-slate-500 font-mono font-bold uppercase tracking-wider select-none">
+                    Filtros Padrão
+                  </div>
+                )}
+              </div>
+
+            </div>
+
+          </div>
+        )}
+
+        {/* Requirement 4: Situation Status Filter bar for Histórico de Baixas */}
+        {activeTab === "historico_baixas" && (
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-850 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 text-left animate-fade-in no-print">
+            <div className="flex items-center gap-2">
+              <FileText className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div>
+                <span className="text-xs font-bold text-white font-mono block">
+                  Filtrar Situação do Histórico
+                </span>
+                <span className="text-[10px] text-slate-400 font-sans block">
+                  Selecione o estado do registro para consultar no histórico consolidado
+                </span>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5 text-xs font-mono">
+              {[
+                { id: "todos", label: "📋 Todas as Ocorrências" },
+                { id: "aprovados", label: "✅ Aprovadas / Promax" },
+                { id: "reprovados", label: "❌ Reprovadas" },
+                { id: "baixados", label: "🟢 Baixadas (Com Recibo)" },
+                { id: "pendentes", label: "⏳ Pendentes" },
+                { 
+                  id: "duplicatas", 
+                  label: `⚠️ Duplicatas ${duplicateAnalysis.totalDuplicateCount > 0 ? `(${duplicateAnalysis.totalDuplicateCount})` : ""}` 
+                }
+              ].map((st) => (
+                <button
+                  key={st.id}
+                  type="button"
+                  onClick={() => setHistoricoBaixasStatusFilter(st.id as any)}
+                  className={`px-3 py-1.5 rounded-xl font-bold transition-all cursor-pointer ${
+                    historicoBaixasStatusFilter === st.id
+                      ? st.id === "duplicatas"
+                        ? "bg-rose-600 text-white shadow-md shadow-rose-950 border border-rose-500 animate-pulse"
+                        : "bg-emerald-600 text-white shadow-md shadow-emerald-950 border border-emerald-500"
+                      : st.id === "duplicatas" && duplicateAnalysis.totalDuplicateCount > 0
+                        ? "bg-rose-955/80 text-rose-300 hover:text-white border border-rose-800/80 hover:bg-rose-900"
+                        : "bg-slate-900 text-slate-400 hover:text-white border border-slate-800 hover:bg-slate-850"
+                  }`}
+                >
+                  {st.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* PAINEL DO ANALISTA DE DADOS: CONCILIAÇÃO & ANTI-DUPLICAÇÃO DE BASES (CONTINGÊNCIAS VS VALES) */}
+        {(onlyContingenciaFilter || processTypeFilter === "troca_exceto_sku_fechado" || processTypeFilter === "contingencia") && (
+          <div className="bg-slate-900 border-2 border-amber-500/80 rounded-2xl p-4.5 shadow-2xl text-left no-print space-y-3.5 animate-fade-in">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-3">
+                <span className="p-2.5 bg-amber-500/20 border border-amber-500/50 rounded-xl text-amber-400 text-lg shrink-0">
+                  🚨
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center gap-2 flex-wrap">
+                    <span>Base de Contingências do Período & Conciliação Anti-Duplicação</span>
+                    <span className="text-[10px] font-mono font-black bg-amber-500 text-slate-950 px-2.5 py-0.5 rounded-full uppercase">
+                      {startDate && endDate ? `${startDate.split("-").reverse().join("/")} até ${endDate.split("-").reverse().join("/")}` : "Período Completo"}
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-400 font-sans mt-0.5">
+                    Visão do analista: conciliação entre a Base de Contingência e a Guia de Vales para garantir exportações 100% exclusivas e sem duplicação de prejuízo.
+                  </p>
+                </div>
+              </div>
+
+              {/* Botão Ação Anti-Duplicação */}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setValeFilter(prev => prev === "sem_vale" ? "todos" : "sem_vale");
+                  }}
+                  className={`h-9 px-3.5 rounded-xl text-xs font-bold font-mono transition-all flex items-center gap-2 border cursor-pointer ${
+                    valeFilter === "sem_vale"
+                      ? "bg-emerald-600 border-emerald-400 text-white shadow-lg shadow-emerald-950/60 ring-2 ring-emerald-400/50"
+                      : "bg-slate-950 border-amber-500/80 text-amber-300 hover:bg-slate-900 hover:text-white"
+                  }`}
+                  title="Desmarcar/ocultar as contingências que também constam na Guia de Vales"
+                >
+                  <span className="text-sm">{valeFilter === "sem_vale" ? "☑️" : "⬜"}</span>
+                  <span>Desmarcar as da Guia de Vales ({processSummary.contingenciasComValeCount})</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Painel de Métricas do Analista */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {/* Card 1: Total Bruto do Período */}
+              <div 
+                onClick={() => setValeFilter("todos")}
+                className={`p-3 rounded-xl border transition-all cursor-pointer ${
+                  valeFilter === "todos" 
+                    ? "bg-amber-950/50 border-amber-400 ring-2 ring-amber-400/40 shadow-lg shadow-amber-950" 
+                    : "bg-slate-950/70 border-slate-800 hover:border-slate-700"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono text-slate-400 uppercase font-bold block">1. Total no Período (Bruto)</span>
+                  {valeFilter === "todos" && (
+                    <span className="text-[9px] font-mono font-black px-1.5 py-0.2 bg-amber-500 text-slate-950 rounded">VISÃO ATIVA</span>
+                  )}
+                </div>
+                <p className="text-xl font-black font-mono text-white mt-1">
+                  {processSummary.contingenciasTotalCount} <span className="text-xs font-sans font-medium text-slate-400">ocorrências</span>
+                </p>
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-xs font-mono font-bold text-amber-400">{formatCurrency(processSummary.contingenciasTotalVal)}</span>
+                  <span className="text-[10px] text-slate-400 font-sans">Com e Sem Vales</span>
+                </div>
+              </div>
+
+              {/* Card 2: Constam na Guia de Vales */}
+              <div 
+                onClick={() => setValeFilter("com_vale")}
+                className={`p-3 rounded-xl border transition-all cursor-pointer ${
+                  valeFilter === "com_vale" 
+                    ? "bg-purple-950/60 border-purple-400 ring-2 ring-purple-400/40 shadow-lg shadow-purple-950" 
+                    : "bg-slate-950/70 border-slate-800 hover:border-slate-700"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono text-purple-400 uppercase font-bold block">2. Na Guia de Vales (Vales Emitidos)</span>
+                  <span className="text-[9px] font-mono font-bold px-1.5 py-0.2 bg-purple-500/20 text-purple-300 border border-purple-500/30 rounded">
+                    {processSummary.contingenciasComValeCount} reg.
+                  </span>
+                </div>
+                <p className="text-xl font-black font-mono text-purple-200 mt-1">
+                  {formatCurrency(processSummary.contingenciasComValeVal)}
+                </p>
+                <span className="text-[10px] text-purple-300/80 block font-sans mt-0.5">
+                  ⚠️ Já cobrado na Base de Vales (não duplicar)
+                </span>
+              </div>
+
+              {/* Card 3: Base Limpa de Contingência (Sem Vales) */}
+              <div 
+                onClick={() => setValeFilter("sem_vale")}
+                className={`p-3 rounded-xl border transition-all cursor-pointer ${
+                  valeFilter === "sem_vale" 
+                    ? "bg-emerald-950/70 border-emerald-400 ring-2 ring-emerald-400/50 shadow-xl shadow-emerald-950" 
+                    : "bg-slate-950/70 border-slate-800 hover:border-slate-700"
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-mono text-emerald-400 uppercase font-bold block">3. Base Limpa de Contingência</span>
+                  <span className="text-[9px] font-mono font-black px-1.5 py-0.2 bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 rounded">
+                    {processSummary.contingenciasSemValeCount} reg.
+                  </span>
+                </div>
+                <p className="text-xl font-black font-mono text-emerald-200 mt-1">
+                  {formatCurrency(processSummary.contingenciasSemValeVal)}
+                </p>
+                <span className="text-[10px] text-emerald-300 font-semibold block font-sans mt-0.5">
+                  🛡️ Sem Vale (Base pura para exportação)
+                </span>
+              </div>
+            </div>
+
+            {/* Aviso Dinâmico de Conciliação e Exportação */}
+            <div className={`p-3 rounded-xl border text-xs font-sans flex items-center justify-between gap-3 flex-wrap transition-colors ${
+              valeFilter === "sem_vale"
+                ? "bg-emerald-950/40 border-emerald-600/50 text-emerald-200"
+                : "bg-amber-950/40 border-amber-600/50 text-amber-200"
+            }`}>
+              <div className="flex items-center gap-2.5 max-w-2xl">
+                <span className="text-xl shrink-0">{valeFilter === "sem_vale" ? "🛡️" : "⚠️"}</span>
+                <div>
+                  <span className="font-bold block text-sm">
+                    {valeFilter === "sem_vale"
+                      ? "Proteção Anti-Duplicação ATIVADA!"
+                      : "Atenção: Base de Contingência Não Conciliada"}
+                  </span>
+                  <span className="text-[11px] text-slate-300 leading-relaxed block mt-0.5">
+                    {valeFilter === "sem_vale"
+                      ? `As ${processSummary.contingenciasComValeCount} contingências que também estão na Guia de Vales foram desmarcadas e excluídas desta lista. Ao exportar esta base e depois exportar a Base de Vales, NENHUM valor será somado duas vezes!`
+                      : `A lista abaixo contém ${processSummary.contingenciasComValeCount} contingências que também geraram Vale. Se você exportar agora, esses valores serão duplicados ao juntar com a Base de Vales. Clique no botão "Desmarcar as da Guia de Vales" acima para gerar a base líquida de contingência.`}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0 ml-auto">
+                <button
+                  type="button"
+                  onClick={() => {
+                    exportFilteredRequestsExcel(filteredRequests, valesHistorico, promaxRecords, {
+                      startDate,
+                      endDate,
+                      sectorFilter,
+                      processTypeFilter: "contingencia",
+                      valeFilter,
+                      onlyContingencia: true
+                    });
+                  }}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 active:scale-95 border border-emerald-400 text-white font-mono font-bold text-xs rounded-xl shadow-lg shadow-emerald-950 cursor-pointer flex items-center gap-2 hover:scale-[1.02] transition-all"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>
+                    {valeFilter === "sem_vale"
+                      ? `Exportar Base de Contingência Limpa (${filteredRequests.length})`
+                      : `Exportar Base de Contingência (${filteredRequests.length})`}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* AMANHÃ REMINDERS BANNER CONTAINER */}
+        {activeTab === "faltas_inversoes" && tomorrowReminders.length > 0 && (
+          <div className="p-4 bg-amber-950/20 border border-amber-900/35 rounded-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4 no-print text-left animate-fade-in">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 bg-amber-950 border border-amber-900/40 rounded-xl text-amber-500 shrink-0 animate-pulse mt-0.5">
+                <Clock className="w-5 h-5" />
+              </div>
+              <div>
+                <h4 className="text-xs font-bold text-amber-400 uppercase tracking-widest font-mono flex items-center gap-1.5">
+                  <span>⏰ Prazo Urgente Amanhã</span>
+                  <span className="p-0.5 px-1.5 bg-amber-500 text-slate-950 rounded-full font-sans font-extrabold text-[9px] lowercase leading-none">
+                    {tomorrowReminders.length} pendente{tomorrowReminders.length > 1 ? "s" : ""}
+                  </span>
+                </h4>
+                <p className="text-[11.5px] text-slate-300 mt-1 max-w-2xl leading-normal">
+                  Cargas agendadas para amanhã necessitam de comprovação de entrega. Acesse os comprovantes físicos ou simule os arquivos assinados e faça a respectiva baixa física no controle.
+                </p>
+                <div className="mt-2 flex flex-wrap gap-1.5 text-[9.5px] font-mono">
+                  {tomorrowReminders.map(rem => (
+                    <span key={rem.id} className="p-0.5 px-2 bg-slate-950 border border-slate-850/60 rounded text-slate-400">
+                      NF: <span className="text-amber-500 font-bold">{rem.nf}</span> ({rem.faltaMotorista || "Sem Mot."})
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+            
+            <div className="flex gap-2 w-full md:w-auto shrink-0 justify-end">
+              <button
+                onClick={() => setDismissedReminderToday(true)}
+                className="p-1.5 px-3 bg-slate-950 hover:bg-slate-850 border border-slate-850 text-[10px] text-slate-400 hover:text-white rounded-xl cursor-pointer transition-colors font-mono font-bold"
+              >
+                Ignorar
+              </button>
+              <button
+                onClick={() => setShowReminderPopup(true)}
+                className="p-1.5 px-4 bg-amber-600 hover:bg-amber-700 text-slate-950 font-extrabold text-[10px] rounded-xl cursor-pointer transition-all hover:scale-[1.03] shadow-md shadow-amber-950/25"
+              >
+                Abrir Checklist
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* SPECIAL CONTROLS PANEL FOR THE FALTAS & INVERSÕES HISTORICAL TAB */}
+        {activeTab === "faltas_inversoes" && (
+          <div className="p-4 bg-slate-900 border border-slate-800 rounded-2xl flex flex-wrap gap-4 items-center justify-between no-print animate-fade-in text-left">
+            <div className="flex flex-wrap gap-4 items-center">
+              {/* Filter shortage status (Open pending vs Closed baixados) */}
+              <div className="space-y-1">
+                <span className="text-[9.5px] font-mono font-bold text-slate-400 block uppercase">Estado de Baixa Física:</span>
+                <div className="bg-slate-955 border border-slate-850 p-1 rounded-xl flex items-center space-x-1">
+                  <button
+                    onClick={() => setLackFilterStatus("todos")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer transition-colors ${
+                      lackFilterStatus === "todos" ? "bg-slate-800 text-white font-bold" : "text-slate-450 hover:text-white"
+                    }`}
+                  >
+                    Geral ({lackCount})
+                  </button>
+                  <button
+                    onClick={() => setLackFilterStatus("abertos")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer transition-colors ${
+                      lackFilterStatus === "abertos" ? "bg-indigo-600 text-white font-bold" : "text-slate-450 hover:text-white"
+                    }`}
+                    title="Apenas pendências físicas esperando envio do produto pelo controle"
+                  >
+                    Pendente ({lackSubstats.abertos})
+                  </button>
+                  <button
+                    onClick={() => setLackFilterStatus("baixados")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer transition-colors ${
+                      lackFilterStatus === "baixados" ? "bg-emerald-600 text-white font-bold" : "text-slate-450 hover:text-white"
+                    }`}
+                    title="Baixas de estoque concluídas"
+                  >
+                    Baixadas ({lackSubstats.baixados})
+                  </button>
+                </div>
+              </div>
+
+              {/* Filter shortage reason/origin (Loading vs Delivery error) */}
+              <div className="space-y-1">
+                <span className="text-[9.5px] font-mono font-bold text-slate-400 block uppercase">Origem do Erro / Custódia:</span>
+                <div className="bg-slate-955 border border-slate-850 p-1 rounded-xl flex items-center space-x-1">
+                  <button
+                    onClick={() => setLackFilterErrorType("todos")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer ${
+                      lackFilterErrorType === "todos" ? "bg-slate-800 text-white font-bold" : "text-slate-450 hover:text-white"
+                    }`}
+                  >
+                    Todos
+                  </button>
+                  <button
+                    onClick={() => setLackFilterErrorType("carregamento")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer ${
+                      lackFilterErrorType === "carregamento" ? "bg-blue-900 border border-blue-800/40 text-blue-300 font-bold" : "text-slate-450"
+                    }`}
+                    title="Falta de carregamento no armazém - Sem faturamento comercial"
+                  >
+                    Carregamento ({lackSubstats.carregamento})
+                  </button>
+                  <button
+                    onClick={() => setLackFilterErrorType("entrega")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer ${
+                      lackFilterErrorType === "entrega" ? "bg-amber-900 border border-amber-800/40 text-amber-300 font-bold" : "text-slate-450"
+                    }`}
+                    title="Erro de descarga/entrega na rota - Faturar + Cobrança"
+                  >
+                    Descarregamento ({lackSubstats.entrega})
+                  </button>
+                  <button
+                    onClick={() => setLackFilterErrorType("indefinido")}
+                    className={`px-3 py-1 text-[10.5px] font-semibold rounded-lg cursor-pointer ${
+                      lackFilterErrorType === "indefinido" ? "bg-red-956 border border-red-900/20 text-red-400 font-bold" : "text-slate-450"
+                    }`}
+                    title="Faltas aguardando classificação operacional de culpa"
+                  >
+                    Não Definidos ({lackSubstats.indefinido})
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Quick Informative text box */}
+            <div className="max-w-xs text-[10px] text-slate-400 border-l-2 border-slate-700 pl-3 leading-relaxed font-sans">
+              As Faltas e Inversões ficam gravadas permanentemente. Faltas de carregamento não faturam. Faltas de entrega geram Vale e faturamento.
+            </div>
+          </div>
+        )}
+
+        {/* Requests List Grid */}
+        {activeTab === "criar_solicitacao" ? (
+          <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl max-w-4xl mx-auto space-y-6 text-left no-print animate-fade-in shadow-xl">
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+              <div>
+                <h3 className="text-sm font-extrabold text-white uppercase tracking-widest font-sans flex items-center gap-2">
+                  <span className="p-1.5 bg-emerald-500/10 border border-emerald-500/30 rounded-lg text-emerald-400">
+                    <PlusCircle className="w-4 h-4" />
+                  </span>
+                  <span>Criar Nova Solicitação (Supervisor / Gestor)</span>
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Gere solicitações de trocas, faltas, sobras ou inversões com arquivamento persistente na nuvem.
+                </p>
+              </div>
+              <button
+                onClick={() => setActiveTab("pendente")}
+                className="p-1.5 bg-slate-950 hover:bg-slate-850 border border-slate-800 rounded-lg text-slate-400 hover:text-white cursor-pointer transition-colors text-xs font-mono font-bold flex items-center gap-1"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Cancelar</span>
+              </button>
+            </div>
+
+            {/* Error and Success alerts */}
+            {createError && (
+              <div className="p-4 bg-red-950/30 border border-red-900/45 text-red-300 rounded-xl text-xs flex items-start gap-2.5 leading-relaxed font-semibold">
+                <AlertCircle className="w-4 h-4 shrink-0 text-red-500 mt-0.5" />
+                <span>{createError}</span>
+              </div>
+            )}
+
+            {createSuccess && (
+              <div className="p-4 bg-emerald-950/40 border border-emerald-900/40 text-emerald-300 rounded-xl text-xs flex items-start gap-2.5 leading-relaxed font-bold animate-pulse">
+                <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400 mt-0.5" />
+                <span>{createSuccess}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleCreateRequestSubmit} className="space-y-6" id="form-criar-solicitacao">
+              {/* Row 1: Setor and Crew */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4.5">
+                {/* Sector */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">
+                    Setor / RN <span className="text-slate-500 font-normal text-[9px]">(Opcional)</span>:
+                  </label>
+                  <select
+                    value={reqSetor}
+                    onChange={(e) => setReqSetor(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-semibold text-slate-300 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                  >
+                    <option value="">-- Não especificar Setor (Opcional) --</option>
+                    {repsArray.map(r => (
+                      <option key={r.setor} value={r.setor}>
+                        Setor {r.setor} ({r.nome})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Driver */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Motorista (Rota):</label>
+                  <select
+                    value={reqMotorista}
+                    onChange={(e) => setReqMotorista(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-semibold text-slate-300 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                  >
+                    <option value="">-- Selecione o Motorista --</option>
+                    {LISTA_CREW.filter(c => c.cargo.toLowerCase().includes("motorista")).map((c, cIdx) => (
+                      <option key={`drv_${c.cpf || c.nome}_${cIdx}`} value={c.nome}>
+                        {c.nome} ({c.cargo})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Assistants */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Ajudante 1:</label>
+                  <select
+                    value={reqAjudante1}
+                    onChange={(e) => setReqAjudante1(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-semibold text-slate-300 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                  >
+                    <option value="">-- Selecione o Ajudante 1 --</option>
+                    <option value="Não possui">Não possui</option>
+                    {LISTA_CREW.filter(c => c.cargo.toLowerCase().includes("ajudante") || c.cargo.toLowerCase().includes("auxiliar")).map((c, cIdx) => (
+                      <option key={`aj_${c.cpf || c.nome}_${cIdx}`} value={c.nome}>
+                        {c.nome}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Row 2: Document Details */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4.5">
+                {/* Nota Fiscal */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">
+                    Nota Fiscal (NF) <span className="text-red-500">*</span>:
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex: 123456"
+                    value={reqNf}
+                    onChange={(e) => setReqNf(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-mono text-slate-200 placeholder:text-slate-700 focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+
+                {/* Cliente NB */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">
+                    Cód. Cliente (NB) <span className="text-red-500">*</span>:
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex: 504030"
+                    value={reqNb}
+                    onChange={(e) => setReqNb(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-mono text-slate-200 placeholder:text-slate-700 focus:outline-none focus:border-emerald-500"
+                  />
+                  {sectorLoadingInfo && (
+                    <div className="space-y-1.5 mt-1.5 font-sans leading-tight text-[11px]">
+                      {sectorLoadingInfo.isRegistered ? (
+                        <div className="bg-emerald-950/60 border border-emerald-800/60 p-2.5 rounded-xl space-y-1">
+                          <span className="text-emerald-300 block font-bold text-xs flex items-center gap-1.5">
+                            <span>✅ PDV:</span>
+                            <span className="text-white font-extrabold">{sectorLoadingInfo.clientName}</span>
+                          </span>
+                          {sectorLoadingInfo.clientCity ? (
+                            <span className="text-emerald-300 font-bold block flex items-center gap-1.5 text-[11px] pt-0.5">
+                              <span className="text-amber-300 shrink-0">📍 CIDADE DO PDV:</span>
+                              <span className="text-white font-mono bg-emerald-900/90 px-2 py-0.5 rounded-md border border-emerald-600/50 text-[11px] uppercase tracking-wide">
+                                {sectorLoadingInfo.clientCity}
+                              </span>
+                            </span>
+                          ) : (
+                            <span className="text-amber-300/90 font-medium block text-[10.5px]">
+                              📍 Cidade: Não cadastrada no banco de PDVs
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="bg-slate-900 border border-slate-800 p-2.5 rounded-xl space-y-1">
+                          <span className="text-amber-400 block font-semibold text-[11px]">
+                            ⚠️ NB não cadastrado no banco do PDV.
+                          </span>
+                          {sectorLoadingInfo.clientCity ? (
+                            <span className="text-emerald-400 font-bold block flex items-center gap-1.5 text-[11px] pt-0.5">
+                              <span className="text-amber-300 shrink-0">📍 CIDADE DO PDV (registros):</span>
+                              <span className="text-white font-mono bg-slate-800 px-2 py-0.5 rounded text-[11px] uppercase tracking-wide">
+                                {sectorLoadingInfo.clientCity}
+                              </span>
+                            </span>
+                          ) : (
+                            <span className="text-slate-400 block text-[10.5px]">
+                              📍 Cidade: Não localizada
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {sectorLoadingInfo.foundSector ? (
+                        <span className="text-emerald-400 font-bold block font-mono text-[11px]">
+                          📍 Setor auto-identificado: Setor {sectorLoadingInfo.foundSector}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500 block font-medium text-[10.5px]">
+                          🔍 Nenhum setor associado a este NB nos registros.
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Mapa de Carga */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">
+                    Mapa de Carga <span className="text-red-500">*</span>:
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="Ex: 987"
+                    value={reqMapa}
+                    onChange={(e) => setReqMapa(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-mono text-slate-200 placeholder:text-slate-700 focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+
+                {/* Data de Entrega / Alinhamento */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block flex items-center gap-1">
+                    <Calendar className="w-3 h-3 text-slate-400" />
+                    <span>Data de Entrega / Alinhamento <span className="text-slate-500 font-normal ml-0.5">(Opcional)</span>:</span>
+                  </label>
+                  <input
+                    type="date"
+                    value={reqDataEntrega}
+                    onChange={(e) => setReqDataEntrega(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 h-10 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500"
+                  />
+                  {reqDataEntrega && (() => {
+                    const parts = reqDataEntrega.split("-");
+                    if (parts.length === 3) {
+                      const year = parseInt(parts[0], 10);
+                      const month = parseInt(parts[1], 10) - 1;
+                      const day = parseInt(parts[2], 10);
+                      const deliveryDateObj = new Date(year, month, day);
+                      const dayOfWeek = deliveryDateObj.getDay();
+
+                      const dayNames = ["Domingo", "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado"];
+                      const dayName = dayNames[dayOfWeek];
+                      const isMonday = dayOfWeek === 1;
+
+                      let fridayDateStr = "";
+                      if (isMonday) {
+                        const fridayObj = new Date(deliveryDateObj);
+                        fridayObj.setDate(fridayObj.getDate() - 3);
+                        const fDay = String(fridayObj.getDate()).padStart(2, '0');
+                        const fMonth = String(fridayObj.getMonth() + 1).padStart(2, '0');
+                        fridayDateStr = `${fDay}/${fMonth}/${fridayObj.getFullYear()}`;
+                      }
+
+                      return (
+                        <div className="space-y-1.5 mt-2">
+                          <div className="text-[11px] font-medium text-slate-300 font-mono flex items-center gap-1.5">
+                            <span>📅 Dia da semana alinhado:</span>
+                            <span className={`font-bold ${isMonday ? "text-amber-400" : "text-emerald-400"}`}>
+                              {dayName} ({String(day).padStart(2, '0')}/{String(month + 1).padStart(2, '0')}/{year})
+                            </span>
+                          </div>
+
+                          {isMonday && (
+                            <div className="p-3 bg-amber-950/80 border-2 border-amber-500/80 rounded-xl space-y-1.5 animate-fadeIn shadow-lg shadow-amber-950/50">
+                              <div className="flex items-center gap-2 text-amber-300 font-extrabold text-xs">
+                                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                                <span className="uppercase tracking-wide">⚠️ LEMBRETE: CARREGAMENTO NA SEXTA-FEIRA</span>
+                              </div>
+                              <p className="text-[11px] text-amber-100 leading-relaxed font-sans font-medium">
+                                Esta entrega está agendada para <strong>Segunda-feira ({String(day).padStart(2, '0')}/{String(month + 1).padStart(2, '0')})</strong>.
+                              </p>
+                              <div className="text-amber-200 text-[11px] font-bold bg-amber-900/90 px-2.5 py-1.5 rounded-lg border border-amber-500/50 leading-normal font-sans">
+                                🚛 <strong>Atenção operacional:</strong> Como a entrega ocorre na Segunda-feira, o carregamento da carga deve ser feito na <strong>Sexta-feira anterior ({fridayDateStr})</strong>! Por favor, alinhe a separação e o carregamento na sexta-feira.
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                </div>
+              </div>
+
+              {/* Motive & Evidence Section */}
+              <div className="p-4 bg-slate-950 rounded-2xl border border-slate-850 space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Motive Selection */}
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Motivo Principal:</label>
+                    <select
+                      value={reqMotiveType}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setReqMotiveType(val);
+                        setReqMotiveText("");
+                        if (val === "Falta no SKU") {
+                          setReqUnidade("und");
+                        } else {
+                          setReqUnidade("sku");
+                        }
+                      }}
+                      className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs font-semibold text-slate-300 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                    >
+                      <option value="Produto Avariado">Produto Avariado</option>
+                      <option value="Falta de SKU Completo">Falta de SKU Completo</option>
+                      <option value="Falta no SKU">Falta no SKU</option>
+                      <option value="Sobra de Carga">Sobra de Carga</option>
+                      <option value="Inversão">Inversão</option>
+                      <option value="Outros">Outros</option>
+                    </select>
+                  </div>
+
+                  {/* Complementary Motive text */}
+                  <div className="space-y-1">
+                    <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Detalhamento do Motivo:</label>
+                    <input
+                      type="text"
+                      placeholder="Ex: Quebra de garrafa, erro na carga, etc."
+                      value={reqMotiveText}
+                      onChange={(e) => setReqMotiveText(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 focus:outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                </div>
+
+                {/* Evidence Photo Section */}
+                <div className="border-t border-slate-900 pt-3.5">
+                  <div className="space-y-2">
+                    <span className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block flex items-center gap-1.5">
+                      <span>📸 Foto da Evidência / Comprovante:</span>
+                      <span className="text-emerald-500 font-sans font-bold text-[9px] uppercase tracking-normal">(Opcional)</span>
+                    </span>
+                    <p className="text-[10.5px] text-slate-500 leading-normal">
+                      Anexar uma foto da evidência ou do comprovante físico é opcional para todos os motivos e serve apenas para maior rastreabilidade e auditoria.
+                    </p>
+
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 mt-1.5">
+                      <label className="h-10 bg-slate-900 hover:bg-slate-850 border border-slate-800 text-slate-350 hover:text-white px-4 rounded-xl cursor-pointer flex items-center justify-center gap-2 text-xs font-bold transition-all hover:scale-[1.01]">
+                        <Camera className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Tirar Foto / Anexar</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          onChange={handleImageCaptureInForm}
+                          className="hidden"
+                        />
+                      </label>
+
+                      {reqFotoUrl && (
+                        <div className="flex items-center gap-2 p-1.5 px-3 bg-emerald-950/20 border border-emerald-900/25 rounded-xl max-w-sm">
+                          <img src={reqFotoUrl} className="w-7 h-7 object-cover rounded border border-emerald-900/30" alt="Evidência" />
+                          <span className="text-[10px] font-mono text-emerald-400 font-bold truncate max-w-[150px]">Foto capturada!</span>
+                          <button
+                            type="button"
+                            onClick={() => setReqFotoUrl("")}
+                            className="text-red-500 hover:text-red-400 p-1 cursor-pointer ml-auto"
+                            title="Remover foto"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Product and quantities item entry section */}
+              <div className="p-4 bg-slate-950 rounded-2xl border border-slate-850 space-y-4">
+                <h4 className="text-xs font-bold text-slate-300 uppercase tracking-widest font-mono border-b border-slate-900 pb-2">
+                  📦 Inserir SKUs de Produtos
+                </h4>
+
+                {reqMotiveType === "Inversão" ? (
+                  <div className="space-y-4">
+                    {/* Inversion inputs */}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {/* SKU to deliver */}
+                      <div className="space-y-1 relative">
+                        <label className="text-[10px] font-bold text-emerald-400 font-mono uppercase tracking-wider block">
+                          SKU que deve IR (Entregar ao cliente):
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="Digite código ou descrição..."
+                          value={reqInversaoIr}
+                          onChange={(e) => {
+                            setReqInversaoIr(e.target.value);
+                            setShowIrSuggestions(true);
+                          }}
+                          onFocus={() => setShowIrSuggestions(true)}
+                          onBlur={() => setTimeout(() => setShowIrSuggestions(false), 200)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 font-mono focus:outline-none focus:border-emerald-500"
+                        />
+                        {/* Suggestions list */}
+                        {showIrSuggestions && irSuggestions.length > 0 && (
+                          <div className="absolute z-30 left-0 right-0 top-16 bg-slate-950 border border-slate-850 rounded-xl shadow-2xl max-h-48 overflow-y-auto divide-y divide-slate-900">
+                            {irSuggestions.map(p => (
+                              <button
+                                key={p.codigo}
+                                type="button"
+                                onMouseDown={() => {
+                                  setReqInversaoIr(`#${p.codigo} - ${p.descricao}`);
+                                  setReqItem(p.codigo);
+                                }}
+                                className="w-full px-3 py-2 text-left hover:bg-slate-900 transition-colors block text-[10.5px]"
+                              >
+                                <span className="font-mono font-bold text-emerald-400">{p.codigo}</span>
+                                <span className="text-slate-400 ml-2 block truncate">{p.descricao}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* SKU to recollect */}
+                      <div className="space-y-1 relative">
+                        <label className="text-[10px] font-bold text-rose-400 font-mono uppercase tracking-wider block">
+                          SKU que deve VIR (Recolher do cliente):
+                        </label>
+                        <input
+                          type="text"
+                          placeholder="Digite código ou descrição..."
+                          value={reqInversaoRecolher}
+                          onChange={(e) => {
+                            setReqInversaoRecolher(e.target.value);
+                            setShowRecolherSuggestions(true);
+                          }}
+                          onFocus={() => setShowRecolherSuggestions(true)}
+                          onBlur={() => setTimeout(() => setShowRecolherSuggestions(false), 200)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 font-mono focus:outline-none focus:border-emerald-500"
+                        />
+                        {/* Suggestions list */}
+                        {showRecolherSuggestions && recolherSuggestions.length > 0 && (
+                          <div className="absolute z-30 left-0 right-0 top-16 bg-slate-950 border border-slate-850 rounded-xl shadow-2xl max-h-48 overflow-y-auto divide-y divide-slate-900">
+                            {recolherSuggestions.map(p => (
+                              <button
+                                key={p.codigo}
+                                type="button"
+                                onMouseDown={() => setReqInversaoRecolher(`#${p.codigo} - ${p.descricao}`)}
+                                className="w-full px-3 py-2 text-left hover:bg-slate-900 transition-colors block text-[10.5px]"
+                              >
+                                <span className="font-mono font-bold text-rose-400">{p.codigo}</span>
+                                <span className="text-slate-400 ml-2 block truncate">{p.descricao}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Quantities for Inversion */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4.5">
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Qtd do SKU a Enviar:</label>
+                        <input
+                          type="number"
+                          placeholder="Falta/Inversão IR"
+                          value={reqInversaoIrQtd}
+                          onChange={(e) => setReqInversaoIrQtd(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 font-mono focus:outline-none focus:border-emerald-500"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Qtd do SKU a Recolher:</label>
+                        <input
+                          type="number"
+                          placeholder="Sobra/Inversão Recolher"
+                          value={reqInversaoRecolherQtd}
+                          onChange={(e) => setReqInversaoRecolherQtd(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 font-mono focus:outline-none focus:border-emerald-500"
+                        />
+                      </div>
+
+                      <div className="flex items-end">
+                        <button
+                          type="button"
+                          onClick={handleAddReqDraftItem}
+                          className="w-full h-10 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl cursor-pointer flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform shadow"
+                        >
+                          <Plus className="w-4 h-4" />
+                          <span>Adicionar Inversão</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                    {/* SKU search */}
+                    <div className="md:col-span-6 space-y-1 relative">
+                      <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">SKU do Produto:</label>
+                      <input
+                        type="text"
+                        placeholder="Pesquise por código ou nome do SKU..."
+                        value={reqItem}
+                        onChange={(e) => {
+                          setReqItem(e.target.value);
+                          setShowItemSuggestions(true);
+                        }}
+                        onFocus={() => setShowItemSuggestions(true)}
+                        onBlur={() => setTimeout(() => setShowItemSuggestions(false), 200)}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 font-mono focus:outline-none focus:border-emerald-500"
+                      />
+                      {/* Suggestions list */}
+                      {showItemSuggestions && itemSuggestions.length > 0 && (
+                        <div className="absolute z-30 left-0 right-0 top-16 bg-slate-950 border border-slate-850 rounded-xl shadow-2xl max-h-48 overflow-y-auto divide-y divide-slate-900">
+                          {itemSuggestions.map(p => (
+                            <button
+                              key={p.codigo}
+                              type="button"
+                              onMouseDown={() => setReqItem(p.codigo)}
+                              className="w-full px-3 py-2 text-left hover:bg-slate-900 transition-colors block text-[10.5px]"
+                            >
+                              <span className="font-mono font-bold text-amber-500">{p.codigo}</span>
+                              <span className="text-slate-400 ml-2 block truncate">{p.descricao}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Dynamic Price / Unit Preview */}
+                      {(() => {
+                        const productDef = PRODUCT_DATABASE.find(p => p.codigo === reqItem.trim());
+                        if (productDef) {
+                          const embalagem = productDef.fator || 12;
+                          const closedBoxPrice = productDef.valor || 98.50;
+                          const unitPrice = closedBoxPrice / embalagem;
+                          return (
+                            <div className="mt-1.5 p-1.5 px-2 bg-slate-900/40 border border-slate-850 rounded-xl text-[10px] text-slate-400 font-mono flex flex-wrap gap-x-3 gap-y-1 leading-relaxed">
+                              <span>📦 Embalagem: <strong>{embalagem} un</strong></span>
+                              <span>Sugerido (SKU): <strong className="text-emerald-400">R$ {closedBoxPrice.toFixed(2)}</strong></span>
+                              <span>Unitário (UND): <strong className="text-amber-500">R$ {unitPrice.toFixed(2)}</strong></span>
+                            </div>
+                          );
+                        }
+                        return null;
+                      })()}
+                    </div>
+
+                    {/* Unidade de Medida */}
+                    <div className="md:col-span-2 space-y-1">
+                      <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Unidade:</label>
+                      <select
+                        value={reqUnidade}
+                        onChange={(e) => setReqUnidade(e.target.value as "sku" | "und")}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs font-semibold text-slate-200 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                      >
+                        <option value="sku">SKU (Caixa Fechada)</option>
+                        <option value="und">UND (Unidade Avulsa)</option>
+                      </select>
+                    </div>
+
+                    {/* Quantity */}
+                    <div className="md:col-span-2 space-y-1">
+                      <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Quantidade:</label>
+                      <input
+                        type="number"
+                        placeholder="Ex: 5"
+                        value={reqQuantidade}
+                        onChange={(e) => setReqQuantidade(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 h-10 text-xs text-slate-200 placeholder:text-slate-700 font-mono focus:outline-none focus:border-emerald-500"
+                      />
+                    </div>
+
+                    {/* Add Button */}
+                    <div className="md:col-span-2 flex items-end">
+                      <button
+                        type="button"
+                        onClick={handleAddReqDraftItem}
+                        className="w-full h-10 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl cursor-pointer flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform shadow"
+                      >
+                        <Plus className="w-4 h-4" />
+                        <span>Adicionar SKU</span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Draft list table */}
+                {reqDraftItems.length > 0 && (
+                  <div className="mt-3.5 border border-slate-900 rounded-xl overflow-hidden bg-slate-950">
+                    <table className="w-full text-left text-xs divide-y divide-slate-900">
+                      <thead>
+                        <tr className="bg-slate-900/50 font-mono font-bold text-slate-500 text-[10px] uppercase tracking-wider">
+                          <th className="px-4 py-2.5 align-middle">SKU / Produto</th>
+                          <th className="px-4 py-2.5 align-middle">Unidade</th>
+                          <th className="px-4 py-2.5 text-center align-middle">Qtd</th>
+                          <th className="px-4 py-2.5 text-right align-middle">Valor Unit.</th>
+                          <th className="px-4 py-2.5 text-right align-middle">Subtotal</th>
+                          <th className="px-4 py-2.5 pl-6 align-middle">Motivo</th>
+                          <th className="px-4 py-2.5 text-right align-middle">Ação</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-900">
+                        {reqDraftItems.map((item) => {
+                          const isUnd = item.unidadeMedida === "und";
+                          const embalagem = item.fatorEmbalagem || 12;
+                          const precoSugerido = item.precoSugerido || 98.50;
+                          const valUnit = isUnd ? (precoSugerido / embalagem) : precoSugerido;
+                          const subtotal = item.precoCalculated || (valUnit * item.quantidade);
+
+                          return (
+                            <tr key={item.id} className="hover:bg-slate-900/30">
+                              <td className="px-4 py-2.5 align-middle">
+                                <span className="font-mono font-bold text-emerald-400">{item.itemCode}</span>
+                                <span className="text-slate-400 ml-2 block sm:inline truncate max-w-[200px]" title={item.itemDesc}>{item.itemDesc}</span>
+                              </td>
+                              <td className="px-4 py-2.5 font-mono text-[10px] align-middle">
+                                {isUnd ? (
+                                  <span className="p-1 px-1.5 bg-blue-950/40 border border-blue-900/50 rounded text-blue-400 font-bold badge-3d">UND</span>
+                                ) : (
+                                  <span className="p-1 px-1.5 bg-emerald-950/40 border border-emerald-900/50 rounded text-emerald-400 font-bold badge-3d">SKU</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-2.5 text-center font-mono font-bold text-slate-200 align-middle">
+                                {item.quantidade}
+                              </td>
+                              <td className="px-4 py-2.5 text-right font-mono text-slate-350 align-middle">
+                                R$ {valUnit.toFixed(2)}
+                              </td>
+                              <td className="px-4 py-2.5 text-right font-mono font-bold text-emerald-450 align-middle">
+                                R$ {subtotal.toFixed(2)}
+                              </td>
+                              <td className="px-4 py-2.5 pl-6 align-middle">
+                                <span className="p-0.5 px-2 bg-slate-900 border border-slate-800 rounded font-bold text-[10px] text-amber-500 font-mono block whitespace-nowrap overflow-hidden text-ellipsis max-w-[150px]" title={item.motivo}>
+                                  {item.motivo}
+                                </span>
+                              </td>
+                              <td className="px-4 py-2.5 text-right align-middle">
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveReqDraftItem(item.id)}
+                                  className="text-red-500 hover:text-red-400 p-1 rounded hover:bg-slate-900/60 cursor-pointer inline-flex items-center"
+                                  title="Excluir item"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* Row 4: Observações e Submit */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-4.5">
+                {/* Observations */}
+                <div className="md:col-span-8 space-y-1">
+                  <label className="text-[10px] font-bold text-slate-400 font-mono uppercase tracking-wider block">Observações Adicionais:</label>
+                  <textarea
+                    rows={2}
+                    placeholder="Escreva observações internas para a equipe de controle ou auditoria..."
+                    value={reqObservacao}
+                    onChange={(e) => setReqObservacao(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-205 placeholder:text-slate-700 focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+
+                {/* Submit button wrapper */}
+                <div className="md:col-span-4 flex items-end">
+                  <button
+                    type="submit"
+                    disabled={uploadingImage}
+                    className="w-full h-12 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-850 text-white font-extrabold text-sm rounded-xl cursor-pointer flex items-center justify-center gap-2 hover:scale-[1.01] transition-transform shadow-lg shadow-emerald-950/20"
+                  >
+                    {uploadingImage ? (
+                      <>
+                        <span className="w-4 h-4 border-2 border-t-transparent border-white rounded-full animate-spin"></span>
+                        <span>Arquivando na Nuvem...</span>
+                      </>
+                    ) : (
+                      <>
+                        <PlusCircle className="w-5 h-5 text-emerald-300" />
+                        <span>Gerar Solicitação 🚀</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        ) : activeTab === "historico_vales" ? (
+          <div className="no-print animate-fade-in">
+            <ValesHistoryDashboard 
+              vales={displayVales} 
+              onReimprimir={(vale) => setSelectedPrintDoc({ type: "vale", request: vale.originalRequest })} 
+              onDeleteSingleVale={handleDeleteSingleVale}
+              onUpdateValeStatus={handleUpdateValeStatus}
+              onCreateAvulsoVale={handleCreateAvulsoVale}
+              openAvulsoTrigger={openAvulsoTrigger}
+              onInspectRequest={(vale) => {
+                const req = vale.originalRequest || requests.find(r => r.id === vale.requestId || (r.nf && r.nf !== "N0-NF" && r.nf === vale.nf));
+                if (req) {
+                  setInspectRequest(req);
+                } else {
+                  setInspectRequest({
+                    id: vale.requestId || vale.id,
+                    timestamp: Date.now(),
+                    data: vale.dataEmissao,
+                    setor: vale.rota,
+                    mapa: vale.originalRequest?.mapa || "S/M",
+                    nb: vale.originalRequest?.nb || "N/A",
+                    nf: vale.nf,
+                    fotoUrl: vale.originalRequest?.fotoUrl || "",
+                    observacao: `Vale emitido para Motorista ${vale.motorista} (CPF: ${vale.motoristaCpf || "N/A"}) - Equipe: ${vale.ajudante1 || vale.ajudantes || "N/A"}`,
+                    statusPromax: "cadastrado",
+                    item: vale.originalRequest?.item || "N/A",
+                    quantidade: vale.itemsCount,
+                    hectolitros: vale.hectolitros,
+                    fatorHecto: 1,
+                    items: vale.originalRequest?.items,
+                    faltaMotorista: vale.motorista,
+                    faltaMotoristaCpf: vale.motoristaCpf,
+                    faltaAjudante1: vale.ajudante1,
+                    faltaAjudante1Cpf: vale.ajudante1Cpf,
+                    faltaAjudante2: vale.ajudante2,
+                    faltaAjudante2Cpf: vale.ajudante2Cpf
+                  } as any);
+                }
+              }}
+            />
+          </div>
+        ) : activeTab === "espelho" ? (
+          <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl shadow-xl space-y-4 text-left animate-fade-in">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-3">
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold font-mono text-white uppercase tracking-wide flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-indigo-400" /> Espelho de Reposições e Trocas Aprovadas
+                </h3>
+                <p className="text-[11px] text-slate-400 font-sans">
+                  Consulte e imprima a lista consolidada de todas as anomalias e devoluções homologadas e liquidadas ("cadastradas") na data de referência.
+                </p>
+              </div>
+              <button
+                onClick={handleOpenPrintEspelho}
+                disabled={espelhoFiltrado.length === 0}
+                className={`px-4 py-2 rounded-xl font-mono text-xs font-bold transition-all flex items-center gap-2 uppercase tracking-wider shadow-md ${
+                  espelhoFiltrado.length === 0
+                    ? "bg-slate-800 text-slate-600 border border-slate-850 cursor-not-allowed"
+                    : "bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-950/25 cursor-pointer hover:scale-[1.02] active:scale-95"
+                }`}
+              >
+                <Printer className="w-4 h-4" />
+                <span>Imprimir Espelho</span>
+              </button>
+            </div>
+
+            {/* Date and Search Bar */}
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-3 bg-slate-950/40 p-4 border border-slate-850 rounded-xl items-end">
+              <div className="md:col-span-4 space-y-1">
+                <label className="text-[10px] text-slate-400 font-mono block">Data de Referência (Cadastro)</label>
+                <input
+                  type="date"
+                  defaultValue={new Date().toISOString().split("T")[0]}
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      const [year, month, day] = e.target.value.split("-");
+                      setFilterEspelhoDate(`${day}/${month}/${year}`);
+                    } else {
+                      setFilterEspelhoDate(new Date().toLocaleDateString("pt-BR"));
+                    }
+                  }}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-xs text-slate-200 font-mono focus:border-indigo-500 focus:outline-none"
+                />
+              </div>
+
+              <div className="md:col-span-8 space-y-1">
+                <label className="text-[10px] text-slate-400 font-mono block">Filtrar por palavras-chave</label>
+                <div className="relative">
+                  <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-500" />
+                  <input
+                    type="text"
+                    placeholder="Buscar por NB, Cliente, Produto, Cidade..."
+                    value={searchEspelho}
+                    onChange={(e) => setSearchEspelho(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 font-sans focus:border-indigo-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* DETAILED ALERT BOX FOR CARREGADO ITEMS > 1 WEEK WITHOUT BAIXA */}
+            {delayedCarregados.length > 0 && (
+              <div className="bg-rose-950/80 border-2 border-rose-600/80 p-4 rounded-xl shadow-md card-3d space-y-2.5">
+                <div className="flex items-center justify-between gap-2 border-b border-rose-800/80 pb-2">
+                  <div className="flex items-center gap-2 text-rose-300 font-mono font-black text-xs uppercase">
+                    <AlertTriangle className="w-4 h-4 animate-bounce text-rose-400" />
+                    <span>⚠️ ATENÇÃO OPERACIONAL: REPOSIÇÕES CARREGADAS HÁ MAIS DE 1 SEMANA PENDENTES DE BAIXA ({delayedCarregados.length})</span>
+                  </div>
+                  <span className="text-[10px] font-mono text-rose-200 font-extrabold bg-rose-800/80 px-2.5 py-0.5 rounded border border-rose-500/60 shadow-sm">
+                    Pendentes &gt; 7 dias
+                  </span>
+                </div>
+                <p className="text-xs text-slate-300 font-sans leading-relaxed">
+                  Os itens listados abaixo foram marcados como <strong>CARREGADOS (com placa do veículo)</strong> há mais de 7 dias e ainda não possuem confirmação de baixa no sistema:
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 pt-1">
+                  {delayedCarregados.map((it, idx) => {
+                    const itemReq = requests.find(r => r.id === it.requestId);
+                    const age = getItemAgeInDays(it, itemReq);
+                    return (
+                      <div key={idx} className="bg-rose-900/50 border border-rose-700/80 p-2.5 rounded-lg text-xs font-mono text-rose-200 space-y-1 shadow-sm">
+                        <div className="flex items-center justify-between font-bold">
+                          <span>NB #{it.nb}</span>
+                          <span className="text-amber-300 bg-amber-950/90 px-1.5 py-0.5 rounded border border-amber-600/60 text-[10px]">
+                            ⏱️ {age} dias
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-bold text-white truncate" title={it.razaoSocial}>{it.razaoSocial}</p>
+                        <div className="text-[10px] text-rose-300 flex items-center justify-between">
+                          <span>📍 {it.municipio}</span>
+                          <span>🚛 {it.placaVeiculo || "Placa atribuída"}</span>
+                        </div>
+                        <p className="text-[10px] text-slate-300 truncate" title={it.productDesc}>
+                          #{it.productCode} - {it.productDesc} ({it.quantidade}/{it.unidadeType})
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* LISTA DE CIDADES DESTINADAS ÀS REPOSIÇÕES DO DIA (ESPELHO FILTRADO) */}
+            <div className="bg-slate-950/80 p-4 border border-slate-800/80 rounded-xl space-y-3 card-3d">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800/80 pb-2">
+                <div>
+                  <h4 className="text-xs font-bold font-mono text-sky-400 uppercase tracking-wide flex items-center gap-1.5">
+                    <MapPin className="w-3.5 h-3.5 text-sky-400" /> Cidades do Espelho Filtrado ({filterEspelhoDate})
+                  </h4>
+                  <p className="text-[10px] text-slate-400">
+                    Atribua a placa do veículo por cidade para replicar em todas as solicitações da lista filtrada atual. As cidades exibidas correspondem estritamente aos itens do espelho visível.
+                  </p>
+                </div>
+              </div>
+
+              {espelhoCidadesDoDia.length === 0 ? (
+                <p className="text-[11px] text-slate-500 italic font-mono py-1">
+                  Nenhuma cidade com reposições visíveis na lista filtrada para {filterEspelhoDate}.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                  {espelhoCidadesDoDia.map(({ city, count, items }) => {
+                    const val = espelhoCityInputs[city] || "";
+                    const assignedCount = items.filter(it => {
+                      const k = `${it.requestId}_${it.productCode}`;
+                      const p = espelhoPlates[k] !== undefined ? espelhoPlates[k] : (it.placaVeiculo || it.placa || "");
+                      return p && p.trim();
+                    }).length;
+
+                    return (
+                      <div key={city} className="bg-slate-900/90 border border-slate-800 p-2.5 rounded-xl space-y-2 flex flex-col justify-between card-3d hover:border-slate-700 transition-all">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-extrabold text-xs text-sky-300 font-mono uppercase bg-sky-950/90 border border-sky-600/60 px-2 py-0.5 rounded badge-3d flex items-center gap-1">
+                            📍 {city}
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-300 bg-slate-950 px-1.5 py-0.5 rounded border border-slate-800 badge-3d">
+                            {count} {count === 1 ? "item" : "itens"} ({assignedCount}/{count} c/ placa)
+                          </span>
+                        </div>
+
+                        <div className="flex gap-1.5 items-center">
+                          <input
+                            type="text"
+                            placeholder="Placa ex: KLR-8920"
+                            value={val}
+                            onChange={(e) => {
+                              const upper = e.target.value.toUpperCase();
+                              setEspelhoCityInputs(prev => ({ ...prev, [city]: upper }));
+                            }}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs text-amber-200 font-mono uppercase focus:border-sky-400 focus:outline-none placeholder:text-slate-600 input-3d"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleApplyPlateToCity(city, val)}
+                            className="px-2.5 py-1 bg-sky-600/25 hover:bg-sky-600/40 border border-sky-500/50 text-sky-200 hover:text-white rounded-lg text-[10.5px] font-mono font-bold whitespace-nowrap cursor-pointer transition-colors btn-3d"
+                            title={`Aplicar placa '${val}' para todos os ${count} itens de ${city} no espelho filtrado`}
+                          >
+                            Aplicar
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Main Table Container */}
+            <div className="border border-slate-850 rounded-xl overflow-hidden bg-slate-950 font-sans text-xs card-3d">
+              {/* FILTRO DE STATUS (TODOS / PENDENTES / CARREGADOS) */}
+              <div className="p-3 bg-slate-900/80 border-b border-slate-850 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-[10.5px] font-mono text-slate-400">
+                <div className="flex items-center gap-2">
+                  <span className="font-bold text-slate-300">Filtro de Envio:</span>
+                  <div className="inline-flex p-0.5 bg-slate-950 border border-slate-800 rounded-lg badge-3d">
+                    <button
+                      type="button"
+                      onClick={() => setEspelhoStatusFilter("todos")}
+                      className={`px-2.5 py-1 rounded-md font-bold transition-all cursor-pointer btn-3d ${
+                        espelhoStatusFilter === "todos"
+                          ? "bg-indigo-600 text-white"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Todos ({espelhoCounts.total})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEspelhoStatusFilter("pendentes")}
+                      className={`px-2.5 py-1 rounded-md font-bold transition-all cursor-pointer btn-3d ${
+                        espelhoStatusFilter === "pendentes"
+                          ? "bg-amber-600 text-white"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      ⏳ Pendentes ({espelhoCounts.pendentes})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEspelhoStatusFilter("carregados")}
+                      className={`px-2.5 py-1 rounded-md font-bold transition-all cursor-pointer btn-3d ${
+                        espelhoStatusFilter === "carregados"
+                          ? "bg-blue-600 text-white"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      🚛 Carregados ({espelhoCounts.carregados})
+                    </button>
+                    {espelhoCounts.baixados > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setEspelhoStatusFilter("baixados")}
+                        className={`px-2.5 py-1 rounded-md font-bold transition-all cursor-pointer btn-3d ${
+                          espelhoStatusFilter === "baixados"
+                            ? "bg-emerald-600 text-white"
+                            : "text-slate-400 hover:text-white"
+                        }`}
+                      >
+                        ✅ Baixadas ({espelhoCounts.baixados})
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <span>
+                  Exibindo <strong className="text-white font-bold">{espelhoFiltrado.length}</strong> reposições na data <strong className="text-white font-bold">{filterEspelhoDate}</strong>
+                </span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-slate-950 text-slate-400 text-[10px] font-bold uppercase border-b border-slate-850">
+                      <th className="p-3 align-middle">NB</th>
+                      <th className="p-3 align-middle">CLIENTE / CIDADE DESTINO</th>
+                      <th className="p-3 align-middle">PRODUTO (SKU)</th>
+                      <th className="p-3 text-center align-middle">QUANTIDADE / UNIDADE</th>
+                      <th className="p-3 align-middle">STATUS ENCAMINHAMENTO</th>
+                      <th className="p-3 text-amber-400 font-extrabold align-middle">🚛 PLACA VEÍCULO</th>
+                      <th className="p-3 align-middle">MAPA / NF</th>
+                      <th className="p-3 text-center align-middle">AÇÃO</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-850">
+                    {espelhoFiltrado.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="p-8 text-center text-slate-500 font-mono text-xs italic align-middle">
+                          Nenhuma reposição/troca encontrada com o filtro selecionado para a data {filterEspelhoDate}.
+                        </td>
+                      </tr>
+                    ) : (
+                      espelhoFiltrado.map((item, idx) => {
+                        const itemKey = `${item.requestId}_${item.productCode}`;
+                        const currentPlate = espelhoPlates[itemKey] !== undefined ? espelhoPlates[itemKey] : (item.placaVeiculo || item.placa || "");
+                        const isCarregado = Boolean(currentPlate && currentPlate.trim());
+                        const itemReq = requests.find(r => r.id === item.requestId);
+                        const isBaixado = isRequestBaixada(itemReq);
+                        const ageInDays = getItemAgeInDays(item, itemReq);
+                        const isDelayedCarregado = isCarregado && !isBaixado && ageInDays >= 7;
+
+                        return (
+                          <tr key={idx} className={`text-slate-350 transition-colors ${isDelayedCarregado ? "bg-rose-950/20 hover:bg-rose-950/30" : isBaixado ? "bg-emerald-950/10 hover:bg-emerald-950/20" : "hover:bg-slate-850/30"}`}>
+                            <td className="p-3 font-mono font-bold text-white text-xs align-middle">{item.nb}</td>
+                            <td className="p-3 space-y-1 uppercase align-middle">
+                              <p className="font-bold text-slate-200 text-xs">{item.razaoSocial}</p>
+                              <div className="flex gap-2 items-center text-[10px]">
+                                <span className="text-slate-400 font-mono">{item.nomeFantasia}</span>
+                                <span className="text-slate-500">•</span>
+                                {/* PROMINENTLY HIGHLIGHTED CITY NAME - CYAN/SKY PALETTE */}
+                                <span className="text-sky-300 font-black font-mono text-xs uppercase bg-sky-950 border border-sky-500/80 px-2 py-0.5 rounded shadow-sm inline-flex items-center gap-1 badge-3d">
+                                  📍 {item.municipio}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="p-3 uppercase align-middle">
+                              <p className="font-bold text-slate-300">{item.productDesc}</p>
+                              <p className="text-[10px] text-slate-500 font-mono">SKU: #{item.productCode}</p>
+                            </td>
+                            {/* CONCISE QUANTITY / UNIT FORMAT: 1/SKU or 1/UND */}
+                            <td className="p-3 text-center align-middle font-mono">
+                              <span className="font-black text-amber-300 text-xs bg-slate-900/90 border border-slate-700/80 px-2.5 py-1 rounded badge-3d inline-block shadow-sm">
+                                {item.quantidade}/{item.unidadeType === "SKU" ? "SKU" : "UND"}
+                              </span>
+                            </td>
+                            {/* STATUS ENCAMINHAMENTO */}
+                            <td className="p-3 font-mono align-middle">
+                              <div className="space-y-1">
+                                {isBaixado ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-emerald-950/90 border border-emerald-500/60 text-emerald-300 rounded font-bold text-[10px] badge-3d">
+                                    <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                    BAIXADA / ENTREGUE
+                                  </span>
+                                ) : isCarregado ? (
+                                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-blue-950/90 border border-blue-500/60 text-blue-300 rounded font-bold text-[10px] badge-3d">
+                                    <CheckCircle2 className="w-3 h-3 text-blue-400" />
+                                    CARREGADO
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 px-2 py-1 bg-amber-950/90 border border-amber-500/60 text-amber-300 rounded font-bold text-[10px] badge-3d">
+                                    <Clock className="w-3 h-3 text-amber-400 animate-pulse" />
+                                    PENDENTE ENVIOS
+                                  </span>
+                                )}
+                                {isDelayedCarregado && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-rose-950 border border-rose-500 text-rose-300 rounded font-black text-[9.5px] badge-3d animate-pulse block">
+                                    <AlertTriangle className="w-3 h-3 text-rose-400" />
+                                    &gt;7 DIAS SEM BAIXA ({ageInDays}d)
+                                  </span>
+                                )}
+                                <span className="block text-[9.5px] text-slate-400">Setor: {item.solicitante}</span>
+                              </div>
+                            </td>
+                            {/* INDIVIDUAL PLATE INPUT FIELD */}
+                            <td className="p-3 font-mono align-middle">
+                              <div className="space-y-1">
+                                <input
+                                  type="text"
+                                  placeholder="EX: KLR-8920"
+                                  value={currentPlate}
+                                  onChange={(e) => {
+                                    const val = e.target.value.toUpperCase();
+                                    setEspelhoPlates(prev => ({ ...prev, [itemKey]: val }));
+                                    const targetReq = requests.find(r => r.id === item.requestId);
+                                    if (targetReq) {
+                                      const updatedItemPlates = { ...(targetReq as any).itemPlates, [item.productCode]: val };
+                                      savePendingRequest({
+                                        ...targetReq,
+                                        placaVeiculo: val,
+                                        itemPlates: updatedItemPlates
+                                      });
+                                    }
+                                  }}
+                                  className={`w-36 bg-slate-950 border text-xs px-2.5 py-1.5 rounded-lg font-mono uppercase focus:outline-none transition-all input-3d ${
+                                    !currentPlate.trim()
+                                      ? "border-rose-500/80 text-rose-300 placeholder-rose-700/60 bg-rose-950/20"
+                                      : "border-emerald-500/80 text-emerald-300 font-extrabold bg-emerald-950/20"
+                                  }`}
+                                />
+                              </div>
+                            </td>
+                            <td className="p-3 font-mono text-[10.5px] align-middle">
+                              <p className="text-slate-300">NF: {item.nf || "N/A"}</p>
+                              <p className="text-slate-500 text-[9px]">MAPA: {item.mapa || "N/A"}</p>
+                            </td>
+                            <td className="p-3 text-center align-middle">
+                              <button
+                                onClick={() => handleDeleteApprovedItem(item.requestId, item.productCode)}
+                                className="px-2 py-1 bg-red-950/80 hover:bg-red-900 border border-red-800/60 rounded text-red-300 text-[10px] font-bold font-mono transition-colors cursor-pointer flex items-center justify-center gap-1 mx-auto btn-3d"
+                                title="Excluir item do Espelho do Dia e do sistema"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                                <span>Excluir</span>
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        ) : filteredRequests.length === 0 ? (
+          <div className="p-16 text-center bg-slate-900 rounded-2xl border border-slate-850 space-y-2 text-slate-550 max-w-lg mx-auto no-print">
+            <AlertCircle className="w-8 h-8 mx-auto text-slate-650" />
+            <p className="font-mono text-xs">Nenhum registro encontrado nesta exibição.</p>
+            <p className="text-[10px] text-slate-655">Limpe os filtros de pesquisa ou mude de guia para atualizar.</p>
+          </div>
+        ) : (
+          <div className="space-y-4 no-print">
+            {/* Top Sleek Pagination & Performance Bar */}
+            {totalFilteredCount > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-950/80 rounded-xl border border-slate-800/80 text-xs font-mono">
+                <div className="flex items-center gap-2 text-slate-400">
+                  <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  <span>
+                    Exibindo <strong className="text-white">{pageSize > 0 ? `${(safeCurrentPage - 1) * pageSize + 1}–${Math.min(totalFilteredCount, safeCurrentPage * pageSize)}` : `1–${totalFilteredCount}`}</strong> de <strong className="text-white">{totalFilteredCount}</strong> ocorrências
+                  </span>
+                  {pageSize > 0 && totalPages > 1 && (
+                    <span className="text-[10px] text-indigo-400 font-bold bg-indigo-950/60 px-2 py-0.5 rounded border border-indigo-900/40">
+                      Pág. {safeCurrentPage} de {totalPages}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  {/* Page Size Selector */}
+                  <div className="flex items-center gap-1 bg-slate-900 px-2 py-1 rounded-lg border border-slate-800">
+                    <span className="text-[10px] text-slate-400 uppercase">Exibir:</span>
+                    {[30, 60, 100, 0].map((sz) => (
+                      <button
+                        key={sz}
+                        type="button"
+                        onClick={() => {
+                          setPageSize(sz);
+                          setCurrentPage(1);
+                        }}
+                        className={`px-1.5 py-0.5 text-[10.5px] rounded font-bold cursor-pointer transition-all ${
+                          pageSize === sz
+                            ? "bg-indigo-600 text-white shadow-xs"
+                            : "text-slate-400 hover:text-white hover:bg-slate-800"
+                        }`}
+                      >
+                        {sz === 0 ? "Todos" : sz}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Pagination Navigation */}
+                  {pageSize > 0 && totalPages > 1 && (
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={safeCurrentPage <= 1}
+                        onClick={() => setCurrentPage(1)}
+                        className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-[11px] font-bold border border-slate-800 transition-all cursor-pointer"
+                        title="Primeira Página"
+                      >
+                        «
+                      </button>
+                      <button
+                        type="button"
+                        disabled={safeCurrentPage <= 1}
+                        onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                        className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-[11px] font-bold border border-slate-800 transition-all cursor-pointer"
+                        title="Página Anterior"
+                      >
+                        ‹
+                      </button>
+                      <span className="px-2 text-slate-300 font-bold text-xs">
+                        {safeCurrentPage} / {totalPages}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={safeCurrentPage >= totalPages}
+                        onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                        className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-[11px] font-bold border border-slate-800 transition-all cursor-pointer"
+                        title="Próxima Página"
+                      >
+                        ›
+                      </button>
+                      <button
+                        type="button"
+                        disabled={safeCurrentPage >= totalPages}
+                        onClick={() => setCurrentPage(totalPages)}
+                        className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-[11px] font-bold border border-slate-800 transition-all cursor-pointer"
+                        title="Última Página"
+                      >
+                        »
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {displayedRequests.map((req, idx) => {
+                const repInfo = repsList[req.setor.trim()];
+                const rotInfo = motoristasList[req.setor.trim()];
+                const isShortage = isFaltaOrInversao(req);
+                const cast = req as any;
+                const clientDetails = getResolvedClientDetails(req.nb);
+                const matchedPromax = getMatchedPromax(req);
+                const promaxUser = req.usuarioAcao || matchedPromax?.usuarioAcao;
+                const dupInfo = duplicateAnalysis.duplicateMap.get(req.id);
+              
+              const isBaixadoCard = !!cast.faltaBaixa || !!(req as any).faltaBaixa || req.status === "baixado" || req.statusPromax === "cadastrado";
+              const hasReceiptFile = !!(cast.faltaBaixaReciboUrl || (req as any).faltaBaixaReciboUrl || (req as any).pdfFilePath || (req as any).receiptFile || (req as any).faltaBaixaReciboName);
+              const isEnviadaRotaCard = !isBaixadoCard && (
+                !!(req.placa || (req as any).placaVeiculo || cast.faltaMotorista || (req as any).motorista || req.statusEnvio === "carregados" || req.statusEnvio === "em_rota" || (req as any).enviadoRota || (req as any).emRota)
+              );
+              const isAguardandoCarregamentoCard = !isBaixadoCard && !isEnviadaRotaCard;
+
+              const isReprovadoCard = req.statusPromax === "reprovado" || req.status === "reprovado";
+              
+              // Determine if overdue (>2 days without settlement)
+              const reqAgeMs = req.timestamp ? (Date.now() - req.timestamp) : 0;
+              const isAtrasadoCard = !isBaixadoCard && (reqAgeMs > 172800000 || isReprovadoCard || !!dupInfo);
+
+              return (
+                <div 
+                  key={`${req.id || 'req'}_${idx}`} 
+                  className={`bg-slate-900 border rounded-2xl p-4 flex flex-col justify-between space-y-4 shadow-xl transition-all ${
+                    isBaixadoCard
+                      ? "border-emerald-500/70 bg-emerald-950/20 shadow-emerald-950/20" 
+                      : isAtrasadoCard
+                        ? "border-rose-500/80 bg-rose-950/20 shadow-rose-950/20"
+                        : "border-amber-500/80 bg-amber-950/20 shadow-amber-950/20 hover:border-amber-400"
+                  }`}
+                >
+                  <div className="space-y-3">
+                    {/* DUPLICATE WARNING BADGE ON CARD */}
+                    {dupInfo && (
+                      <div className="p-2.5 bg-rose-955/90 border border-rose-500/80 rounded-xl flex items-center justify-between gap-2 text-rose-200 text-xs font-mono shadow-md animate-fadeIn">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <Copy className="w-4 h-4 text-rose-400 shrink-0 animate-pulse" />
+                          <span className="font-bold text-[10.5px] leading-tight truncate">
+                            ⚠️ DUPLICATA DETECTADA ({dupInfo.totalInGroup} reg. idênticos)
+                            {dupInfo.isExcess && (
+                              <span className="ml-1 text-amber-300 font-extrabold text-[9px] uppercase border border-amber-500/50 bg-amber-950/80 px-1.5 py-0.5 rounded">
+                                Cópia Excedente
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handlePermanentDelete(req.id)}
+                          className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-extrabold font-mono rounded-lg flex items-center gap-1 shrink-0 transition-colors shadow cursor-pointer border border-rose-400"
+                          title="Excluir este cadastro duplicado do histórico"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>Excluir</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Header bar of card */}
+                    <div className="flex justify-between items-center gap-2">
+                      <div className="flex items-center space-x-2 min-w-0">
+                        <div className="w-7 h-7 bg-blue-950 text-blue-400 border border-blue-900/50 rounded-lg flex items-center justify-center font-bold text-[10px] font-mono shrink-0">
+                          {req.setor}
+                        </div>
+                        <div className="text-left min-w-0">
+                          <h4 className="font-bold text-xs text-slate-200 truncate">
+                            {rotInfo ? `Rota ${req.setor}` : `Setor ${req.setor}`}
+                          </h4>
+                          <span 
+                            className="text-[10px] font-mono text-indigo-300 font-semibold flex items-center gap-1 leading-tight truncate mt-0.5" 
+                            title={`Cadastrado por: ${getDisplayCadastroUser(req, repsList, motoristasList)}`}
+                          >
+                            <User className="w-3 h-3 text-indigo-400 shrink-0" />
+                            <span className="truncate">{getDisplayCadastroUser(req, repsList, motoristasList)}</span>
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => setInspectRequest(req)}
+                          className="p-1.5 bg-slate-900 hover:bg-blue-950 border border-slate-750 hover:border-blue-500 rounded-lg text-blue-400 hover:text-blue-300 transition-all shadow cursor-pointer flex items-center justify-center shrink-0"
+                          title="Analisar card, observações e anexos em detalhes"
+                        >
+                          <Eye className="w-4 h-4 text-blue-400" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handlePermanentDelete(req.id)}
+                          className="p-1.5 bg-slate-900 hover:bg-rose-950 border border-slate-750 hover:border-rose-500 rounded-lg text-rose-400 hover:text-rose-300 transition-all shadow cursor-pointer flex items-center justify-center shrink-0"
+                          title="Excluir este card do histórico"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* DEDICATED HORIZONTAL STATUS CONTAINER - strictly constrained inside card bounds */}
+                    <div className="w-full bg-slate-950/80 p-2 rounded-xl border border-slate-800/80 flex flex-wrap items-center gap-1.5 overflow-hidden">
+                      {/* Status Badge */}
+                      {isBaixadoCard ? (
+                        <span className="px-2 py-0.5 bg-emerald-950/90 border border-emerald-500/60 rounded-lg text-[8.5px] font-bold font-mono text-emerald-300 flex items-center gap-1 uppercase shrink-0 shadow-sm" title={hasReceiptFile ? "Baixada com recibo assinado/PDF anexado" : "Baixada no sistema (Aguardando anexo do recibo assinado)"}>
+                          <CheckCircle2 className="w-2.5 h-2.5 text-emerald-400 shrink-0" />
+                          <span className="truncate">{hasReceiptFile ? "🟢 Baixada (Recibo PDF)" : "🟢 Baixada (Sem PDF)"}</span>
+                        </span>
+                      ) : isEnviadaRotaCard ? (
+                        <span className="px-2 py-0.5 bg-blue-950/90 border border-blue-500/60 rounded-lg text-[8.5px] font-bold font-mono text-blue-300 flex items-center gap-1 uppercase shrink-0 shadow-sm" title="Carga em veículo e enviada para rota">
+                          <Truck className="w-2.5 h-2.5 text-blue-400 shrink-0" />
+                          <span className="truncate">🚚 Enviada p/ Rota</span>
+                        </span>
+                      ) : isAtrasadoCard ? (
+                        <span className="px-2 py-0.5 bg-rose-950/90 border border-rose-500/60 rounded-lg text-[8.5px] font-bold font-mono text-rose-300 flex items-center gap-1 uppercase shrink-0 shadow-sm">
+                          <AlertCircle className="w-2.5 h-2.5 text-rose-400 animate-pulse shrink-0" />
+                          <span className="truncate">🔴 Atrasado</span>
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 bg-amber-950/90 border border-amber-500/60 rounded-lg text-[8.5px] font-bold font-mono text-amber-300 flex items-center gap-1 uppercase shrink-0 shadow-sm" title="Aguardando montagem de carga / expedição">
+                          <Clock className="w-2.5 h-2.5 text-amber-400 animate-pulse shrink-0" />
+                          <span className="truncate">⏳ Aguardando Carga</span>
+                        </span>
+                      )}
+
+                      {/* Tipo Erro Badge */}
+                      {cast.faltaTipoErro === "carregamento" ? (
+                        <span className="text-[8px] uppercase font-bold font-mono text-blue-300 bg-blue-950/60 px-2 py-0.5 rounded-lg border border-blue-900/40 shrink-0" title="Classificação: Erro de Carregamento / Estoque">
+                          📦 Carregamento
+                        </span>
+                      ) : cast.faltaTipoErro === "entrega" ? (
+                        <span className="text-[8px] uppercase font-bold font-mono text-amber-300 bg-amber-955/50 px-2 py-0.5 rounded-lg border border-amber-900/40 shrink-0" title="Classificação: Erro de Entrega / Descarregamento">
+                          🚚 Falta Entrega
+                        </span>
+                      ) : cast.faltaTipoErro === "nao_identificado" ? (
+                        <span className="text-[8px] uppercase font-bold font-mono text-purple-300 bg-purple-950/60 px-2 py-0.5 rounded-lg border border-purple-900/40 shrink-0" title="Classificação: Não Identificado (Sem Culpa Definida)">
+                          ❓ Não Identificado
+                        </span>
+                      ) : null}
+
+                      {/* Rateio Active Badge */}
+                      {cast.faltaCrewList && Array.isArray(cast.faltaCrewList) && cast.faltaCrewList.length > 0 && (
+                        <span className="text-[8px] uppercase font-bold font-mono text-amber-300 bg-amber-955/60 px-2 py-0.5 rounded-lg border border-amber-700/50 shrink-0 flex items-center gap-1" title="Equipe e Rateio definidos no novo modelo">
+                          <Users className="w-2.5 h-2.5 text-amber-400" />
+                          <span>Rateio ({cast.faltaCrewList.length} colab.)</span>
+                        </span>
+                      )}
+
+                      {/* Tipo Processo Badge */}
+                      {isReposicaoReq(req) ? (
+                        <span className="text-[8px] uppercase font-bold font-mono text-indigo-300 bg-indigo-950/60 px-2 py-0.5 rounded-lg border border-indigo-800/40 shrink-0" title="Reposição por Falta de Produto">
+                          📦 Reposição
+                        </span>
+                      ) : (
+                        <span className="text-[8px] uppercase font-bold font-mono text-emerald-300 bg-emerald-950/60 px-2 py-0.5 rounded-lg border border-emerald-800/40 shrink-0" title="Troca (Avaria/Inversão/Outros Motivos)">
+                          🔁 Troca
+                        </span>
+                      )}
+
+                      {/* Contingência Badge */}
+                      {!isFaltaSkuCompletoReq(req) && (
+                        <span className="text-[8px] uppercase font-bold font-mono text-amber-300 bg-amber-955/50 px-2 py-0.5 rounded-lg border border-amber-800/40 shrink-0" title="Elegível para Recibo PDV de Contingência">
+                          ⚠️ Contingência
+                        </span>
+                      )}
+
+                      {/* Vale Status Badge (Identificado por Mapa e SKU) */}
+                      {isRequestWithVale(req, valesHistorico) ? (
+                        <span className="text-[8px] uppercase font-bold font-mono text-purple-300 bg-purple-955/60 px-2 py-0.5 rounded-lg border border-purple-800/40 shrink-0 flex items-center gap-1" title="Esta ocorrência gerou um Vale / Rateio de Prejuízo (identificado pelo Mapa e SKU cadastrado)">
+                          <span>🎫 Vale Gerado</span>
+                        </span>
+                      ) : (
+                        <span className="text-[8px] uppercase font-bold font-mono text-slate-400 bg-slate-900/60 px-2 py-0.5 rounded-lg border border-slate-800 shrink-0" title="Sem vale emitido">
+                          <span>🛡️ Sem Vale</span>
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Client Info Block on card */}
+                    <div className="bg-slate-950/40 p-2.5 rounded-xl border border-slate-850/60 text-left">
+                      <p className="text-[9px] uppercase font-bold text-slate-500 tracking-wider font-mono">Cliente / Ponto de Venda (PDV):</p>
+                      <h4 className="font-extrabold text-slate-200 text-xs uppercase leading-tight mt-1" title={clientDetails.razaoSocial}>
+                        {clientDetails.razaoSocial}
+                      </h4>
+                      {clientDetails.nomeFantasia && clientDetails.nomeFantasia !== clientDetails.razaoSocial && (
+                        <p className="text-[10px] font-extrabold text-blue-400 uppercase font-mono mt-0.5 tracking-wide truncate" title={clientDetails.nomeFantasia}>
+                          🏷️ N. FANTASIA: {clientDetails.nomeFantasia}
+                        </p>
+                      )}
+                      <p className="text-[10px] text-emerald-450 font-bold uppercase mt-1">
+                        📍 {clientDetails.municipio} - {clientDetails.uf}
+                      </p>
+                    </div>
+
+                    {/* Promax Contingency Banner (Requirement 3) */}
+                    {isContingenciaAlertReq(req) && (
+                      <div className="p-2.5 bg-amber-950/80 border border-amber-500/60 rounded-xl flex flex-col gap-2 text-amber-200 text-xs font-bold font-sans text-left">
+                        <div className="flex items-center gap-2">
+                          <span className="p-1 bg-amber-500/20 border border-amber-500/40 rounded text-amber-400 shrink-0">🚨</span>
+                          <span className="text-[11px] leading-snug">REGISTRO EM CONTINGÊNCIA PROMAX (Lançar no Próximo Mês)</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleBaixaContingencia(req.id)}
+                          className="w-full py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold rounded-lg text-[10.5px] uppercase tracking-wider transition-transform hover:scale-[1.02] shadow cursor-pointer flex items-center justify-center gap-1.5"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>Dar Baixa em Contingência</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {req.contingenciaBaixada && (
+                      <div className="p-2.5 bg-emerald-950/80 border border-emerald-800/60 rounded-xl flex items-center justify-between gap-2 text-emerald-200 text-xs font-sans text-left shadow">
+                        <div className="flex items-center gap-2 text-[10.5px] font-bold text-emerald-300">
+                          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                          <span>Contingência baixada em {req.contingenciaBaixadaDate} {req.contingenciaBaixadaUser ? `por ${req.contingenciaBaixadaUser}` : ""}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleDesfazerBaixaContingencia(req.id)}
+                          className="px-2.5 py-1 bg-rose-950 hover:bg-rose-900 border border-rose-800/60 text-rose-300 hover:text-white rounded-lg text-[9.5px] font-bold transition-all cursor-pointer flex items-center gap-1 shrink-0"
+                          title="Desfazer a baixa e reverter o registro para o alerta de contingência"
+                        >
+                          <RotateCcw className="w-3 h-3 text-rose-400" />
+                          <span>Desfazer Baixa</span>
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Metadata summary (NF, MAPA, NB) */}
+                    <div className="p-3 bg-slate-950 rounded-xl space-y-1.5 border border-slate-850 text-xs font-mono text-left">
+                      {req.dataEntrega && (
+                        <div className="flex justify-between text-amber-400 font-bold border-b border-slate-900 pb-1 mb-1">
+                          <span className="flex items-center gap-1 text-[10.5px]">
+                            <Calendar className="w-3 h-3 text-amber-400" />
+                            <span>Previsão de Entrega:</span>
+                          </span>
+                          <span className="text-amber-300">{req.dataEntrega}</span>
+                        </div>
+                      )}
+                      <div className="flex justify-between text-slate-400">
+                        <span>NF-e original:</span>
+                        <strong className="text-white text-right select-all">{req.nf}</strong>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Código NB PDV:</span>
+                        <span className="text-white text-right select-all">{req.nb}</span>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Mapa de Carga:</span>
+                        <span className="text-slate-200 text-right select-all">{req.mapa || "FALTA MAPA"}</span>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Motivo do Registro:</span>
+                        <span className="text-indigo-400 font-bold text-right uppercase text-[10px]">{req.motivo || "Falta / Inversão"}</span>
+                      </div>
+
+                      {req.items && req.items.length > 0 ? (
+                        <div className="pt-2 border-t border-slate-900 mt-2 space-y-2 text-left">
+                          <span className="text-[8px] text-blue-400 block font-bold uppercase tracking-wider">SKUs DA SOLICITAÇÃO ({req.items.length})</span>
+                          <div className="space-y-2 divide-y divide-slate-900 max-h-[140px] overflow-y-auto pr-1 scrollbar-thin">
+                            {req.items.map((sub, sIdx) => {
+                              const isSwapItem = !!sub.produtoAhEnviar || !!sub.produtoARecolher;
+                              const isItemShort = (sub.motivo || "").toLowerCase().includes("falta");
+                              
+                              return (
+                                <div key={sub.id || sIdx} className="pt-1.5 first:pt-0 text-[10px] space-y-0.5 font-mono">
+                                  <div className="flex justify-between items-start gap-1">
+                                    <span className="text-slate-200 font-bold max-w-[170px] break-words whitespace-normal leading-tight">
+                                      #{sub.item} - <span className="font-sans font-medium text-slate-400">{sub.descricao || "Item SSTR"}</span>
+                                    </span>
+                                    <strong className="text-emerald-400 whitespace-nowrap">
+                                      {sub.quantidade} {getUnitLabel(sub, req)}
+                                    </strong>
+                                  </div>
+                                  <div className="flex justify-between text-[8.5px] text-slate-500">
+                                    <span>
+                                      Hl: <strong className="text-amber-500 font-semibold">{(calculateItemHL(sub) || sub.hectolitros || 0).toFixed(4)}</strong>
+                                      {sub.precoCalculated !== undefined && (
+                                        <span className="ml-1.5 border-l border-slate-850 pl-1.5">
+                                          Val: <strong className="text-emerald-400 font-bold">R$ {calculateItemValue(sub).toFixed(2)}</strong>
+                                        </span>
+                                      )}
+                                    </span>
+                                    <span>Motivo: <strong className={isItemShort ? "text-red-400" : isSwapItem ? "text-indigo-400" : "text-blue-400"}>{sub.motivo}</strong></span>
+                                  </div>
+                                  
+                                  {isSwapItem && (() => {
+                                    const pEnviar = parseInversionProduct(sub.produtoAhEnviar, sub.quantidade);
+                                    const pRecolher = parseInversionProduct(sub.produtoARecolher, sub.quantidade);
+                                    return (
+                                      <div className="mt-1.5 p-1.5 bg-slate-900 rounded-[6px] text-[8.5px] font-sans text-amber-500 leading-normal border border-slate-850 space-y-1">
+                                        <div className="font-bold text-amber-400 uppercase tracking-wide text-[8px]">🔄 COMPROVAÇÃO DE INVERSÃO LOGÍSTICA:</div>
+                                        <div className="pl-1 text-[8px] text-slate-300 space-y-0.5">
+                                          <div>➡️ <strong className="text-emerald-400">ENTREGAR:</strong> <span className="font-mono text-slate-100 font-bold">{pEnviar.fullText}</span></div>
+                                          <div>⬅️ <strong className="text-rose-400">RECOLHER:</strong> <span className="font-mono text-slate-300">{pRecolher.fullText}</span></div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })()}
+                                </div>
+                              );
+                            })}
+                          </div>
+                          
+                          <div className="pt-1.5 border-t border-slate-950 flex flex-col gap-1 font-bold text-[9.5px]">
+                            <div className="flex justify-between">
+                              <span className="text-slate-450 uppercase">Total Geral (Volume):</span>
+                              <span className="text-amber-500">{getRequestHL(req).toFixed(4)} HL</span>
+                            </div>
+                            <div className="flex justify-between text-xs text-emerald-400">
+                              <span className="uppercase text-[9.5px]">Total Geral (Financ.):</span>
+                              <span>{formatCurrency(getRequestValue(req, promaxRecords))}</span>
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          {req.item && (
+                            <div className="flex justify-between text-slate-400">
+                              <span>SKU do Item:</span>
+                              <span className="text-amber-400 font-bold text-right truncate max-w-[150px]">{req.item}</span>
+                            </div>
+                          )}
+                          {req.quantidade !== undefined && (
+                            <div className="flex justify-between text-slate-400">
+                              <span>Quantidade:</span>
+                              <span className="text-white font-bold text-right">
+                                {req.quantidade} {getUnitLabel({ unidadeMedida: req.unidadeMedida, motivo: req.motivo }, req)}
+                              </span>
+                            </div>
+                          )}
+                          <div className="pt-1.5 border-t border-slate-950 flex flex-col gap-1 font-bold text-[9.5px] mt-1.5">
+                            <div className="flex justify-between">
+                              <span className="text-slate-450 uppercase">Total Geral (Volume):</span>
+                              <span className="text-amber-500">{getRequestHL(req).toFixed(4)} HL</span>
+                            </div>
+                            <div className="flex justify-between text-xs text-emerald-400">
+                              <span className="uppercase text-[9.5px]">Total Geral (Financ.):</span>
+                              <span>{formatCurrency(getRequestValue(req, promaxRecords))}</span>
+                            </div>
+                          </div>
+                        </>
+                      )}
+
+                      <div className="flex justify-between text-slate-400 pt-1.5 border-t border-slate-950 mt-1">
+                        <span>Data da anomalia:</span>
+                        <span className="text-slate-450 text-right">{cast.mapaDataAnomalia || req.data}</span>
+                      </div>
+
+                      {/* Display active assigned crew & rateio */}
+                      {(cast.faltaCrewList?.length > 0 || cast.faltaMotorista || cast.motorista || cast.faltaAjudantes || cast.ajudantes) && (
+                        <div className="pt-2 mt-2 border-t border-slate-900 space-y-1.5 text-[10.5px] font-sans leading-relaxed text-slate-400">
+                          {cast.faltaCrewList && Array.isArray(cast.faltaCrewList) && cast.faltaCrewList.length > 0 ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between text-[9.5px] font-mono text-amber-400 font-bold uppercase">
+                                <span className="flex items-center gap-1">
+                                  <Users className="w-3 h-3 text-amber-400" />
+                                  <span>Equipe & Rateio ({cast.faltaCrewList.length} colab.):</span>
+                                </span>
+                                {(() => {
+                                  const reqTotalVal = getRequestValue(req, promaxRecords);
+                                  const rateio = calculateValeRateio(reqTotalVal, null, null, null, null, null, null, null, cast.faltaCrewList);
+                                  return (
+                                    <span className="text-slate-300 font-bold">
+                                      {rateio.isDriverX ? "⭐ Regra Motorista X" : `${formatCurrency(rateio.individualValue)}/cada`}
+                                    </span>
+                                  );
+                                })()}
+                              </div>
+                              <div className="flex flex-wrap gap-1">
+                                {(() => {
+                                  const reqTotalVal = getRequestValue(req, promaxRecords);
+                                  const rateio = calculateValeRateio(reqTotalVal, null, null, null, null, null, null, null, cast.faltaCrewList);
+                                  return rateio.crew.map((m, mIdx) => (
+                                    <span 
+                                      key={`card_crew_${req.id}_${mIdx}`}
+                                      className={`px-1.5 py-0.5 rounded text-[8.5px] font-mono border ${
+                                        m.isExempt 
+                                          ? "bg-purple-950/60 border-purple-800 text-purple-300 italic" 
+                                          : "bg-slate-900 border-slate-800 text-slate-200"
+                                      }`}
+                                      title={`${m.role}: ${m.name} (${m.cpf || "Sem CPF"}) - ${m.isExempt ? "Isento" : formatCurrency(m.value)}`}
+                                    >
+                                      <strong>{m.role}:</strong> {m.name || "N/D"} {m.isExempt ? "⭐ Isento" : `(${formatCurrency(m.value)})`}
+                                    </span>
+                                  ));
+                                })()}
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              {(cast.faltaMotorista || cast.motorista) && (
+                                <p>🚚 <strong>Motorista:</strong> <span className="font-mono text-xs uppercase text-slate-300 font-bold">{cast.faltaMotorista || cast.motorista}</span></p>
+                              )}
+                              {(cast.faltaAjudantes || cast.ajudantes) && (
+                                <p>👥 <strong>Equipe / Ajudantes:</strong> <span className="text-slate-300 uppercase italic font-medium">{cast.faltaAjudantes || cast.ajudantes}</span></p>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Photo Evidence Box for Control/Management */}
+                    {req.fotoUrl && !req.fotoUrl.toLowerCase().endsWith(".pdf") && (req.fotoUrl.startsWith("data:image") || req.fotoUrl.startsWith("http") || req.fotoUrl.startsWith("blob:") || req.fotoUrl.startsWith("/")) ? (
+                      <div className="relative group bg-slate-950 p-2.5 rounded-xl border border-slate-850 flex items-center justify-between gap-3 text-left font-mono">
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          <img 
+                            src={req.fotoUrl} 
+                            alt="Evidência anexada" 
+                            className="w-11 h-11 object-cover rounded-lg border border-slate-800 shrink-0 cursor-pointer hover:opacity-90 transition-opacity"
+                            onClick={() => setZoomPhoto(req.fotoUrl)}
+                            referrerPolicy="no-referrer"
+                          />
+                          <div className="text-[10px] leading-relaxed min-w-0 flex-1">
+                            <span className="text-amber-400 font-extrabold uppercase tracking-wider block text-[8.5px] font-sans">
+                              📷 Evidência Anexada:
+                            </span>
+                            <span className="text-slate-300 italic block truncate max-w-[180px] font-medium text-[9.5px]">
+                              "{req.observacao || "Foto enviada pelo solicitante"}"
+                            </span>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <label className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg text-slate-300 hover:text-white cursor-pointer transition-colors flex items-center gap-1 text-[9px] font-bold" title="Alterar/Trocar foto do card">
+                            <Upload className="w-3.5 h-3.5 text-indigo-400" />
+                            <span>Trocar</span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              className="hidden"
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                if (file) {
+                                  const reader = new FileReader();
+                                  reader.onload = (evt) => {
+                                    if (evt.target?.result) {
+                                      savePendingRequest({ ...req, fotoUrl: evt.target.result as string });
+                                    }
+                                  };
+                                  reader.readAsDataURL(file);
+                                }
+                              }}
+                            />
+                          </label>
+                          <button 
+                            type="button"
+                            onClick={() => setZoomPhoto(req.fotoUrl)}
+                            className="p-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-lg text-blue-400 hover:text-white cursor-pointer transition-colors flex items-center gap-1 text-[9px] font-bold"
+                            title="Visualizar foto em tela cheia"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>Ampliar</span>
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="bg-slate-950 p-2 rounded-xl border border-slate-850/80 flex items-center justify-between gap-2 text-left font-sans text-[10px]">
+                        <div className="flex items-center gap-1.5 text-slate-400 min-w-0">
+                          <Camera className="w-3.5 h-3.5 text-amber-500/80 shrink-0" />
+                          <span className="truncate text-[9.5px]">Sem foto anexada</span>
+                        </div>
+                        <label className="px-2 py-1 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-800/60 rounded-md text-indigo-300 hover:text-white cursor-pointer transition-colors flex items-center gap-1 text-[9px] font-bold shrink-0">
+                          <Upload className="w-3 h-3 text-indigo-400" />
+                          <span>Anexar Foto</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file) {
+                                const reader = new FileReader();
+                                reader.onload = (evt) => {
+                                  if (evt.target?.result) {
+                                    savePendingRequest({ ...req, fotoUrl: evt.target.result as string });
+                                  }
+                                };
+                                reader.readAsDataURL(file);
+                              }
+                            }}
+                          />
+                        </label>
+                      </div>
+                    )}
+
+                    {/* Shared Network Folder & Official PDF Info Box */}
+                    <div className="bg-slate-950 p-2.5 rounded-xl border border-slate-850 space-y-2 text-left font-mono">
+                      <div className="flex items-center justify-between text-slate-400 border-b border-slate-900 pb-1.5">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span className="font-bold text-slate-200 text-[10px] truncate">
+                            {req.pdfFilename || generatePdfFilename(req.mapa, req.nb, req.nf, req.data)}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => exportRegistrationPdf(req, { autoDownload: true })}
+                          className="text-[9px] text-blue-400 hover:text-blue-300 font-bold underline cursor-pointer shrink-0 ml-1"
+                          title="Baixar cópia do PDF com informações e foto anexada"
+                        >
+                          Re-gerar/Baixar PDF
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between text-[9px] text-slate-400 pt-0.5">
+                        <span className="truncate max-w-[200px] font-medium text-slate-300" title={NETWORK_REGISTROS_PATH}>
+                          📂 {NETWORK_REGISTROS_PATH}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            navigator.clipboard.writeText(NETWORK_REGISTROS_PATH);
+                            alert("✅ Caminho da pasta de registros copiado:\n" + NETWORK_REGISTROS_PATH);
+                          }}
+                          className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded text-emerald-400 hover:text-white cursor-pointer transition-colors flex items-center gap-1 shrink-0 text-[9px] font-bold"
+                          title="Copiar caminho da pasta para colar no Explorador de Arquivos"
+                        >
+                          <Copy className="w-3 h-3" />
+                          <span>Copiar Pasta</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Low checkmared details info */}
+                    {(activeTab === "faltas_inversoes" || activeTab === "historico_baixas") && cast.faltaBaixa && (
+                      <div className="p-3 bg-emerald-950/30 border border-emerald-900/40 rounded-xl text-xs text-left space-y-2 mt-2">
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono font-bold block uppercase text-[8.5px] text-emerald-500">🟢 Log de Baixa Registrada</span>
+                          <span className="text-[10px] font-mono text-slate-400">{cast.faltaBaixaDate}</span>
+                        </div>
+                        <p className="text-[11px] font-medium text-slate-200">
+                          Confirmado envio e entrega do produto por <strong className="text-emerald-400">{cast.faltaBaixaUser}</strong>.
+                        </p>
+                        
+                         {/* Observations block */}
+                         {(cast.faltaBaixaObs || req.observacao) && (
+                           <div className="p-2.5 bg-slate-950 border border-slate-900 rounded-xl text-[11px] text-slate-300 font-sans space-y-0.5">
+                             <span className="text-[9px] uppercase font-mono font-bold text-emerald-400 block">📝 Observações Importadas na Baixa:</span>
+                             <p className="italic leading-relaxed">"{cast.faltaBaixaObs || req.observacao}"</p>
+                           </div>
+                         )}
+
+                         {/* Receipt Image Thumbnail & Fullscreen Zoom Preview */}
+                         {cast.faltaBaixaReciboUrl && (
+                           <div className="pt-2 border-t border-emerald-900/30 space-y-2">
+                             {typeof cast.faltaBaixaReciboUrl === "string" && !cast.faltaBaixaReciboUrl.endsWith(".pdf") && cast.faltaBaixaReciboUrl !== "pdf_placeholder" && (
+                               <div className="relative group rounded-xl overflow-hidden border border-emerald-700/50 bg-slate-950 p-1 flex items-center gap-2">
+                                 <img 
+                                   src={cast.faltaBaixaReciboUrl} 
+                                   alt="Foto do Recibo Assinado" 
+                                   className="w-16 h-16 object-cover rounded-lg cursor-pointer hover:opacity-85 transition-opacity shrink-0"
+                                   onClick={() => setZoomPhoto(cast.faltaBaixaReciboUrl)}
+                                   referrerPolicy="no-referrer"
+                                 />
+                                 <div className="min-w-0 flex-1 text-left font-mono">
+                                   <span className="text-[10px] font-bold text-emerald-400 block truncate">📷 Imagem do Recibo Assinado</span>
+                                   <span className="text-[9px] text-slate-400 block truncate">{cast.faltaBaixaReciboName || "recibo_assinado.jpg"}</span>
+                                   <button
+                                     type="button"
+                                     onClick={() => setZoomPhoto(cast.faltaBaixaReciboUrl)}
+                                     className="mt-1 px-2 py-0.5 bg-emerald-900 hover:bg-emerald-800 text-emerald-200 text-[9px] font-bold rounded cursor-pointer transition-colors flex items-center gap-1"
+                                   >
+                                     <Eye className="w-3 h-3 text-emerald-300" />
+                                     <span>Analisar / Ampliar Imagem</span>
+                                   </button>
+                                 </div>
+                               </div>
+                             )}
+
+                             <div className="flex items-center justify-between pt-1">
+                               <span className="text-[10px] text-slate-400 font-mono truncate max-w-[140px] flex items-center gap-1" title={cast.faltaBaixaReciboName}>
+                                 📎 <span className="hover:underline">{cast.faltaBaixaReciboName || "Recibo_Assinado"}</span>
+                               </span>
+                               {cast.faltaBaixaReciboUrl === "pdf_placeholder" || (cast.faltaBaixaReciboType && cast.faltaBaixaReciboType.includes("pdf")) ? (
+                                 <button
+                                   onClick={() => {
+                                     const link = document.createElement("a");
+                                     link.href = cast.faltaBaixaReciboUrl === "pdf_placeholder" ? "#" : cast.faltaBaixaReciboUrl;
+                                     link.download = cast.faltaBaixaReciboName || "recibo_assinado.pdf";
+                                     if (cast.faltaBaixaReciboUrl === "pdf_placeholder") {
+                                       alert(`Documento PDF "${cast.faltaBaixaReciboName || "recibo.pdf"}" registrado no sistema devidamente.`);
+                                     } else {
+                                       link.click();
+                                     }
+                                   }}
+                                   className="px-2.5 py-1 bg-emerald-900/60 hover:bg-emerald-850 border border-emerald-850 text-[10px] text-emerald-355 hover:text-white rounded-md cursor-pointer transition-colors"
+                                 >
+                                   Baixar/Abrir PDF
+                                 </button>
+                               ) : (
+                                 <button
+                                   onClick={() => setZoomPhoto(cast.faltaBaixaReciboUrl)}
+                                   className="px-2.5 py-1 bg-emerald-900/60 hover:bg-emerald-850 border border-emerald-850 text-[10px] text-emerald-355 hover:text-white rounded-md cursor-pointer transition-colors flex items-center gap-1 font-bold"
+                                 >
+                                   <Eye className="w-3 h-3 text-emerald-400" />
+                                   <span>Visualizar Foto</span>
+                                 </button>
+                               )}
+                             </div>
+                           </div>
+                         )}
+                      </div>
+                    )}
+                  </div>
+ 
+                   {/* Actions footer (Depends heavily on SSTR Faltas Ledger vs regular filters) */}
+                  <div className="pt-2 border-t border-slate-850/60 no-print">
+                    
+                    {(activeTab === "faltas_inversoes" || activeTab === "historico_baixas") ? (
+                      /* AUDIT LEDGER CARD ACTIONS */
+                      <div className="space-y-2">
+                        {/* Classify and Edit details */}
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleOpenEditFalta(req)}
+                            className="flex-1 py-1.5 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-800/60 text-indigo-300 rounded-lg text-[10px] font-sans font-bold cursor-pointer transition-colors flex items-center justify-center gap-1 uppercase"
+                            title="Classificar tipo de erro, motorista, equipe e rateio"
+                          >
+                            <Users className="w-3.5 h-3.5 text-amber-400" />
+                            <span>Classificar & Rateio</span>
+                          </button>
+ 
+                          {/* Low button */}
+                          {cast.faltaBaixa ? (
+                            <button
+                              onClick={() => handleReverterBaixaShortage(req.id)}
+                              className="px-2.5 py-1.5 bg-slate-950 hover:bg-slate-850 border border-slate-850 text-slate-450 hover:text-white rounded-lg text-[10px] font-sans font-bold cursor-pointer transition-colors"
+                              title="Reverter a baixa física para aberta"
+                            >
+                              Estornar Baixa
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => {
+                                setBaixandoFalta(req);
+                                setBaixaReciboFile(null);
+                                setBaixaObservacao("");
+                                setBaixaError("");
+                              }}
+                              className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-[11px] font-bold flex items-center justify-center gap-1 cursor-pointer transition-colors uppercase leading-none"
+                              title="Dar baixa - Anexar recibo assinado e liquidar"
+                            >
+                              Dar Baixa
+                            </button>
+                          )}
+                        </div>
+ 
+                        {/* Printable Receipts, Driver charging slips, and Return to Pending */}
+                        <div className="flex flex-wrap gap-2 pt-1 border-t border-slate-850/50">
+                          {/* Deliver Receipt */}
+                          {(() => {
+                            const canPrintRecibo = true;
+                            return (
+                              <button
+                                onClick={() => setSelectedPrintDoc({ type: "recibo", request: req })}
+                                className="flex-1 py-1.5 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1.5 transition-all bg-slate-950 hover:bg-slate-855 border border-slate-800 text-blue-400 cursor-pointer"
+                                title="Gerar recibo de entrega timbrado Ambev para o PDV assinar"
+                              >
+                                <Printer className="w-3.5 h-3.5 text-blue-550" />
+                                <span>Recibo PDV</span>
+                              </button>
+                            );
+                          })()}
+
+                          {/* Crew Charge slip */}
+                          {(() => {
+                            const isSwap = isSwapRequest(req) || isInversaoOrSwapReq(req);
+                            const canGenerateVale = !isSwap && cast.faltaTipoErro === "entrega";
+                            return (
+                              <button
+                                onClick={() => setSelectedPrintDoc({ type: "vale", request: req })}
+                                disabled={!canGenerateVale}
+                                className={`flex-1 py-1.5 rounded-lg text-[9px] font-bold flex items-center justify-center gap-1.5 transition-all ${
+                                  canGenerateVale
+                                    ? "bg-slate-950 hover:bg-slate-850 border border-slate-800 text-amber-500 cursor-pointer"
+                                    : "bg-slate-950/20 border border-transparent text-slate-650 cursor-not-allowed opacity-50"
+                                }`}
+                                title={
+                                  isSwap
+                                    ? "Inversão não gera vale (apenas compensação física de mercadoria)"
+                                    : (cast.faltaTipoErro === "entrega"
+                                      ? "Gerar auto de infração / cobrança (vale) para assinatura do motorista e equipe"
+                                      : "Vale disponível apenas para Erro de Descarregamento / Entrega")
+                                }
+                              >
+                                <Signature className="w-3 h-3" />
+                                <span>Vale Motorista</span>
+                              </button>
+                            );
+                          })()}
+
+                          {/* Return to pending option (Icon-only, Yellow) */}
+                          <button
+                            type="button"
+                            onClick={() => handleOpenReturnModal(req)}
+                            className="p-1.5 bg-amber-500/10 hover:bg-amber-500/25 border border-amber-500/40 hover:border-amber-400 text-amber-400 rounded-lg transition-all cursor-pointer shrink-0 flex items-center justify-center group"
+                            title="Retornar este card para PENDENTE (redefinir data de entrega com lembrete)"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5 text-amber-400 group-hover:-rotate-90 transition-transform duration-300" />
+                          </button>
+
+                          {/* Permanent Delete option (Icon-only, Red) */}
+                          <button
+                            type="button"
+                            onClick={() => handlePermanentDelete(req.id)}
+                            className="p-1.5 bg-rose-500/10 hover:bg-rose-500/25 border border-rose-500/40 hover:border-rose-400 text-rose-400 rounded-lg transition-all cursor-pointer shrink-0 flex items-center justify-center group"
+                            title="Excluir permanentemente este registro do histórico"
+                          >
+                            <Trash2 className="w-3.5 h-3.5 text-rose-400 group-hover:scale-110 transition-transform" />
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      /* STANDARD WORKFLOW ACTION ROW */
+                      <div className="flex items-center justify-between gap-2">
+                        {/* Delete button option */}
+                        <button
+                          onClick={() => triggerDelete(req.id)}
+                          className="p-1.5 bg-slate-950 text-slate-500 hover:text-red-400 border border-slate-850 hover:border-red-900 rounded-lg cursor-pointer"
+                          title="Deletar permanentemente"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+
+                        {req.statusPromax === "pendente" ? (
+                          <div className="flex items-center gap-1.5 flex-grow justify-end">
+                            {/* Classificar & Rateio option */}
+                            <button
+                              type="button"
+                              onClick={() => handleOpenEditFalta(req)}
+                              className="px-2.5 py-1.5 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-800 text-indigo-300 rounded-lg text-[10px] font-sans font-bold cursor-pointer transition-colors flex items-center gap-1 shrink-0"
+                              title="Classificar tipo de erro (Carregamento / Entrega), equipe e rateio"
+                            >
+                              <Users className="w-3.5 h-3.5 text-amber-400" />
+                              <span>Equipe / Rateio</span>
+                            </button>
+
+                            {/* Corrigir option */}
+                            <button
+                              onClick={() => triggerCorrigir(req.id)}
+                              className="px-2.5 py-1.5 bg-amber-955/80 hover:bg-amber-900 hover:text-white border border-amber-900/30 text-amber-400 rounded-lg text-[10px] font-sans font-bold cursor-pointer transition-colors shrink-0"
+                              title="Devolver para ajuste pelo RN de campo"
+                            >
+                              Corrigir
+                            </button>
+
+                            {/* Reprovar option */}
+                            <button
+                              onClick={() => triggerReject(req.id)}
+                              className="px-2.5 py-1.5 bg-red-955/80 hover:bg-red-900 hover:text-white border border-red-900/30 text-red-500 rounded-lg text-[10px] font-sans font-bold cursor-pointer transition-colors shrink-0"
+                              title="Reprovar definitivamente"
+                            >
+                              Reprovar
+                            </button>
+
+                            {/* Approved Registered option */}
+                            <button
+                              onClick={() => triggerRegister(req.id)}
+                              className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-[10px] font-bold flex items-center justify-center gap-0.5 cursor-pointer transition-colors shrink-0"
+                            >
+                              <CheckSquare className="w-3 h-3 shrink-0" />
+                              <span>Cadastrar</span>
+                            </button>
+                          </div>
+                        ) : req.statusPromax === "reprovado" ? (
+                          <div className="flex items-center justify-between gap-2 w-full">
+                            <div className="py-1.5 px-3 bg-red-955/10 border border-red-900/20 text-red-400 rounded-lg text-[10px] font-mono shrink-0">
+                              Reprovado Definitivo
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditFalta(req)}
+                                className="px-2.5 py-1.5 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-800 text-indigo-300 rounded-lg text-[10px] font-bold font-sans flex items-center gap-1 cursor-pointer transition-colors"
+                                title="Editar equipe e rateio no novo modelo"
+                              >
+                                <Users className="w-3.5 h-3.5 text-amber-400" />
+                                <span>Equipe / Rateio</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleOpenReturnModal(req)}
+                                className="p-1.5 bg-amber-500/10 hover:bg-amber-500/25 border border-amber-500/40 hover:border-amber-400 text-amber-400 rounded-lg transition-all cursor-pointer shrink-0 flex items-center justify-center group"
+                                title="Retornar este card para PENDENTE (redefinir data de entrega)"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5 text-amber-400 group-hover:-rotate-90 transition-transform duration-300" />
+                              </button>
+                            </div>
+                          </div>
+                        ) : req.statusPromax === "corrigir" ? (
+                          <div className="flex items-center justify-between gap-2 w-full">
+                            <div className="py-1.5 px-3 bg-amber-955/10 border border-amber-900/20 text-amber-405 rounded-lg text-[10px] font-mono shrink-0">
+                              Aguardando Correção pelo RN
+                            </div>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditFalta(req)}
+                                className="px-2.5 py-1.5 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-800 text-indigo-300 rounded-lg text-[10px] font-bold font-sans flex items-center gap-1 cursor-pointer transition-colors"
+                                title="Editar equipe e rateio no novo modelo"
+                              >
+                                <Users className="w-3.5 h-3.5 text-amber-400" />
+                                <span>Equipe / Rateio</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleOpenReturnModal(req)}
+                                className="p-1.5 bg-amber-500/10 hover:bg-amber-500/25 border border-amber-500/40 hover:border-amber-400 text-amber-400 rounded-lg transition-all cursor-pointer shrink-0 flex items-center justify-center group"
+                                title="Retornar este card para PENDENTE (redefinir data de entrega)"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5 text-amber-400 group-hover:-rotate-90 transition-transform duration-300" />
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex flex-col gap-2 w-full pt-2 border-t border-slate-850/80">
+                            <div className="p-2.5 bg-slate-950 border border-slate-850 rounded-xl space-y-1.5 text-[10px] font-mono text-left">
+                              <div className="flex flex-wrap items-center justify-between gap-1">
+                                <span className="text-slate-400">
+                                  👤 Cadastrado por (Plataforma): <strong className="text-indigo-300 font-bold">{getDisplayCadastroUser(req, repsList, motoristasList)}</strong>
+                                </span>
+                                <span className="text-slate-400">
+                                  🕒 <strong className="text-slate-200">{req.cadastroDate || req.data || "Sem Data/Hora"}</strong>
+                                </span>
+                              </div>
+                              {promaxUser ? (
+                                <div className="text-[9.5px] text-emerald-400 font-bold flex items-center gap-1 pt-1 border-t border-slate-900">
+                                  <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                                  <span>Usuário Promax (Col K / 03.18.05): <strong className="text-white bg-emerald-950/80 px-1.5 py-0.5 rounded border border-emerald-800/40">{promaxUser}</strong></span>
+                                </div>
+                              ) : (
+                                <div className="text-[9px] text-slate-500 pt-1 border-t border-slate-900">
+                                  🖥️ Usuário Promax (Col K): <span className="text-slate-400 italic">Pendente / Aguardando Importação 03.18.05</span>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="flex items-center justify-end gap-2 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenReturnModal(req)}
+                                className="p-1.5 bg-amber-500/10 hover:bg-amber-500/25 border border-amber-500/40 hover:border-amber-400 text-amber-400 rounded-lg transition-all cursor-pointer shrink-0 flex items-center justify-center group"
+                                title="Retornar este card para PENDENTE (redefinir data de entrega)"
+                              >
+                                <RotateCcw className="w-3.5 h-3.5 text-amber-400 group-hover:-rotate-90 transition-transform duration-300" />
+                              </button>
+
+                              {/* Editar no novo modelo com rateio */}
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditFalta(req)}
+                                className="px-2.5 py-1.5 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-800 text-indigo-300 rounded-lg text-[10px] font-bold font-sans flex items-center gap-1 cursor-pointer transition-colors"
+                                title="Editar equipe, motorista, ajudantes e rateio no novo modelo"
+                              >
+                                <Users className="w-3.5 h-3.5 text-amber-400" />
+                                <span>Editar Equipe & Rateio</span>
+                              </button>
+
+                              {/* Emitir / Ver Vale Motorista */}
+                              <button
+                                type="button"
+                                onClick={() => setSelectedPrintDoc({ type: "vale", request: req })}
+                                className="px-2.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-300 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer shrink-0"
+                                title="Visualizar e imprimir Vale de Cobrança com Rateio da Equipe"
+                              >
+                                <Signature className="w-3.5 h-3.5 text-amber-400" />
+                                <span>Vale Motorista</span>
+                              </button>
+
+                              <button
+                                onClick={() => setSelectedPrintDoc({ type: "recibo", request: req })}
+                                className="px-2.5 py-1.5 bg-slate-950 hover:bg-slate-855 border border-slate-800 text-blue-400 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer shrink-0"
+                                title="Gerar Recibo PDV em Contingência para este cadastro aprovado"
+                              >
+                                <Printer className="w-3.5 h-3.5 text-blue-400" />
+                                <span>Recibo PDV ⚠️</span>
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                </div>
+              );
+            })}
+            </div>
+
+            {/* Bottom Comprehensive Pagination Bar */}
+            {totalFilteredCount > 0 && pageSize > 0 && totalPages > 1 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-950/90 rounded-xl border border-slate-800/90 text-xs font-mono">
+                <span className="text-slate-400">
+                  Mostrando <strong className="text-white">{(safeCurrentPage - 1) * pageSize + 1}–{Math.min(totalFilteredCount, safeCurrentPage * pageSize)}</strong> de <strong className="text-white">{totalFilteredCount}</strong> solicitações filtradas
+                </span>
+
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage <= 1}
+                    onClick={() => {
+                      setCurrentPage(1);
+                      window.scrollTo({ top: 300, behavior: "smooth" });
+                    }}
+                    className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-xs font-bold border border-slate-800 transition-all cursor-pointer"
+                    title="Primeira Página"
+                  >
+                    « Primeira
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage <= 1}
+                    onClick={() => {
+                      setCurrentPage(prev => Math.max(1, prev - 1));
+                      window.scrollTo({ top: 300, behavior: "smooth" });
+                    }}
+                    className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-xs font-bold border border-slate-800 transition-all cursor-pointer"
+                    title="Página Anterior"
+                  >
+                    ‹ Anterior
+                  </button>
+
+                  {/* Numbered Page Buttons */}
+                  {Array.from({ length: totalPages }, (_, i) => i + 1)
+                    .filter(p => p === 1 || p === totalPages || Math.abs(p - safeCurrentPage) <= 2)
+                    .map((p, idx, arr) => {
+                      const prev = arr[idx - 1];
+                      const showEllipsis = prev && p - prev > 1;
+                      return (
+                        <React.Fragment key={p}>
+                          {showEllipsis && <span className="text-slate-500 px-1">...</span>}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCurrentPage(p);
+                              window.scrollTo({ top: 300, behavior: "smooth" });
+                            }}
+                            className={`w-7 h-7 rounded text-xs font-bold transition-all cursor-pointer flex items-center justify-center ${
+                              safeCurrentPage === p
+                                ? "bg-indigo-600 text-white shadow-md shadow-indigo-950 font-black border border-indigo-400"
+                                : "bg-slate-900 text-slate-400 hover:text-white hover:bg-slate-800 border border-slate-800"
+                            }`}
+                          >
+                            {p}
+                          </button>
+                        </React.Fragment>
+                      );
+                    })}
+
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage >= totalPages}
+                    onClick={() => {
+                      setCurrentPage(prev => Math.min(totalPages, prev + 1));
+                      window.scrollTo({ top: 300, behavior: "smooth" });
+                    }}
+                    className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-xs font-bold border border-slate-800 transition-all cursor-pointer"
+                    title="Próxima Página"
+                  >
+                    Próxima ›
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeCurrentPage >= totalPages}
+                    onClick={() => {
+                      setCurrentPage(totalPages);
+                      window.scrollTo({ top: 300, behavior: "smooth" });
+                    }}
+                    className="px-2.5 py-1 rounded bg-slate-900 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed text-slate-300 text-xs font-bold border border-slate-800 transition-all cursor-pointer"
+                    title="Última Página"
+                  >
+                    Última »
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Discreet Instructions Box (fluxo de ações) */}
+      <footer className="mt-8 pt-4 border-t border-slate-900/60 flex justify-center no-print text-left">
+        <div className="max-w-2xl bg-slate-950/40 p-3.5 rounded-xl border border-slate-850/50 text-[10.5px] text-slate-550 leading-relaxed font-sans flex items-start gap-2.5">
+          <span className="text-blue-500/80 font-bold shrink-0 mt-0.5 font-semibold">💡 Controle de Faltas Física & SSTR:</span>
+          <div className="flex flex-col gap-1.5 text-left">
+            <p>
+              Qualquer solicitação contendo falta física ou inversão de SKU é listada de forma persistente sob a aba **Faltas & Inversões**.
+            </p>
+            <p>
+              Classifique as faltas como <span className="text-blue-400">Carregamento (Estoque Armazém / Sem Faturamento)</span> ou <span className="text-amber-500">Descarregamento na Entrega (Faturamento Coletor / Vale Motorista com desconto)</span> e imprima recibos oficiais com a marca Ambev.
+            </p>
+          </div>
+        </div>
+      </footer>
+
+      {/* PHYSICAL SETTLEMENT (DAR BAIXA) MODAL WITH FILE UPLOAD */}
+      {baixandoFalta && (
+        <div className="fixed inset-0 z-55 bg-black/85 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in no-print">
+          <div className="bg-slate-900 border border-slate-805 rounded-2xl p-6 w-full max-w-lg shadow-2xl space-y-4 text-left font-sans animate-scale-up">
+            <div className="flex items-center justify-between border-b border-slate-850 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="p-1 px-1.5 bg-emerald-950 border border-emerald-900 rounded text-emerald-450 text-[9px] uppercase font-mono font-bold">
+                  Baixa Física
+                </div>
+                <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+                  Liquidar Shortage / Inversão
+                </h3>
+              </div>
+              <button
+                onClick={() => setBaixandoFalta(null)}
+                className="text-slate-455 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="bg-slate-955 p-3 rounded-xl border border-slate-850 text-xs text-slate-350 space-y-1.5 leading-relaxed font-mono">
+              <div><strong>NF / Série:</strong> {baixandoFalta.nf}</div>
+              <div><strong>PDV / Cliente Código:</strong> {baixandoFalta.nb}</div>
+              <div><strong>Setor de Vendas:</strong> {baixandoFalta.setor}</div>
+              {baixandoFalta.items && baixandoFalta.items.length > 0 && (
+                <div className="pt-1.5 border-t border-slate-900 text-slate-400">
+                  <strong>Itens Envolvidos:</strong>
+                  <ul className="list-disc pl-4 mt-1 space-y-0.5 text-[11px]">
+                    {baixandoFalta.items.map((sub, idx) => (
+                      <li key={idx}>
+                        {sub.produtoAhEnviar ? (() => {
+                          const pEnviar = parseInversionProduct(sub.produtoAhEnviar, sub.quantidade);
+                          const pRecolher = parseInversionProduct(sub.produtoARecolher, sub.quantidade);
+                          return (
+                            <div className="my-1 p-1.5 bg-slate-900/80 rounded border border-slate-800 text-[10px] space-y-0.5 font-sans">
+                              <div>➡️ <strong className="text-emerald-400">ENTREGAR:</strong> <span className="font-mono text-slate-200 font-bold">{pEnviar.fullText}</span></div>
+                              <div>⬅️ <strong className="text-rose-400">RECOLHER:</strong> <span className="font-mono text-slate-300">{pRecolher.fullText}</span></div>
+                            </div>
+                          );
+                        })() : (
+                          <span>📦 SKU: {sub.item} - {sub.descricao || "Falta"} (Qtd: {sub.quantidade} {getUnitLabel(sub, baixandoFalta)})</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-slate-450 font-bold uppercase tracking-wider block">
+                {baixandoFalta.faltaTipoErro === "carregamento" ? (
+                  <span className="text-blue-400">Comprovante / Recibo (Opcional - Erro de Armazém/Carregamento)</span>
+                ) : (
+                  <>
+                    Comprovante Assinado (Foto JPG/PNG ou PDF) <span className="text-emerald-500">*</span>
+                  </>
+                )}
+              </label>
+
+              {/* Drag and Drop Container */}
+              <div 
+                onClick={() => document.getElementById("receipt-file-input")?.click()}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    const file = e.dataTransfer.files[0];
+                    const fileType = file.type;
+                    const fileName = file.name;
+                    const reader = new FileReader();
+                    reader.onload = () => {
+                      setBaixaReciboFile({
+                        name: fileName,
+                        type: fileType,
+                        dataUrl: reader.result as string
+                      });
+                    };
+                    reader.readAsDataURL(file);
+                  }
+                }}
+                className={`border-2 border-dashed rounded-xl p-5 text-center cursor-pointer transition-all duration-200 ${
+                  baixaReciboFile 
+                    ? "border-emerald-500/50 bg-emerald-950/10" 
+                    : "border-slate-800 hover:border-emerald-500 bg-slate-950/45 hover:bg-slate-950/70"
+                }`}
+              >
+                <input 
+                  id="receipt-file-input"
+                  type="file"
+                  accept="image/*,application/pdf"
+                  className="hidden"
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files[0]) {
+                      const file = e.target.files[0];
+                      const fileType = file.type;
+                      const fileName = file.name;
+                      const reader = new FileReader();
+                      reader.onload = () => {
+                        setBaixaReciboFile({
+                          name: fileName,
+                          type: fileType,
+                          dataUrl: reader.result as string
+                        });
+                      };
+                      reader.readAsDataURL(file);
+                    }
+                  }}
+                />
+
+                {baixaReciboFile ? (
+                  <div className="space-y-2" onClick={(e) => e.stopPropagation()}>
+                    {baixaReciboFile.type.includes("pdf") || baixaReciboFile.dataUrl === "pdf_placeholder" ? (
+                      <div className="flex flex-col items-center p-2">
+                        <FileText className="w-9 h-9 text-emerald-400 mb-1" />
+                        <span className="text-xs text-white font-mono font-bold truncate max-w-[280px]">{baixaReciboFile.name}</span>
+                        <span className="text-[10px] text-emerald-500 font-mono">Documento PDF Carregado</span>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center">
+                        <img src={baixaReciboFile.dataUrl} className="max-h-24 object-contain rounded border border-slate-850 mb-1.5" alt="Recibo Assinado" />
+                        <span className="text-[11px] text-white font-mono truncate max-w-[280px] block">{baixaReciboFile.name}</span>
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setBaixaReciboFile(null)}
+                      className="px-2 py-0.5 bg-red-950 text-red-400 border border-red-900/50 hover:bg-red-905 hover:text-white rounded text-[10px] font-sans font-bold cursor-pointer transition-colors"
+                    >
+                      Remover e Alterar Comprovante
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center space-y-1.5 select-none py-2">
+                    <Upload className="w-7 h-7 text-slate-500 animate-pulse" />
+                    <p className="text-xs font-semibold text-slate-200">Arraste & Solte ou Clique para Anexar</p>
+                    <p className="text-[10px] text-slate-500">Imagens JPG, PNG ou recibos formato PDF</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Simulation Quick helper buttons for fast validation */}
+              {!baixaReciboFile && (
+                <div className="flex items-center justify-between gap-1.5 text-[10px] bg-slate-950/50 p-2 rounded-lg border border-slate-850">
+                  <span className="text-slate-400 font-mono">Gerar comprovante teste:</span>
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBaixaReciboFile({
+                          name: "FOTO_RECIBO_CLIENTE_ENTREGUE.jpg",
+                          type: "image/jpeg",
+                          dataUrl: "https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?auto=format&fit=crop&q=80&w=300"
+                        });
+                      }}
+                      className="px-2 py-0.5 bg-blue-950 hover:bg-blue-900 border border-blue-900/40 text-blue-450 rounded font-mono text-[9px] cursor-pointer transition-colors"
+                    >
+                      📸 Simular Foto (JPG)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setBaixaReciboFile({
+                          name: "RECIBO_TIMBRADO_AMBEV_FINANCEIRO.pdf",
+                          type: "application/pdf",
+                          dataUrl: "pdf_placeholder"
+                        });
+                      }}
+                      className="px-2 py-0.5 bg-indigo-950 hover:bg-indigo-900 border border-indigo-900/40 text-indigo-450 rounded font-mono text-[9px] cursor-pointer transition-colors"
+                    >
+                      📄 Simular PDF
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-[10px] text-slate-450 font-bold uppercase tracking-wider block">
+                Notas / Observação da Baixa
+              </label>
+              <textarea
+                rows={2}
+                placeholder="Ex. Recibo assinado fisicamente, encaminhado ao setor Operacional / Rota."
+                value={baixaObservacao}
+                onChange={(e) => setBaixaObservacao(e.target.value)}
+                className="w-full bg-slate-955 border border-slate-805 rounded-lg p-2 text-xs text-slate-205 font-mono focus:border-emerald-500 focus:outline-none"
+              />
+            </div>
+
+            {baixaError && (
+              <div className="p-2.5 bg-red-950/20 border border-red-900/35 rounded-xl text-[10px] text-red-400 font-mono">
+                🚨 {baixaError}
+              </div>
+            )}
+
+            <div className="flex gap-2.5 pt-2 border-t border-slate-850">
+              <button
+                onClick={() => setBaixandoFalta(null)}
+                className="flex-1 py-2 bg-slate-950 hover:bg-slate-850 border border-slate-800 text-slate-400 hover:text-white rounded-lg text-xs font-semibold cursor-pointer transition-colors"
+              >
+                Voltar
+              </button>
+              <button
+                onClick={handleConfirmarBaixaShortage}
+                disabled={!baixaReciboFile}
+                className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                  baixaReciboFile 
+                    ? "bg-emerald-600 hover:bg-emerald-700 text-white cursor-pointer" 
+                    : "bg-slate-900 border border-slate-800 text-slate-600 cursor-not-allowed"
+                }`}
+              >
+                Gravar Baixa
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FULLSCREEN PHOTO / PDF ZOOM MODAL */}
+      {zoomPhoto && (
+        <PdfDocumentViewer 
+          source={zoomPhoto} 
+          onClose={() => setZoomPhoto(null)} 
+          title="Visualizador de Documento / Recibo de Baixa"
+          fileName="comprovante_sstr.pdf"
+        />
+      )}
+
+      {/* DETAILED INSPECTION MODAL (ANÁLISE DE LANÇAMENTOS E ANEXOS) */}
+      {inspectRequest && (
+        <div 
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-5 animate-fade-in no-print"
+          onClick={() => setInspectRequest(null)}
+        >
+          <div 
+            className="bg-slate-950 border border-slate-800 w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden text-left"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="px-5 py-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <div className="p-2 bg-blue-950 border border-blue-800 rounded-xl text-blue-400">
+                  <Eye className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-white text-sm uppercase">Análise Detalhada do Lançamento</h3>
+                  <p className="text-[10.5px] font-mono text-slate-400">
+                    {isReposicaoReq(inspectRequest) ? "📦 Reposição por Falta" : "🔁 Troca (Avaria/Inversão/Outros)"} • Setor/Rota {inspectRequest.setor}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setInspectRequest(null)}
+                className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto space-y-4 custom-scrollbar text-xs">
+              
+              {/* Status Badge & Workflow Banner */}
+              {(() => {
+                const cast = inspectRequest as any;
+                const hasReceipt = !!cast.faltaBaixaReciboUrl || !!cast.faltaBaixaReciboName || (!!cast.faltaBaixa && !!inspectRequest.fotoUrl) || !!cast.contingenciaBaixada || cast.status === "baixado";
+                return (
+                  <div className={`p-3 rounded-xl border flex items-center justify-between gap-3 ${
+                    hasReceipt 
+                      ? "bg-emerald-950/40 border-emerald-800 text-emerald-200" 
+                      : "bg-amber-950/40 border-amber-800 text-amber-200"
+                  }`}>
+                    <div>
+                      <span className="font-extrabold font-mono uppercase text-[10px] block">
+                        {hasReceipt ? "🟢 STATUS: BAIXADO (Recibo Anexado)" : "⏳ STATUS: LANÇADO PARA ENVIO (Pendente de Recibo)"}
+                      </span>
+                      <p className="text-[11px] font-sans text-slate-300 mt-0.5">
+                        {hasReceipt 
+                          ? `Baixa registrada por ${cast.faltaBaixaUser || "Sistema"} em ${cast.faltaBaixaDate || "Data Confirmada"}.` 
+                          : "Lançamento em trânsito/envio. Aguardando importação do recibo assinado para baixa."}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => exportRegistrationPdf(inspectRequest, { autoDownload: true })}
+                      className="px-3 py-1.5 bg-blue-950 hover:bg-blue-900 border border-blue-800 text-blue-200 rounded-lg text-xs font-bold font-mono shrink-0 transition-colors flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <FileText className="w-3.5 h-3.5 text-blue-400" />
+                      <span>PDF Completo</span>
+                    </button>
+                  </div>
+                );
+              })()}
+
+              {/* Client & PDV Card */}
+              {(() => {
+                const pdvDb = getPdvDatabase();
+                const pdv = pdvDb[inspectRequest.nb];
+                const clientName = pdv?.razaoSocial || `PDV #${inspectRequest.nb}`;
+                const clientFantasia = pdv?.nomeFantasia;
+                return (
+                  <div className="p-3.5 bg-slate-900/90 rounded-xl border border-slate-800 space-y-1.5">
+                    <span className="text-[9.5px] uppercase font-mono font-bold text-slate-400">Ponto de Venda (PDV):</span>
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                      <div>
+                        <h4 className="font-black text-sm text-slate-100 uppercase">{clientName}</h4>
+                        {clientFantasia && clientFantasia !== clientName && (
+                          <p className="text-xs font-bold text-blue-400 font-mono uppercase mt-0.5">
+                            🏷️ Nome Fantasia: {clientFantasia}
+                          </p>
+                        )}
+                      </div>
+                      <span className="text-xs font-mono font-extrabold text-amber-400 bg-amber-950/60 px-2 py-1 rounded border border-amber-800/40 shrink-0">
+                        Cód. NB: {inspectRequest.nb}
+                      </span>
+                    </div>
+                    <div className="pt-2 border-t border-slate-800 text-[11px] text-slate-300 font-sans grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <p>📍 <strong>Local:</strong> {pdv?.endereco || "Endereço Cadastrado"}, {pdv?.bairro || "Bairro"}</p>
+                      <p>🏙️ <strong>Município:</strong> {pdv?.municipio || "Guarabira"} - {pdv?.uf || "PB"}</p>
+                      <p>📄 <strong>Documento:</strong> {pdv?.documento || "N/A"}</p>
+                      <p>📮 <strong>CEP:</strong> {pdv?.cep || "N/A"}</p>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Lançamento Metadata */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-left font-mono text-[11px]">
+                <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800">
+                  <span className="text-[9px] uppercase font-bold text-slate-500 block">NF-e Original</span>
+                  <span className="font-extrabold text-slate-200">{inspectRequest.nf || "N/A"}</span>
+                </div>
+                <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800">
+                  <span className="text-[9px] uppercase font-bold text-slate-500 block">Mapa de Carga</span>
+                  <span className="font-extrabold text-slate-200">{inspectRequest.mapa || "N/A"}</span>
+                </div>
+                <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800">
+                  <span className="text-[9px] uppercase font-bold text-slate-500 block">Data Lançamento</span>
+                  <span className="font-extrabold text-slate-200">{inspectRequest.data}</span>
+                </div>
+                <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800">
+                  <span className="text-[9px] uppercase font-bold text-slate-500 block">Solicitante</span>
+                  <span className="font-extrabold text-indigo-300 truncate block">
+                    {getDisplayCadastroUser(inspectRequest, repsList, motoristasList)}
+                  </span>
+                </div>
+              </div>
+
+              {/* Product Items Table */}
+              <div className="space-y-1.5">
+                <span className="text-[10px] font-mono font-bold text-slate-400 uppercase">Itens Lançados no Pedido / Ocorrência:</span>
+                <div className="border border-slate-800 rounded-xl overflow-hidden bg-slate-900/60">
+                  <table className="w-full text-left font-mono text-[11px]">
+                    <thead className="bg-slate-900 text-slate-400 border-b border-slate-800 text-[9.5px] uppercase">
+                      <tr>
+                        <th className="p-2">Cód</th>
+                        <th className="p-2">Produto</th>
+                        <th className="p-2 text-center">Qtd</th>
+                        <th className="p-2 text-right">Volume (HL)</th>
+                        <th className="p-2 text-right">Total (R$)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/60 text-slate-200">
+                      {getInspectItems(inspectRequest, promaxRecords).map((item, idx) => (
+                        <tr key={idx} className="hover:bg-slate-800/40 transition-colors">
+                          <td className="p-2 font-bold text-blue-400">{item.code !== "N/A" ? `#${item.code}` : "N/A"}</td>
+                          <td className="p-2 max-w-[200px] truncate" title={item.name}>{item.name}</td>
+                          <td className="p-2 text-center font-bold">{item.qty} {item.um}</td>
+                          <td className="p-2 text-right text-indigo-300 font-bold">{item.hl ? item.hl.toFixed(4) : "0.0000"} HL</td>
+                          <td className="p-2 text-right text-emerald-400 font-extrabold">{formatCurrency(item.val || 0)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Observations & Motivo */}
+              {(inspectRequest.observacao || (inspectRequest as any).faltaBaixaObs) && (
+                <div className="p-3 bg-slate-900/90 rounded-xl border border-slate-800 space-y-1 font-sans text-[11px] text-slate-300">
+                  <span className="text-[9.5px] uppercase font-mono font-bold text-amber-400 block">📝 Observações & Motivos:</span>
+                  {inspectRequest.observacao && <p className="italic">"Lançamento: {inspectRequest.observacao}"</p>}
+                  {(inspectRequest as any).faltaBaixaObs && <p className="italic text-emerald-300">"Baixa: {(inspectRequest as any).faltaBaixaObs}"</p>}
+                </div>
+              )}
+
+              {/* Attachments Section (Original Evidence & Signed Receipt) */}
+              <div className="space-y-2 pt-2 border-t border-slate-800">
+                <span className="text-[10px] font-mono font-bold text-slate-400 uppercase block">Anexos e Imagens Importadas:</span>
+                
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Original Evidence (Image or PDF) */}
+                  {inspectRequest.fotoUrl && (
+                    <div className="p-2.5 bg-slate-900 rounded-xl border border-slate-800 flex items-center gap-3">
+                      {inspectRequest.fotoUrl.toLowerCase().includes(".pdf") || inspectRequest.fotoUrl.startsWith("data:application/pdf") ? (
+                        <div className="w-12 h-12 bg-amber-955 border border-amber-800 rounded-lg flex items-center justify-center shrink-0">
+                          <FileText className="w-6 h-6 text-amber-400" />
+                        </div>
+                      ) : (
+                        <img 
+                          src={inspectRequest.fotoUrl} 
+                          alt="Evidência" 
+                          className="w-14 h-14 object-cover rounded-lg border border-slate-700 cursor-pointer hover:opacity-85 shrink-0"
+                          onClick={() => setZoomPhoto(inspectRequest.fotoUrl)}
+                          referrerPolicy="no-referrer"
+                        />
+                      )}
+                      <div className="min-w-0 flex-1 font-mono">
+                        <span className="text-[10px] font-bold text-amber-400 block truncate">
+                          {inspectRequest.fotoUrl.toLowerCase().includes(".pdf") ? "📄 Documento PDF (Evidência)" : "📷 Evidência do Cadastro"}
+                        </span>
+                        <span className="text-[9px] text-slate-400 block truncate">Anexo enviado ao lançar</span>
+                        <button
+                          type="button"
+                          onClick={() => setZoomPhoto(inspectRequest.fotoUrl)}
+                          className="mt-1.5 px-2 py-1 bg-amber-950 hover:bg-amber-900 border border-amber-800 text-amber-300 text-[9px] font-bold rounded cursor-pointer transition-colors flex items-center gap-1"
+                        >
+                          <Eye className="w-3 h-3 text-amber-400" />
+                          <span>{inspectRequest.fotoUrl.toLowerCase().includes(".pdf") ? "Visualizar PDF" : "Ampliar Foto"}</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Signed Receipt (Image or PDF) */}
+                  {(inspectRequest as any).faltaBaixaReciboUrl && typeof (inspectRequest as any).faltaBaixaReciboUrl === "string" && (
+                    <div className="p-2.5 bg-slate-900 rounded-xl border border-emerald-800/80 flex items-center gap-3">
+                      {(inspectRequest as any).faltaBaixaReciboUrl.toLowerCase().includes(".pdf") || (inspectRequest as any).faltaBaixaReciboUrl.startsWith("data:application/pdf") || (inspectRequest as any).faltaBaixaReciboUrl === "pdf_placeholder" ? (
+                        <div className="w-12 h-12 bg-emerald-955 border border-emerald-800 rounded-lg flex items-center justify-center shrink-0">
+                          <FileText className="w-6 h-6 text-emerald-400 animate-pulse" />
+                        </div>
+                      ) : (
+                        <img 
+                          src={(inspectRequest as any).faltaBaixaReciboUrl} 
+                          alt="Recibo Assinado" 
+                          className="w-14 h-14 object-cover rounded-lg border border-emerald-700 cursor-pointer hover:opacity-85 shrink-0"
+                          onClick={() => setZoomPhoto((inspectRequest as any).faltaBaixaReciboUrl)}
+                          referrerPolicy="no-referrer"
+                        />
+                      )}
+                      <div className="min-w-0 flex-1 font-mono">
+                        <span className="text-[10px] font-bold text-emerald-400 block truncate">📝 Recibo / Comprovante PDF</span>
+                        <span className="text-[9px] text-slate-400 block truncate">{(inspectRequest as any).faltaBaixaReciboName || "recibo_baixa_assinado.pdf"}</span>
+                        <button
+                          type="button"
+                          onClick={() => setZoomPhoto((inspectRequest as any).faltaBaixaReciboUrl)}
+                          className="mt-1.5 px-2 py-1 bg-emerald-950 hover:bg-emerald-900 border border-emerald-800 text-emerald-300 text-[9px] font-bold rounded cursor-pointer transition-colors flex items-center gap-1"
+                        >
+                          <Eye className="w-3 h-3 text-emerald-400" />
+                          <span>Visualizar Recibo PDF</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-5 py-3 bg-slate-900 border-t border-slate-800 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setInspectRequest(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold font-mono rounded-xl cursor-pointer transition-colors"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SHORTAGE CLASSIFICATION AND DETAILS EDITING SLIDEOVER/MODAL */}
+      {editingFalta && (() => {
+        return (
+          <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-xs flex items-center justify-center p-2 sm:p-3 md:p-5 animate-fade-in no-print overflow-y-auto">
+            <div className={`bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl text-left font-sans flex flex-col transition-all duration-300 my-auto overflow-hidden ${
+              isEditFaltaMaximized 
+                ? "w-[99vw] max-w-[1700px] h-[98vh] max-h-[98vh]" 
+                : "w-[96vw] max-w-6xl xl:max-w-7xl max-h-[95vh] h-[93vh]"
+            }`}>
+              
+              {/* Fixed Header with Maximize Toggle */}
+              <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between shrink-0 bg-slate-900 rounded-t-3xl">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-500/20 text-indigo-400 flex items-center justify-center font-bold border border-indigo-500/30 shrink-0">
+                    <Layers className="w-5 h-5 text-indigo-400" />
+                  </div>
+                  <div>
+                    <h3 className="text-sm sm:text-base font-bold text-white uppercase tracking-wider flex items-center gap-2 flex-wrap">
+                      <span>Classificar e Ajustar Falta Física</span>
+                      <span className="px-2.5 py-0.5 rounded-full text-[10.5px] font-mono bg-indigo-950 border border-indigo-800 text-indigo-300 font-bold">
+                        NF {editingFalta.nf}
+                      </span>
+                      {isEditFaltaMaximized && (
+                        <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono bg-amber-500/10 border border-amber-500/30 text-amber-400 font-bold">
+                          TELA MAXIMIZADA
+                        </span>
+                      )}
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Classifique o tipo de responsabilidade e configure a equipe de responsáveis com rateio automático
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setIsEditFaltaMaximized(prev => !prev)}
+                    className="p-2 hover:bg-slate-800 rounded-xl text-slate-400 hover:text-white cursor-pointer transition-colors"
+                    title={isEditFaltaMaximized ? "Restaurar tamanho padrão" : "Maximizar janela (Expandir tela)"}
+                  >
+                    {isEditFaltaMaximized ? <Minimize2 className="w-5 h-5 text-amber-400" /> : <Maximize2 className="w-5 h-5 text-slate-400 hover:text-white" />}
+                  </button>
+                  <button 
+                    onClick={() => setEditingFalta(null)} 
+                    className="p-2 hover:bg-slate-800 rounded-xl text-slate-400 hover:text-white cursor-pointer transition-colors"
+                    title="Fechar (ESC)"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Scrollable Body with Mouse Wheel Scrollbar */}
+              <div className="p-4 sm:p-6 space-y-4 overflow-y-auto flex-1 custom-scrollbar text-xs">
+                {/* Informative recap banner */}
+                <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 text-xs text-slate-300 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 font-mono shadow-inner">
+                  <div>
+                    <span className="text-[10px] text-slate-500 block uppercase font-bold">Nota Fiscal:</span>
+                    <strong className="text-white text-xs">{editingFalta.nf}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-500 block uppercase font-bold">Código Client NB:</span>
+                    <strong className="text-blue-400 text-xs">{editingFalta.nb}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-500 block uppercase font-bold">Mapa Carga:</span>
+                    <strong className="text-amber-400 text-xs">{editingFalta.mapa || "NÃO CONFIGURADO"}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-500 block uppercase font-bold">Setor Venda / Rota:</span>
+                    <strong className="text-emerald-400 text-xs">{editingFalta.setor}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-500 block uppercase font-bold">Valor Ocorrência:</span>
+                    <strong className="text-rose-400 text-xs font-black">{formatCurrency(getRequestValue(editingFalta, promaxRecords))}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[10px] text-slate-500 block uppercase font-bold">Solicitante:</span>
+                    <strong className="text-indigo-300 text-xs truncate block">{getDisplayCadastroUser(editingFalta, repsList, motoristasList)}</strong>
+                  </div>
+                </div>
+
+                {/* 2-Column Responsive Layout for maximum ergonomics */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+                  
+                  {/* Left Column: Classification, Dates, Location, Notes, Photo (5 cols on lg, 4 cols on xl) */}
+                  <div className="lg:col-span-5 xl:col-span-4 space-y-4">
+                    {/* 1. Classify err type */}
+                    <div className="bg-slate-955 p-4 rounded-2xl border border-slate-800 space-y-2.5 shadow-md">
+                      <label className="text-[11px] font-bold text-slate-200 uppercase block font-mono flex items-center gap-1.5">
+                        <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>Classificação do Erro (Responsabilidade):</span>
+                      </label>
+                      <div className="grid grid-cols-1 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setEditFaltaErrorType("carregamento")}
+                          className={`p-3 rounded-xl border text-xs font-bold text-left cursor-pointer transition-all flex items-center justify-between ${
+                            editFaltaErrorType === "carregamento"
+                              ? "bg-blue-900/40 border-blue-500 text-blue-200 ring-2 ring-blue-500/50 shadow-lg shadow-blue-950/40"
+                              : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-300"
+                          }`}
+                        >
+                          <div>
+                            <p className="text-xs font-black">📦 Carregamento (Armazém)</p>
+                            <p className="text-[9.5px] font-normal opacity-80 mt-0.5">Estoque Armazém / Não faturar equipe</p>
+                          </div>
+                          {editFaltaErrorType === "carregamento" && <CheckCircle2 className="w-4 h-4 text-blue-400 shrink-0" />}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setEditFaltaErrorType("entrega")}
+                          className={`p-3 rounded-xl border text-xs font-bold text-left cursor-pointer transition-all flex items-center justify-between ${
+                            editFaltaErrorType === "entrega"
+                              ? "bg-amber-900/40 border-amber-500 text-amber-200 ring-2 ring-amber-500/50 shadow-lg shadow-amber-950/40"
+                              : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-300"
+                          }`}
+                        >
+                          <div>
+                            <p className="text-xs font-black">🚚 Erro de Entrega (Rota)</p>
+                            <p className="text-[9.5px] font-normal opacity-80 mt-0.5">Rota Logística / Faturar e Cobrar Vale Crew</p>
+                          </div>
+                          {editFaltaErrorType === "entrega" && <CheckCircle2 className="w-4 h-4 text-amber-400 shrink-0" />}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setEditFaltaErrorType("nao_identificado")}
+                          className={`p-3 rounded-xl border text-xs font-bold text-left cursor-pointer transition-all flex items-center justify-between ${
+                            editFaltaErrorType === "nao_identificado" || !editFaltaErrorType
+                              ? "bg-purple-900/40 border-purple-500 text-purple-200 ring-2 ring-purple-500/50 shadow-lg shadow-purple-950/40"
+                              : "bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-slate-300"
+                          }`}
+                        >
+                          <div>
+                            <p className="text-xs font-black">❓ Não Identificado</p>
+                            <p className="text-[9.5px] font-normal opacity-80 mt-0.5">Sem Culpa Definida / Apurar posteriormente</p>
+                          </div>
+                          {(editFaltaErrorType === "nao_identificado" || !editFaltaErrorType) && <CheckCircle2 className="w-4 h-4 text-purple-400 shrink-0" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Dates & Location */}
+                    <div className="bg-slate-955 p-4 rounded-2xl border border-slate-800 space-y-3 shadow-md">
+                      <span className="text-[11px] font-bold text-slate-300 uppercase block font-mono flex items-center gap-1.5">
+                        <Calendar className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Datas & Localidade:</span>
+                      </span>
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-bold text-slate-400 uppercase block font-mono">Data da Anomalia:</label>
+                          <input
+                            type="text"
+                            value={editFaltaDataAnomalia}
+                            onChange={(e) => setEditFaltaDataAnomalia(e.target.value)}
+                            placeholder="Ex: 21/06/2026"
+                            className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-amber-400 focus:outline-none"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-bold text-slate-400 uppercase block font-mono">Entrega Recibo:</label>
+                          <input
+                            type="text"
+                            value={editFaltaDataEntrega}
+                            onChange={(e) => setEditFaltaDataEntrega(e.target.value)}
+                            placeholder="Ex: 22/06/2026"
+                            className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:border-amber-400 focus:outline-none"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Municipio */}
+                      <div className="space-y-1 pt-1">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase block font-mono flex items-center gap-1">
+                          <MapPin className="w-3 h-3 text-emerald-400" />
+                          <span>Município / Cidade do PDV:</span>
+                        </label>
+                        <input
+                          type="text"
+                          value={editFaltaCidade}
+                          onChange={(e) => setEditFaltaCidade(e.target.value)}
+                          placeholder="Cidade do PDV"
+                          className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white uppercase font-bold focus:border-amber-400 focus:outline-none"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Observações & Foto */}
+                    <div className="bg-slate-955 p-4 rounded-2xl border border-slate-800 space-y-3 shadow-md">
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase block font-mono">Observações no Recibo / Justificativa:</label>
+                        <textarea
+                          value={editFaltaObservacao}
+                          onChange={(e) => setEditFaltaObservacao(e.target.value)}
+                          placeholder="Opcional. Ex: Entrega realizada com atraso, autorizado pelo supervisor."
+                          rows={2}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-xl p-2.5 text-xs text-white focus:border-amber-400 focus:outline-none"
+                        />
+                      </div>
+
+                      {/* Foto / Evidência */}
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase block font-mono">Evidência / Foto:</label>
+                        <div className="flex items-center gap-3 bg-slate-900 border border-slate-800 rounded-xl p-2.5">
+                          {editFaltaPhoto ? (
+                            <img src={editFaltaPhoto} alt="Evidência" className="w-11 h-11 object-cover rounded-lg border border-slate-700 shrink-0" />
+                          ) : (
+                            <div className="w-11 h-11 bg-slate-950 border border-dashed border-slate-700 rounded-lg flex items-center justify-center text-slate-500 shrink-0">
+                              <Camera className="w-5 h-5 text-amber-500" />
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0 text-left">
+                            <label className="px-2.5 py-1 bg-indigo-950 hover:bg-indigo-900 border border-indigo-800 text-indigo-300 rounded-lg text-[10px] font-bold cursor-pointer inline-flex items-center gap-1 transition-colors">
+                              <Upload className="w-3 h-3 text-indigo-400" />
+                              <span>{editFaltaPhoto ? "Trocar Foto" : "Importar Anexo"}</span>
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(e) => {
+                                  const file = e.target.files?.[0];
+                                  if (file) {
+                                    const reader = new FileReader();
+                                    reader.onload = (evt) => {
+                                      if (evt.target?.result) {
+                                        setEditFaltaPhoto(evt.target.result as string);
+                                      }
+                                    };
+                                    reader.readAsDataURL(file);
+                                  }
+                                }}
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Right Column: MAXIMIZED RESPONSIBLE PLACEMENT & RATEIO AREA (7 cols on lg, 8 cols on xl) */}
+                  <div className="lg:col-span-7 xl:col-span-8 space-y-4">
+                    {/* Main Responsible Box */}
+                    <div className="bg-slate-955 p-4 sm:p-6 rounded-3xl border-2 border-slate-800 space-y-5 font-sans text-left shadow-2xl">
+                      
+                      {/* Section Header & Collaborator Quantity Picker */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
+                        <div>
+                          <span className="text-sm sm:text-base font-extrabold text-white uppercase font-mono flex items-center gap-2">
+                            <Users className="w-5 h-5 text-amber-400" />
+                            <span>Colocação de Responsáveis & Rateio ({editFaltaCrew.length})</span>
+                          </span>
+                          <p className="text-xs text-slate-400 font-sans mt-0.5">
+                            Defina os colaboradores responsáveis da rota para cálculo do rateio e emissão dos comprovantes
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {[1, 2, 3, 4].map(num => (
+                            <button
+                              key={`ef_q_${num}`}
+                              type="button"
+                              onClick={() => handleSetEditFaltaCrewQuantity(num)}
+                              className={`px-3.5 py-2 rounded-xl text-xs sm:text-sm font-mono font-bold transition-all cursor-pointer ${
+                                editFaltaCrew.length === num
+                                  ? "bg-amber-500 text-slate-950 shadow-lg ring-2 ring-amber-400 scale-105 font-black"
+                                  : "bg-slate-900 hover:bg-slate-850 text-slate-300 border border-slate-750"
+                              }`}
+                            >
+                              {num} {num === 1 ? "Colaborador" : "Colaboradores"}
+                            </button>
+                          ))}
+                          <button
+                            type="button"
+                            onClick={() => handleSetEditFaltaCrewQuantity(editFaltaCrew.length + 1)}
+                            className="px-3 py-2 bg-slate-900 hover:bg-slate-850 text-amber-400 hover:text-amber-300 border border-dashed border-amber-500/60 rounded-xl text-xs sm:text-sm font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-colors shadow-sm"
+                            title="Adicionar mais um colaborador"
+                          >
+                            <Plus className="w-4 h-4" />
+                            <span>+1</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* LIVE RATEIO PREVIEW BANNER */}
+                      {(() => {
+                        const lackTotalValue = getRequestValue(editingFalta, promaxRecords);
+                        const rateio = calculateValeRateio(
+                          lackTotalValue,
+                          null,
+                          null,
+                          null,
+                          null,
+                          null,
+                          null,
+                          null,
+                          editFaltaCrew
+                        );
+                        const payingCount = rateio.crew.filter(c => !c.isExempt).length;
+
+                        return (
+                          <div className={`p-4 rounded-2xl border-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm font-mono shadow-lg ${
+                            rateio.isDriverX 
+                              ? "bg-purple-950/40 border-purple-800 text-purple-200" 
+                              : "bg-slate-900 border-slate-750 text-slate-200"
+                          }`}>
+                            <div className="space-y-1 text-left">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                <span className="font-extrabold uppercase text-amber-400 text-sm sm:text-base">
+                                  Total a Ratear: {formatCurrency(lackTotalValue)}
+                                </span>
+                                <span className="text-xs text-slate-400 font-sans">
+                                  ({rateio.count} envolvido(s) • {payingCount} pagante(s))
+                                </span>
+                              </div>
+                              <p className="text-xs text-slate-300 font-sans">
+                                {rateio.isDriverX
+                                  ? `⭐ Regra Motorista X: Motorista Isento. R$ ${formatCurrency(rateio.individualValue)} para cada ajudante pagante.`
+                                  : `Divisão igualitária de ${formatCurrency(rateio.individualValue)} por colaborador pagante.`}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              {rateio.crew.map((member, mIdx) => (
+                                <span 
+                                  key={`ef_rateio_${mIdx}`} 
+                                  className={`px-3 py-1.5 rounded-xl text-xs font-mono border-2 ${
+                                    member.isExempt 
+                                      ? "bg-purple-900/60 border-purple-700 text-purple-300 italic font-bold" 
+                                      : "bg-rose-950/80 border-rose-800 text-rose-300 font-black"
+                                  }`}
+                                >
+                                  {member.role}: {formatCurrency(member.value)}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      {/* MAXIMIZED CREW MEMBERS LIST - SPACIOUS, LARGE INPUTS */}
+                      <div className="space-y-4">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-xs text-slate-400 font-mono">
+                          <span className="font-extrabold uppercase text-slate-200 text-xs sm:text-sm flex items-center gap-1.5">
+                            <Users className="w-4 h-4 text-amber-400" />
+                            <span>Campos de Preenchimento dos Responsáveis ({editFaltaCrew.length}):</span>
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            Selecione da base oficial Pau Brasil ou digite para atualizar nome e CPF
+                          </span>
+                        </div>
+
+                        {editFaltaCrew.map((member, index) => {
+                          const isDriver = member.role.toLowerCase().includes("motorista");
+                          const isX = isDriverX(member.name) || !!member.isExempt;
+                          const lackTotalValue = getRequestValue(editingFalta, promaxRecords);
+                          const rateio = calculateValeRateio(lackTotalValue, null, null, null, null, null, null, null, editFaltaCrew);
+                          const memberRateioInfo = rateio.crew[index];
+
+                          return (
+                            <div 
+                              key={member.id || `ef_crew_card_${index}`}
+                              className={`p-5 sm:p-6 rounded-3xl border-2 space-y-4 transition-all shadow-xl ${
+                                isX 
+                                  ? "bg-purple-955/30 border-purple-700/80 shadow-purple-950/20" 
+                                  : isDriver 
+                                    ? "bg-slate-950/95 border-amber-500/60 shadow-amber-950/20" 
+                                    : "bg-slate-950/95 border-slate-700 shadow-slate-950/40"
+                              }`}
+                            >
+                              {/* Card Top Row: Index Badge, Role, Quick Select from Database, Exemption checkbox, Delete */}
+                              <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-800">
+                                <div className="flex items-center gap-2.5 flex-wrap flex-1 min-w-[260px]">
+                                  <span className="font-mono font-black text-amber-300 text-xs sm:text-sm px-3 py-1.5 bg-amber-500/15 border border-amber-500/40 rounded-xl flex items-center gap-1">
+                                    <span>#{index + 1}</span>
+                                  </span>
+                                  
+                                  {/* Role Selector */}
+                                  <select
+                                    value={member.role}
+                                    onChange={(e) => handleUpdateEditFaltaCrewMember(index, "role", e.target.value)}
+                                    className="bg-slate-900 border-2 border-slate-700 hover:border-slate-600 text-white font-mono font-bold text-xs sm:text-sm rounded-xl px-3 h-11 focus:border-amber-500 focus:outline-none cursor-pointer transition-colors shadow-sm"
+                                  >
+                                    <option value="Motorista">🚚 Motorista</option>
+                                    <option value="Ajudante 1">👥 Ajudante 1</option>
+                                    <option value="Ajudante 2">👥 Ajudante 2</option>
+                                    <option value="Ajudante 3">👥 Ajudante 3</option>
+                                    <option value="Ajudante 4">👥 Ajudante 4</option>
+                                    <option value="Ajudante">👥 Ajudante</option>
+                                    <option value="Auxiliar">🤝 Auxiliar</option>
+                                  </select>
+
+                                  {/* Quick select from Pau Brasil team */}
+                                  <div className="flex-1 min-w-[260px] sm:min-w-[320px]">
+                                    <select
+                                      value=""
+                                      onChange={(e) => {
+                                        const val = e.target.value;
+                                        if (!val) return;
+                                        handleUpdateEditFaltaCrewMember(index, "name", val);
+                                      }}
+                                      className="w-full bg-slate-900 border-2 border-indigo-800/80 hover:border-indigo-500 text-indigo-200 font-bold rounded-xl px-3.5 h-11 text-xs sm:text-sm font-mono focus:border-indigo-400 focus:outline-none cursor-pointer transition-colors shadow-sm"
+                                    >
+                                      <option value="">🔍 Buscar na Base de Colaboradores Pau Brasil...</option>
+                                      <optgroup label="🚚 Motoristas de Distribuição">
+                                        {DEFAULT_LISTA_CREW.filter(c => c.cargo.includes("MOTORISTA")).map((m, mIdx) => (
+                                          <option key={`ef_m_${m.cpf || m.nome}_${mIdx}`} value={m.nome}>{m.nome} ({m.cargo})</option>
+                                        ))}
+                                      </optgroup>
+                                      <optgroup label="👥 Ajudantes de Distribuição">
+                                        {DEFAULT_LISTA_CREW.filter(c => c.cargo.includes("AJUDANTE")).map((a, aIdx) => (
+                                          <option key={`ef_a_${a.cpf || a.nome}_${aIdx}`} value={a.nome}>{a.nome} ({a.cargo})</option>
+                                        ))}
+                                      </optgroup>
+                                    </select>
+                                  </div>
+                                </div>
+
+                                <div className="flex items-center gap-3 flex-wrap">
+                                  {memberRateioInfo && (
+                                    <span className={`px-3 py-1.5 rounded-xl text-xs sm:text-sm font-mono font-black border-2 ${
+                                      memberRateioInfo.isExempt
+                                        ? "bg-purple-900/60 border-purple-700 text-purple-300 italic"
+                                        : "bg-rose-950/80 border-rose-800 text-rose-300"
+                                    }`}>
+                                      {memberRateioInfo.isExempt ? "⭐ Isento de Cobrança" : `Rateio: ${formatCurrency(memberRateioInfo.value)}`}
+                                    </span>
+                                  )}
+
+                                  <label className="flex items-center gap-2 text-xs sm:text-sm font-mono text-slate-300 cursor-pointer select-none bg-slate-900 px-3.5 py-2 rounded-xl border border-slate-700 hover:border-purple-500 transition-colors">
+                                    <input
+                                      type="checkbox"
+                                      checked={!!member.isExempt}
+                                      onChange={(e) => handleUpdateEditFaltaCrewMember(index, "isExempt", e.target.checked)}
+                                      className="rounded border-slate-700 text-purple-600 focus:ring-purple-500 cursor-pointer w-4 h-4"
+                                    />
+                                    <span className={member.isExempt ? "text-purple-300 font-extrabold" : "text-slate-400"}>Regra Motorista X</span>
+                                  </label>
+
+                                  {editFaltaCrew.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setEditFaltaCrew(prev => prev.filter((_, i) => i !== index));
+                                      }}
+                                      className="p-2 text-slate-400 hover:text-rose-400 hover:bg-rose-950/60 rounded-xl transition-colors cursor-pointer border border-slate-800 hover:border-rose-800"
+                                      title="Remover este colaborador"
+                                    >
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Card Main Row: Large Name Input & Large CPF Input with clear, prominent labels */}
+                              <div className="grid grid-cols-1 md:grid-cols-12 gap-4 pt-1">
+                                {/* Name input (takes 8 cols on md+) */}
+                                <div className="md:col-span-8 space-y-1.5 text-left">
+                                  <label className="text-xs sm:text-sm font-extrabold text-slate-300 uppercase font-mono flex items-center gap-1.5">
+                                    <User className="w-4 h-4 text-amber-400" />
+                                    <span>Nome Completo do Colaborador (Responsável):</span>
+                                  </label>
+                                  <input
+                                    type="text"
+                                    placeholder="DIGITE O NOME COMPLETO DO MOTORISTA OU AJUDANTE"
+                                    value={member.name}
+                                    onChange={(e) => handleUpdateEditFaltaCrewMember(index, "name", e.target.value)}
+                                    className="w-full bg-slate-900 border-2 border-slate-700 focus:border-amber-400 text-white uppercase font-sans font-black rounded-2xl px-4 h-12 text-sm sm:text-base focus:outline-none transition-all shadow-inner placeholder:text-slate-600 placeholder:font-normal"
+                                  />
+                                </div>
+
+                                {/* CPF input (takes 4 cols on md+) */}
+                                <div className="md:col-span-4 space-y-1.5 text-left">
+                                  <label className="text-xs sm:text-sm font-extrabold text-slate-300 uppercase font-mono flex items-center gap-1.5">
+                                    <FileText className="w-4 h-4 text-amber-400" />
+                                    <span>CPF do Colaborador:</span>
+                                  </label>
+                                  <input
+                                    type="text"
+                                    placeholder="000.000.000-00"
+                                    value={member.cpf}
+                                    onChange={(e) => handleUpdateEditFaltaCrewMember(index, "cpf", e.target.value)}
+                                    className="w-full bg-slate-900 border-2 border-slate-700 focus:border-amber-400 text-amber-300 font-mono font-black rounded-2xl px-4 h-12 text-sm sm:text-base focus:outline-none transition-all shadow-inner placeholder:text-slate-600 placeholder:font-normal"
+                                  />
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {/* Large Action to Add Another Member */}
+                        <button
+                          type="button"
+                          onClick={() => handleSetEditFaltaCrewQuantity(editFaltaCrew.length + 1)}
+                          className="w-full py-3.5 bg-slate-900 hover:bg-slate-850 text-amber-400 hover:text-amber-300 border-2 border-dashed border-amber-500/40 hover:border-amber-400 rounded-2xl text-xs sm:text-sm font-mono font-bold flex items-center justify-center gap-2 cursor-pointer transition-all shadow-sm"
+                        >
+                          <Plus className="w-5 h-5" />
+                          <span>Adicionar Outro Colaborador à Equipe</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Fixed Footer */}
+              <div className="p-4 sm:p-5 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3 shrink-0 bg-slate-900 rounded-b-3xl">
+                <button
+                  type="button"
+                  onClick={() => setEditingFalta(null)}
+                  className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs sm:text-sm font-bold text-slate-300 cursor-pointer transition-colors"
+                >
+                  Cancelar
+                </button>
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => handleSaveFaltaDetails(false)}
+                    className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs sm:text-sm font-bold cursor-pointer transition-colors shadow-lg"
+                  >
+                    Salvar Informações
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSaveFaltaDetails(true)}
+                    className="px-5 py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black rounded-xl text-xs sm:text-sm font-mono flex items-center gap-2 cursor-pointer shadow-xl transition-all"
+                    title="Salvar alterações e abrir o Vale Oficial com o rateio para conferência e assinatura"
+                  >
+                    <Signature className="w-4 h-4" />
+                    <span>Salvar e Emitir Vale</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* DOCUMENT PRINT PREVIEW AND CONTROLS MODAL */}
+      {selectedPrintDoc && (() => {
+        const req = selectedPrintDoc.request;
+        const cast = req as any;
+        const isVale = selectedPrintDoc.type === "vale";
+
+        const parseProductString = (str: string | undefined, defaultQty: number) => {
+          if (!str) return { code: "INVERSÃO", name: "Produto Não Especificado", qty: defaultQty };
+          
+          let qty = defaultQty;
+          const qtyMatch = str.match(/\(Qtd:\s*(\d+)/i);
+          if (qtyMatch) {
+            qty = parseInt(qtyMatch[1], 10);
+          }
+
+          const cleanStr = str.replace(/\(Qtd:[^)]+\)/i, "").trim();
+
+          let code = "INVERSÃO";
+          let name = "";
+
+          const match = cleanStr.match(/^#?(\d+)\s*[-:]?\s*(.*)$/);
+          if (match) {
+            code = match[1];
+            name = match[2] ? match[2].trim() : "";
+          } else if (/^\d+$/.test(cleanStr)) {
+            code = cleanStr;
+            name = "";
+          } else {
+            name = cleanStr;
+          }
+
+          if (name.startsWith("-")) {
+            name = name.substring(1).trim();
+          }
+
+          // Lookup in PRODUCT_DATABASE if name is empty, generic, dash, or equal to code
+          const dbP = PRODUCT_DATABASE.find(p => p.codigo === code || p.codigo === code.replace(/^0+/, ""));
+          if (dbP) {
+            if (!name || name === code || name.toUpperCase() === "INVERSÃO" || name === "-" || name.toUpperCase() === "SKU COMPENSADO DE INVERSÃO") {
+              name = dbP.descricao;
+            }
+          }
+
+          if (!name) {
+            name = "PRODUTO SSTR";
+          }
+
+          return { code, name, qty };
+        };
+        
+        // Calculate items and pricing specifically for printable sheets
+        const printableItems = req.items && req.items.length > 0 ? req.items : [
+          {
+            id: "1",
+            item: req.item || "SKU_GENERIC",
+            descricao: "PRODUTO EM COMPENSAÇÃO SSTR",
+            quantidade: req.quantidade || 1,
+            hectolitros: req.hectolitros || 0.1200,
+            motivo: req.motivo || "Falta de SKU"
+          } as RequestItem
+        ];
+
+        const totalPricingValue = getRequestValue(req, promaxRecords);
+
+        // Helper to retrieve split information for logistics team vouchers (vales)
+        const getValeSplitInfo = () => {
+          if (printValeCrew && printValeCrew.length > 0) {
+            return calculateValeRateio(
+              totalPricingValue,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              printValeCrew
+            );
+          }
+
+          const driverName = cast.faltaMotorista || "Motorista";
+          const driverCpf = cast.faltaMotoristaCpf || "";
+          
+          let h1Name = cast.faltaAjudante1 || "";
+          let h1Cpf = cast.faltaAjudante1Cpf || "";
+          let h2Name = cast.faltaAjudante2 || "";
+          let h2Cpf = cast.faltaAjudante2Cpf || "";
+
+          // Fallback if structured helper fields are empty but CSV helper string exists
+          if (!h1Name && cast.faltaAjudantes && cast.faltaAjudantes.trim().length > 0 && cast.faltaAjudantes.toUpperCase() !== "NÃO DECLARADOS") {
+            const parts = cast.faltaAjudantes.split(",").map((s: string) => s.trim());
+            if (parts[0]) h1Name = parts[0];
+            if (parts[1]) h2Name = parts[1];
+          }
+
+          return calculateValeRateio(
+            totalPricingValue,
+            driverName,
+            driverCpf,
+            h1Name,
+            h1Cpf,
+            h2Name,
+            h2Cpf
+          );
+        };
+
+        return (
+          <div className="fixed inset-0 z-50 bg-black/90 flex flex-col items-center justify-start overflow-y-auto p-4 md:p-8 animate-fade-in no-print">
+            
+            {/* Modal actions toolbar header */}
+            <div className="w-full max-w-3xl bg-slate-900 border border-slate-800 rounded-2xl p-4 flex items-center justify-between shadow-2xl mb-4 text-left">
+              <div className="flex items-center gap-2">
+                <Printer className="w-5 h-5 text-indigo-400" />
+                <div>
+                  <h3 className="font-bold text-white text-xs uppercase font-mono">Dispositivo de Impressão Direta</h3>
+                  <p className="text-[10px] text-slate-400">
+                    Apenas o cupom central sairá no papel. <strong className="text-amber-400">Aviso:</strong> Se o gerenciador do navegador não abrir na visualização incorporada, abra este app em uma <strong className="text-indigo-300 font-mono">Nova Guia</strong> (ícone no topo direito) para imprimir perfeitamente.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={handleSavePrintDocEdits}
+                  className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-extrabold cursor-pointer flex items-center gap-1.5 shadow"
+                  title="Salvar edições de peças, unidade, motorista, ajudantes e rateio no banco de dados"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-200" />
+                  <span>Salvar Alterações</span>
+                </button>
+                <button
+                  onClick={() => setSelectedPrintDoc(null)}
+                  className="px-4 py-1.5 bg-slate-950 hover:bg-slate-850 border border-slate-850 text-slate-400 hover:text-white rounded-xl text-xs font-bold cursor-pointer"
+                >
+                  Voltar ao Controle
+                </button>
+                <button
+                  onClick={() => handleLogAndPrint(selectedPrintDoc.request, selectedPrintDoc.type)}
+                  className="px-5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-extrabold flex items-center gap-1.5 cursor-pointer shadow-lg"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  <span>Imprimir Agora</span>
+                </button>
+              </div>
+            </div>
+
+            {/* INTERACTIVE CONTROLS FOR VALE CREW AND RATEIO (HIDDEN DURING PHYSICAL PRINT) */}
+            {isVale && (
+              <div className="w-full max-w-2xl bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-5 mb-5 shadow-2xl text-left no-print space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="p-2 bg-amber-500/20 border border-amber-500/40 rounded-xl text-amber-400">
+                      <Users className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="font-extrabold text-sm text-white font-mono uppercase tracking-wide flex items-center gap-2">
+                        <span>Equipe & Rateio do Vale</span>
+                        <span className="px-2 py-0.5 bg-amber-500/10 border border-amber-500/30 text-amber-400 text-[10px] rounded-full font-sans font-bold">
+                          Configuração Interativa
+                        </span>
+                      </h3>
+                      <p className="text-[11px] text-slate-400 mt-0.5 font-sans">
+                        Selecione a quantidade de colaboradores e defina motoristas e ajudantes responsáveis para gerar automaticamente o rateio e os campos de assinatura na folha.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* QUANTITY OF COLLABORATORS SELECTOR */}
+                <div className="bg-slate-950 p-3.5 sm:p-4 rounded-xl border border-slate-800 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                    <div>
+                      <span className="text-xs font-bold text-slate-200 uppercase font-mono flex items-center gap-1.5">
+                        <Users className="w-3.5 h-3.5 text-amber-400" />
+                        Quantidade de Colaboradores Envolvidos:
+                      </span>
+                      <p className="text-[10px] text-slate-400 font-sans mt-0.5">
+                        Dividir entre condutor e equipe da rota para emissão do termo de débito.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {[1, 2, 3, 4].map(num => (
+                        <button
+                          key={num}
+                          type="button"
+                          onClick={() => handleSetPrintValeCrewQuantity(num)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
+                            printValeCrew.length === num
+                              ? "bg-amber-500 text-slate-950 shadow-md ring-2 ring-amber-400 scale-105 font-black"
+                              : "bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800"
+                          }`}
+                        >
+                          {num} {num === 1 ? "Colaborador" : "Colaboradores"}
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={handleAddPrintValeCrewMember}
+                        className="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-amber-400 hover:text-amber-300 border border-dashed border-amber-500/50 rounded-lg text-xs font-mono font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                        title="Adicionar mais um colaborador"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>+1</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* LIVE RATEIO SUMMARY BANNER */}
+                  {(() => {
+                    const itemsToRender = printDocItems.length > 0 ? printDocItems : printableItems;
+                    const currentDocTotalVal = itemsToRender.reduce((sum, sub) => {
+                      const itemCode = sub.item || sub.itemCode || "";
+                      const itemQty = Number(sub.quantidade) || 0;
+                      const dbProduct = PRODUCT_DATABASE.find(p => p.codigo === itemCode || p.codigo === itemCode.replace(/^0+/, ""));
+                      const embalagem = dbProduct?.fator && dbProduct.fator > 0 ? dbProduct.fator : (sub.fatorEmbalagem || 12);
+                      const umStr = (sub.unidadeMedida || sub.um || "sku").toLowerCase().trim();
+                      const isUnd = umStr === "und" || umStr === "un" || umStr === "unidade" || umStr === "unidades";
+                      let boxPrice = dbProduct?.valor || 0;
+                      if (!boxPrice || boxPrice <= 0) {
+                        const promaxMatch = promaxRecords.find(r => r.produto === itemCode);
+                        if (promaxMatch?.valorUnitario && promaxMatch.valorUnitario > 0) {
+                          boxPrice = promaxMatch.valorUnitario < 15 ? (promaxMatch.valorUnitario * embalagem) : promaxMatch.valorUnitario;
+                        }
+                      }
+                      if (!boxPrice || boxPrice <= 0) boxPrice = 98.50;
+                      let unitPrice = 0;
+                      if (sub.customUnitPrice && Number(sub.customUnitPrice) > 0) {
+                        const cu = Number(sub.customUnitPrice);
+                        unitPrice = isUnd ? (cu > 15 ? cu / embalagem : cu) : (cu < 15 ? cu * embalagem : cu);
+                      } else {
+                        unitPrice = isUnd ? (boxPrice / embalagem) : boxPrice;
+                      }
+                      return sum + (itemQty * unitPrice);
+                    }, 0);
+
+                    const rateio = calculateValeRateio(currentDocTotalVal, null, null, null, null, null, null, null, printValeCrew.length > 0 ? printValeCrew : null);
+                    const payingCount = rateio.crew.filter(c => !c.isExempt).length;
+
+                    return (
+                      <div className={`p-3 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs font-mono ${
+                        rateio.isDriverX ? "bg-purple-950/40 border-purple-800/70 text-purple-200" : "bg-slate-900 border-slate-800 text-slate-200"
+                      }`}>
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold uppercase text-amber-400">Total a Ratear: {formatCurrency(currentDocTotalVal)}</span>
+                            <span className="text-[10px] text-slate-400 font-sans">({rateio.count} envolvido(s) • {payingCount} pagante(s))</span>
+                          </div>
+                          <p className="text-[11px] text-slate-300">
+                            {rateio.isDriverX
+                              ? `⭐ Regra Motorista X: Motorista Isento. R$ ${formatCurrency(rateio.individualValue)} para cada ajudante.`
+                              : `Divisão igualitária de ${formatCurrency(rateio.individualValue)} por colaborador pagante.`}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {rateio.crew.map((member, mIdx) => (
+                            <span 
+                              key={mIdx} 
+                              className={`px-2 py-1 rounded-lg text-[10px] border ${
+                                member.isExempt 
+                                  ? "bg-purple-900/60 border-purple-700 text-purple-300 italic" 
+                                  : "bg-rose-950/60 border-rose-800/80 text-rose-300 font-bold"
+                              }`}
+                            >
+                              {member.role}: {formatCurrency(member.value)}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* COLLABORATORS LIST AND ROLES */}
+                <div className="space-y-2.5">
+                  <div className="flex justify-between items-center text-[11px] text-slate-400 font-mono">
+                    <span className="font-bold uppercase text-slate-300">Responsáveis Envolvidos ({printValeCrew.length}):</span>
+                    <span>Selecione da base ou digite para atualizar nome e CPF</span>
+                  </div>
+
+                  {printValeCrew.map((member, index) => {
+                    const isDriver = member.role.toLowerCase().includes("motorista");
+                    const isX = isDriverX(member.name) || !!member.isExempt;
+
+                    return (
+                      <div 
+                        key={member.id || index}
+                        className={`p-3 rounded-xl border text-xs space-y-2 transition-all ${
+                          isX 
+                            ? "bg-purple-950/20 border-purple-800/60" 
+                            : isDriver 
+                              ? "bg-slate-950 border-amber-900/50" 
+                              : "bg-slate-950 border-slate-800"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-bold text-amber-400 text-xs">
+                              #{index + 1}
+                            </span>
+                            <select
+                              value={member.role}
+                              onChange={(e) => handleUpdatePrintValeCrewMember(index, "role", e.target.value)}
+                              className="bg-slate-900 border border-slate-750 text-white font-mono font-bold text-xs rounded-lg px-2 py-1 focus:border-amber-500 focus:outline-none cursor-pointer"
+                            >
+                              <option value="Motorista">🚚 Motorista</option>
+                              <option value="Ajudante 1">👥 Ajudante 1</option>
+                              <option value="Ajudante 2">👥 Ajudante 2</option>
+                              <option value="Ajudante 3">👥 Ajudante 3</option>
+                              <option value="Ajudante 4">👥 Ajudante 4</option>
+                              <option value="Ajudante">👥 Ajudante</option>
+                              <option value="Auxiliar">🤝 Auxiliar</option>
+                            </select>
+                            {isX && (
+                              <span className="px-2 py-0.5 bg-purple-900/80 border border-purple-700 text-purple-200 text-[9.5px] font-bold rounded font-mono">
+                                ISENTO DE COBRANÇA
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <label className="flex items-center gap-1.5 text-[10.5px] font-mono text-slate-400 cursor-pointer select-none">
+                              <input
+                                type="checkbox"
+                                checked={!!member.isExempt}
+                                onChange={(e) => handleUpdatePrintValeCrewMember(index, "isExempt", e.target.checked)}
+                                className="rounded border-slate-700 text-purple-600 focus:ring-purple-500 cursor-pointer"
+                              />
+                              <span className={member.isExempt ? "text-purple-300 font-bold" : ""}>Isento (Regra Motorista X)</span>
+                            </label>
+                            {printValeCrew.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => handleRemovePrintValeCrewMember(index)}
+                                className="p-1 text-slate-500 hover:text-rose-400 hover:bg-rose-950/40 rounded transition-colors cursor-pointer"
+                                title="Remover este colaborador"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center">
+                          {/* Quick Select from Crew database */}
+                          <div className="sm:col-span-4">
+                            <select
+                              value=""
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                if (!val) return;
+                                handleUpdatePrintValeCrewMember(index, "name", val);
+                              }}
+                              className="w-full bg-slate-900 border border-slate-750 text-slate-300 rounded-lg px-2 py-1.5 text-xs font-mono focus:border-amber-500 focus:outline-none cursor-pointer"
+                            >
+                              <option value="">-- Selecionar da Equipe Pau Brasil --</option>
+                              <optgroup label="🚚 Motoristas de Distribuição">
+                                {DEFAULT_LISTA_CREW.filter(c => c.cargo.includes("MOTORISTA")).map((m, mIdx) => (
+                                  <option key={`${m.cpf}_${mIdx}`} value={m.nome}>{m.nome}</option>
+                                ))}
+                              </optgroup>
+                              <optgroup label="👥 Ajudantes de Distribuição">
+                                {DEFAULT_LISTA_CREW.filter(c => c.cargo.includes("AJUDANTE")).map((a, aIdx) => (
+                                  <option key={`${a.cpf}_${aIdx}`} value={a.nome}>{a.nome}</option>
+                                ))}
+                              </optgroup>
+                            </select>
+                          </div>
+
+                          {/* Name input */}
+                          <div className="sm:col-span-5">
+                            <input
+                              type="text"
+                              placeholder="NOME COMPLETO DO COLABORADOR"
+                              value={member.name}
+                              onChange={(e) => handleUpdatePrintValeCrewMember(index, "name", e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-750 text-white uppercase font-sans font-bold rounded-lg px-2.5 py-1 text-xs focus:border-amber-500 focus:outline-none"
+                            />
+                          </div>
+
+                          {/* CPF input */}
+                          <div className="sm:col-span-3">
+                            <input
+                              type="text"
+                              placeholder="CPF (000.000.000-00)"
+                              value={member.cpf}
+                              onChange={(e) => handleUpdatePrintValeCrewMember(index, "cpf", e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-750 text-slate-300 font-mono rounded-lg px-2.5 py-1 text-xs focus:border-amber-500 focus:outline-none"
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* HIGH-FIDELITY PRINT SHEET ROOT TEMPLATE */}
+            {/* The class 'print-document-content' combined with the dynamic stylesheet inside hides the rest during physical print */}
+            <div 
+              id="printable-document-root" 
+              className="w-full max-w-2xl bg-white text-black p-8 md:p-10 border border-slate-300 rounded-xl shadow-2xl text-left font-sans text-sm relative leading-relaxed"
+            >
+              
+              {/* PRINT ONLY STYLE INJECTOR - Ensures robust clean framing */}
+              <style dangerouslySetInnerHTML={{__html: `
+                @media print {
+                  @page {
+                    size: A4 portrait;
+                    margin: 8mm 8mm 8mm 8mm !important;
+                  }
+                  body * {
+                    visibility: hidden !important;
+                    background: transparent !important;
+                  }
+                  #printable-document-root, #printable-document-root * {
+                    visibility: visible !important;
+                    color: black !important;
+                  }
+                  #printable-document-root {
+                    position: absolute !important;
+                    left: 0 !important;
+                    top: 0 !important;
+                    width: 100% !important;
+                    border: none !important;
+                    box-shadow: none !important;
+                    padding: 0px 5px !important;
+                    margin: 0px !important;
+                    font-size: 10px !important;
+                    line-height: 1.25 !important;
+                  }
+                  #printable-document-root h1 {
+                    font-size: 13px !important;
+                    margin: 2px 0 !important;
+                  }
+                  #printable-document-root h2 {
+                    font-size: 14px !important;
+                  }
+                  #printable-document-root p, #printable-document-root td, #printable-document-root th, #printable-document-root div {
+                    font-size: 10px !important;
+                    line-height: 1.25 !important;
+                  }
+                  #printable-document-root .my-6, #printable-document-root .my-4 {
+                    margin-top: 4px !important;
+                    margin-bottom: 4px !important;
+                  }
+                  #printable-document-root .p-4, #printable-document-root .p-8, #printable-document-root .p-10 {
+                    padding: 6px 10px !important;
+                  }
+                  #printable-document-root .py-3 {
+                    padding-top: 3px !important;
+                    padding-bottom: 3px !important;
+                  }
+                  #printable-document-root .mb-6 {
+                    margin-bottom: 6px !important;
+                  }
+                  #printable-document-root .mb-10 {
+                    margin-bottom: 6px !important;
+                  }
+                  #printable-document-root .mt-12 {
+                    margin-top: 8px !important;
+                  }
+                  #printable-document-root .pt-8 {
+                    padding-top: 4px !important;
+                  }
+                  #printable-document-root .space-y-10 > :not([hidden]) ~ :not([hidden]) {
+                    margin-top: 10px !important;
+                  }
+                  #printable-document-root .space-y-6 > :not([hidden]) ~ :not([hidden]) {
+                    margin-top: 6px !important;
+                  }
+                  #printable-document-root .space-y-4 > :not([hidden]) ~ :not([hidden]) {
+                    margin-top: 4px !important;
+                  }
+                  #printable-document-root .pb-4 {
+                    padding-bottom: 4px !important;
+                  }
+                  #printable-document-root table td, #printable-document-root table th {
+                    padding: 4px 6px !important;
+                  }
+                  .no-print {
+                    display: none !important;
+                  }
+                  .no-print-border {
+                    border: none !important;
+                    background: transparent !important;
+                    padding: 0 !important;
+                    margin: 0 !important;
+                    outline: none !important;
+                    box-shadow: none !important;
+                    width: auto !important;
+                  }
+                }
+              `}} />
+
+              {/* TIMBRE HEADER AMBEV & REVENDEDOR AUTORIZADO PAU BRASIL */}
+              <div className="border-b-2 border-black pb-4 text-center">
+                <div className="flex justify-between items-center mb-2">
+                  <div className="text-left">
+                    <span className="text-[10px] uppercase tracking-widest font-bold text-slate-500 font-mono">REVENDA AMBEV REGISTRADA</span>
+                    <h2 className="text-lg font-black tracking-tighter uppercase text-slate-900 leading-none">PAU BRASIL DISTRIBUIDORA DE BEBIDAS LTDA</h2>
+                    <p className="text-[9.5px] font-mono mt-1 text-slate-600">
+                      Ramo de Bebidas e Logística | CNPJ: <strong className="text-black">53.935.732/0001-30</strong>
+                    </p>
+                    <p className="text-[9px] font-mono leading-none mt-0.5 text-slate-500">
+                      Rodovia PB-073, Km 02, S/N - Distrito Industrial, Guarabira - PB | CEP: 58.200-000
+                    </p>
+                  </div>
+
+                  {/* Dynamic NB & Setor card instead of old Dist ambev badge */}
+                  <div className="border-2 border-black p-2 rounded text-left shrink-0 font-mono bg-slate-50 min-w-[125px]">
+                    <span className="block leading-none text-[8.5px] font-extrabold text-slate-500 uppercase tracking-wider mb-1">REGISTRO SSTR</span>
+                    <span className="block text-xs font-black text-black">NB: <strong className="font-mono">{req.nb}</strong></span>
+                    <span className="block text-[11px] text-slate-700">SETOR: <strong className="font-mono text-black">{req.setor}</strong></span>
+                  </div>
+                </div>
+              </div>
+
+              {/* TITLE OF DOCUMENT */}
+              <div className="my-5 text-center space-y-1 bg-slate-100 py-3 rounded border border-slate-300">
+                {isVale ? (
+                  <>
+                    <h1 className="text-md font-extrabold uppercase tracking-wide">AUTO DE COBRANÇA REPOSIÇÃO - VALE EQUIPE LOGÍSTICA</h1>
+                    <p className="text-[10px] uppercase font-bold text-rose-600">ERRO DE ENTREGADOR / DESCARGA NA ROTA (CUSTÓDIA E AVARIA)</p>
+                  </>
+                ) : (
+                  <>
+                    <h1 className="text-md font-extrabold uppercase tracking-wide">RECIBO DE COMPROVAÇÃO DE ENTREGA DE PRODUTO (PDV)</h1>
+                    <p className="text-[10px] uppercase font-bold text-blue-700">CONTROLE DE COMPENSAÇÃO FÍSICA SSTR - PAU BRASIL DISTRIBUIDORA AMBEV</p>
+                  </>
+                )}
+              </div>
+
+              {/* CONTINGENCY ALERT BANNER FOR RECIBO PDV */}
+              {!isVale && !isFaltaSkuCompletoReq(req) && (
+                <div className="my-3 p-3 border-2 border-amber-600 bg-amber-50 rounded text-center font-sans">
+                  <span className="block text-xs font-extrabold uppercase text-amber-900 tracking-wider">
+                    ⚠️ RECIBO GERADO EM CONTINGÊNCIA - SSTR AMBEV
+                  </span>
+                  <p className="text-[10px] font-bold text-amber-800 mt-0.5">
+                    Comprovante impresso em contingência para acerto/conferência física no PDV. Tipo de Processo:{" "}
+                    <strong className="uppercase font-mono text-black">
+                      {isReposicaoReq(req) ? "REPOSIÇÃO (FALTA DE PRODUTO)" : "TROCA / ANOMALIA COMERCIAL"}
+                    </strong>
+                  </p>
+                </div>
+              )}
+
+              {/* IS VALE DECLARATION TERM */}
+              {isVale && (
+                <div className="my-4 p-4 border border-rose-350 bg-rose-50 rounded text-[11px] leading-relaxed italic text-slate-700 text-left font-sans">
+                  <strong>DECLARAÇÃO DE DEBITAMENTO E RESPONSABILIDADO:</strong> "Pelo presente instrumento de acerto particular do Promax SSTR, nós, na qualidade de condutor/ajudante responsáveis pela rota de entrega descrita abaixo, assumimos a integral responsabilidade pela falta ou avaria física de mercadoria ocorrida na referida entrega ao cliente. Declaramos concordância em relação ao faturamento legal e posterior indenização operacional dos valores no fechamento de perdas logísticas."
+                </div>
+              )}
+
+              {/* METADATA BLOCK FOR DATES & CARGO CHASSIS */}
+              <div className="grid grid-cols-2 gap-x-6 gap-y-3 border border-gray-300 p-4 rounded bg-slate-50/50 mb-6 font-sans text-xs">
+                <div>
+                  <p className="text-slate-500 uppercase font-bold text-[9px] tracking-wide block">Data da Ocorrência (Anomalia):</p>
+                  <p className="font-bold text-slate-900">{cast.mapaDataAnomalia || req.data.split(" ")[0]}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500 uppercase font-bold text-[9px] tracking-wide block">Data da Efetiva Liquidação/Entrega:</p>
+                  <p className="font-bold text-slate-900">{cast.dataEntregaRecibo || new Date().toLocaleDateString("pt-BR")}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500 uppercase font-bold text-[9px] tracking-wide block">No. do Mapa de Carga (Rota):</p>
+                  <p className="font-bold font-mono text-slate-900 select-all">{req.mapa || "NÃO CONSTA"}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500 uppercase font-bold text-[9px] tracking-wide block">Nota Fiscal Originária / Série:</p>
+                  <p className="font-bold font-mono text-slate-900 select-all">{req.nf}</p>
+                </div>
+              </div>
+
+              {/* CUSTOMER PDV INFORMATION CONTAINER */}
+              {(() => {
+                const pdvDb = getPdvDatabase();
+                const clientInfo = getClientDetails(req.nb, pdvDb, promaxRecords);
+                const nbStr = (req.nb || "").trim();
+                const isFound = nbStr && (!!pdvDb[nbStr] || Object.keys(pdvDb).some(k => parseInt(k, 10) === parseInt(nbStr, 10)) || promaxRecords.some(r => (r.codigoCliente || "").trim() === nbStr));
+
+                return (
+                  <div className="border border-gray-300 p-4 rounded mb-6 text-xs text-left bg-slate-50">
+                    <span className="text-slate-500 uppercase font-bold text-[9.5px] block border-b border-gray-200 pb-1 mb-2 tracking-wider">Dados cadastrais do Ponto de Venda (PDV):</span>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 mb-2">
+                      <p className="font-bold text-slate-900 flex items-center gap-1">
+                        <span>Razão Social:</span>
+                        {!isFound ? (
+                          <input
+                            type="text"
+                            value={customPrintNome}
+                            onChange={(e) => handleUpdatePrintNome(e.target.value)}
+                            placeholder="DIGITE A RAZÃO SOCIAL"
+                            className="font-bold text-black uppercase bg-amber-50/30 hover:bg-amber-100/50 focus:bg-white border-b border-gray-300 hover:border-indigo-400 focus:border-indigo-600 focus:outline-none px-1 rounded text-xs leading-none transition-colors w-full max-w-[280px] no-print-border font-sans"
+                          />
+                        ) : (
+                          <span className="uppercase text-slate-800 font-medium">{customPrintNome || clientInfo.razaoSocial}</span>
+                        )}
+                      </p>
+                      <p className="font-bold text-slate-900 flex items-center gap-1">
+                        <span>Nome Fantasia:</span>
+                        {!isFound ? (
+                          <input
+                            type="text"
+                            value={customPrintFantasia}
+                            onChange={(e) => setCustomPrintFantasia(e.target.value)}
+                            placeholder="DIGITE O NOME FANTASIA"
+                            className="font-bold text-black uppercase bg-amber-50/30 hover:bg-amber-100/50 focus:bg-white border-b border-gray-300 hover:border-indigo-400 focus:border-indigo-600 focus:outline-none px-1 rounded text-xs leading-none transition-colors w-full max-w-[280px] no-print-border font-sans"
+                          />
+                        ) : (
+                          <span className="uppercase text-slate-800 font-medium">{customPrintFantasia || clientInfo.nomeFantasia || clientInfo.razaoSocial}</span>
+                        )}
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 mt-2 text-slate-600 pt-2 border-t border-dashed border-gray-200">
+                      <p>Código SSTR (NB): <strong className="text-black font-mono">{req.nb}</strong></p>
+                      <p className="flex items-center gap-1">
+                        <span>CPF/CNPJ:</span>
+                        {!isFound ? (
+                          <input
+                            type="text"
+                            value={customPrintDocumento}
+                            onChange={(e) => handleUpdatePrintDocumento(e.target.value)}
+                            placeholder="DIGITE O CNPJ/CPF"
+                            className="font-mono text-black uppercase bg-amber-50/30 hover:bg-amber-100/50 focus:bg-white border-b border-gray-300 hover:border-indigo-400 focus:border-indigo-600 focus:outline-none px-1 rounded text-xs leading-none transition-colors w-full max-w-[180px] no-print-border font-sans"
+                          />
+                        ) : (
+                          <strong className="text-black font-mono">{customPrintDocumento || clientInfo.documento || "NÃO CONSTA"}</strong>
+                        )}
+                      </p>
+                      
+                      <p className="col-span-2 flex items-center gap-1.5 flex-wrap">
+                        <span>Município:</span>
+                        <input
+                          type="text"
+                          value={customPrintCidade}
+                          onChange={(e) => handleUpdatePrintCidade(e.target.value)}
+                          placeholder="DIGITE A CIDADE MANUALMENTE"
+                          className="font-bold text-black uppercase bg-amber-50/30 hover:bg-amber-100/50 focus:bg-white border-b border-gray-300 hover:border-indigo-400 focus:border-indigo-600 focus:outline-none px-1 rounded text-xs leading-none transition-colors w-64 no-print-border font-sans"
+                        />
+                        {clientInfo.uf && <span> - <strong className="text-black uppercase">{clientInfo.uf}</strong></span>}
+                        {clientInfo.cep && <span> | CEP: <strong className="text-black font-mono">{clientInfo.cep}</strong></span>}
+                      </p>
+                      
+                      <p className="col-span-2 font-semibold text-slate-900 flex items-center gap-1.5 flex-wrap">
+                        <span>Endereço Completo:</span>
+                        {!isFound ? (
+                          <input
+                            type="text"
+                            value={customPrintEndereco}
+                            onChange={(e) => handleUpdatePrintEndereco(e.target.value)}
+                            placeholder="DIGITE O ENDEREÇO COMPLETO"
+                            className="font-bold text-black uppercase bg-amber-50/30 hover:bg-amber-100/50 focus:bg-white border-b border-gray-300 hover:border-indigo-400 focus:border-indigo-600 focus:outline-none px-1 rounded text-xs leading-none transition-colors flex-1 min-w-[300px] no-print-border font-sans"
+                          />
+                        ) : (
+                          <strong className="text-black uppercase font-bold">
+                            {[
+                              customPrintEndereco || clientInfo.endereco?.trim(),
+                              clientInfo.complemento?.trim(),
+                              clientInfo.bairro ? `BAIRRO: ${clientInfo.bairro.trim()}` : "",
+                              customPrintCidade ? `${customPrintCidade.trim()} - ${clientInfo.uf?.trim() || "PB"}` : "",
+                              clientInfo.cep ? `CEP: ${clientInfo.cep.trim()}` : ""
+                            ].filter(Boolean).join(", ")}
+                          </strong>
+                        )}
+                      </p>
+                      
+                      <p className="col-span-2">Setor de Atendimento: <strong className="text-black font-mono">{req.setor}</strong></p>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* PRODUCT LACK LISTING TABLE */}
+              <div className="mb-6">
+                <div className="flex justify-between items-center pb-1 mb-2">
+                  <span className="text-slate-500 uppercase font-bold text-[9.5px] tracking-wider">Produtos Associados à Reposição / Falta:</span>
+                  <span className="text-[10px] text-indigo-600 font-bold font-mono no-print">✏️ Edição Habilitada (Qtd, Unidade, Preço)</span>
+                </div>
+                <table className="w-full text-xs font-sans border-collapse border border-gray-300 text-left">
+                  <thead>
+                    <tr className="bg-slate-100 border-b border-gray-300">
+                      <th className="p-2.5 border-r border-gray-300">Código Item</th>
+                      <th className="p-2.5 border-r border-gray-300">Descrição Comercial do SKU</th>
+                      <th className="p-2.5 border-r border-gray-300 text-center">Quantidade / Unidade</th>
+                      <th className="p-2.5 border-r border-gray-300 text-center">Volume Hectolitros</th>
+                      {isVale && <th className="p-2.5 text-right">Preço Unit.</th>}
+                      {isVale && <th className="p-2.5 text-right">Total R$</th>}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      const itemsToRender = printDocItems.length > 0 ? printDocItems : printableItems;
+                      return itemsToRender.map((sub, index) => {
+                        const isSwap = !!sub.produtoAhEnviar || !!sub.produtoARecolher;
+                        const entregarInfo = isSwap ? parseProductString(sub.produtoAhEnviar, sub.quantidade) : null;
+                        const recolherInfo = isSwap ? parseProductString(sub.produtoARecolher, sub.quantidade) : null;
+                        
+                        const itemCode = entregarInfo ? entregarInfo.code : (sub.item || sub.itemCode || "SKU_GENERIC");
+                        const itemDesc = entregarInfo ? entregarInfo.name : (sub.descricao || sub.productDesc || "PRODUTO SSTR");
+                        const itemQty = Number(sub.quantidade) || 1;
+
+                        const cleanCode = String(itemCode).replace(/^#/, "").trim().replace(/^0+/, "");
+                        const numericCode = String(itemCode).replace(/[^0-9]/g, "");
+                        const dbProduct = PRODUCT_DATABASE.find(p => p.codigo === itemCode || p.codigo === cleanCode || (numericCode && (p.codigo === numericCode || p.codigo.replace(/^0+/, "") === numericCode)));
+                        const embalagem = dbProduct?.fator && dbProduct.fator > 0 ? dbProduct.fator : (sub.fatorEmbalagem || 12);
+
+                        const umStr = (sub.unidadeMedida || sub.um || "sku").toLowerCase().trim();
+                        const isUnd = umStr === "und" || umStr === "un" || umStr === "unidade" || umStr === "unidades";
+
+                        // Determine official box price
+                        let officialBoxPrice = dbProduct?.valor || 0;
+                        if (!officialBoxPrice || officialBoxPrice <= 0) {
+                          const promaxPrice = promaxRecords.find(r => r.produto === itemCode)?.valorUnitario || 0;
+                          if (promaxPrice > 0) {
+                            officialBoxPrice = promaxPrice < 15 ? (promaxPrice * embalagem) : promaxPrice;
+                          }
+                        }
+                        if (!officialBoxPrice || officialBoxPrice <= 0) officialBoxPrice = 98.50;
+
+                        // Display unit price based on UND vs SKU/CX
+                        let displayUnitPrice = 0;
+                        if (sub.customUnitPrice && Number(sub.customUnitPrice) > 0) {
+                          const cu = Number(sub.customUnitPrice);
+                          displayUnitPrice = isUnd ? (cu > 15 ? cu / embalagem : cu) : (cu < 15 ? cu * embalagem : cu);
+                        } else {
+                          displayUnitPrice = isUnd ? (officialBoxPrice / embalagem) : officialBoxPrice;
+                        }
+
+                        const itemTotalValue = itemQty * displayUnitPrice;
+
+                        return (
+                          <React.Fragment key={sub.id || index}>
+                            <tr className="border-b border-gray-300">
+                              <td className="p-2.5 border-r border-gray-300 font-mono font-bold">{itemCode}</td>
+                              <td className="p-2.5 border-r border-gray-300 uppercase shrink-0 font-medium font-sans">
+                                {itemDesc}
+                                {isSwap && <span className="font-bold text-amber-600 text-[10px] block font-sans">🔄 SKU COMPENSADO DE INVERSÃO</span>}
+                              </td>
+                              <td className="p-2.5 border-r border-gray-300 text-center font-bold font-mono">
+                                <div className="flex items-center justify-center gap-1.5">
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    value={itemQty}
+                                    onChange={(e) => handleUpdatePrintDocItem(index, "quantidade", Number(e.target.value))}
+                                    className="w-16 text-center border border-gray-300 rounded font-mono font-bold bg-amber-50/50 hover:bg-amber-100 focus:bg-white text-xs py-0.5 no-print-border"
+                                  />
+                                  <select
+                                    value={isUnd ? "und" : "cx"}
+                                    onChange={(e) => handleUpdatePrintDocItem(index, "unidadeMedida", e.target.value)}
+                                    className="border border-gray-300 rounded font-mono font-bold text-xs py-0.5 px-1 bg-amber-50/50 hover:bg-amber-100 focus:bg-white text-slate-800 no-print-border cursor-pointer"
+                                  >
+                                    <option value="cx">SKU</option>
+                                    <option value="und">UN</option>
+                                  </select>
+                                </div>
+                              </td>
+                              <td className="p-2.5 border-r border-gray-300 text-center font-mono font-bold text-indigo-950">
+                                {(Number(sub.hectolitros) || 0).toFixed(2)} HL
+                              </td>
+                              {isVale && (
+                                <td className="p-2.5 text-right font-mono">
+                                  <input
+                                    type="number"
+                                    step="0.01"
+                                    value={Number(displayUnitPrice.toFixed(2))}
+                                    onChange={(e) => handleUpdatePrintDocItem(index, "customUnitPrice", Number(e.target.value))}
+                                    className="w-20 text-right border border-gray-300 rounded font-mono text-xs py-0.5 px-1 bg-amber-50/50 hover:bg-amber-100 focus:bg-white no-print-border font-bold"
+                                  />
+                                </td>
+                              )}
+                              {isVale && <td className="p-2.5 text-right font-mono font-bold">{formatCurrency(itemTotalValue)}</td>}
+                            </tr>
+                            
+                            {/* INVERSION SWAP EXPLICIT BLOCK */}
+                            {isSwap && recolherInfo && entregarInfo && (
+                              <tr className="bg-amber-50/45 border-b border-gray-300">
+                                <td colSpan={isVale ? 6 : 4} className="p-2 text-[10.5px] font-sans leading-relaxed pl-6">
+                                  <div className="border-l-4 border-amber-500 pl-3.5 space-y-1">
+                                    <p className="text-amber-700 font-bold uppercase text-[9px] tracking-wide">COMPROVAÇÃO DE INVERSÃO LOGÍSTICA:</p>
+                                    <p>⬅️ <strong className="text-slate-700">MERCADORIA RECUSADA / A RECOLHER:</strong> SKU: <strong className="font-mono text-black">#{recolherInfo.code}</strong> - {recolherInfo.name} <span className="font-mono font-bold text-black border-b border-dashed border-black pb-0.5 select-all">(Qtd: {recolherInfo.qty})</span></p>
+                                    <p>➡️ <strong className="text-slate-700">MERCADORIA CORRETA ENVIADA / A ENTREGAR (A NOTA ORIGINAL):</strong> SKU: <strong className="font-mono text-black">#{entregarInfo.code}</strong> - {entregarInfo.name} <span className="font-mono font-bold text-black border-b border-dashed border-black pb-0.5 select-all">(Qtd: {entregarInfo.qty})</span></p>
+                                  </div>
+                                </td>
+                              </tr>
+                            )}
+                          </React.Fragment>
+                        );
+                      });
+                    })()}
+                  </tbody>
+                  <tfoot>
+                    {(() => {
+                      const itemsToRender = printDocItems.length > 0 ? printDocItems : printableItems;
+                      const totalQty = itemsToRender.reduce((s, c) => s + Number(c.quantidade || 0), 0);
+                      const totalHl = itemsToRender.reduce((s, c) => s + Number(c.hectolitros || 0), 0);
+                      const totalVal = itemsToRender.reduce((sum, sub) => {
+                        const itemCode = sub.item || sub.itemCode || "";
+                        const itemQty = Number(sub.quantidade) || 0;
+                        const dbProduct = PRODUCT_DATABASE.find(p => p.codigo === itemCode || p.codigo === itemCode.replace(/^0+/, ""));
+                        const embalagem = dbProduct?.fator && dbProduct.fator > 0 ? dbProduct.fator : (sub.fatorEmbalagem || 12);
+                        const umStr = (sub.unidadeMedida || sub.um || "sku").toLowerCase().trim();
+                        const isUnd = umStr === "und" || umStr === "un" || umStr === "unidade" || umStr === "unidades";
+
+                        let boxP = dbProduct?.valor || 0;
+                        if (!boxP || boxP <= 0) {
+                          const promaxP = promaxRecords.find(r => r.produto === itemCode)?.valorUnitario || 0;
+                          if (promaxP > 0) boxP = promaxP < 15 ? promaxP * embalagem : promaxP;
+                        }
+                        if (!boxP || boxP <= 0) boxP = 98.50;
+
+                        let unitP = 0;
+                        if (sub.customUnitPrice && Number(sub.customUnitPrice) > 0) {
+                          const cu = Number(sub.customUnitPrice);
+                          unitP = isUnd ? (cu > 15 ? cu / embalagem : cu) : (cu < 15 ? cu * embalagem : cu);
+                        } else {
+                          unitP = isUnd ? (boxP / embalagem) : boxP;
+                        }
+
+                        return sum + (itemQty * unitP);
+                      }, 0);
+
+                      const umLabel = itemsToRender.every(it => (it.unidadeMedida || "").toLowerCase() === "und") ? "und" : "sku";
+
+                      return (
+                        <tr className="bg-slate-50 font-bold border-t border-gray-400">
+                          <td colSpan={2} className="p-2.5 text-right">TOTAIS DA CARGA COMPENSADA:</td>
+                          <td className="p-2.5 text-center font-mono">
+                            {totalQty} {umLabel}
+                          </td>
+                          <td className="p-2.5 text-center font-mono text-indigo-950 font-black">{totalHl.toFixed(2)} HL</td>
+                          {isVale && <td colSpan={2} className="p-2.5 text-right font-mono text-rose-700">{formatCurrency(totalVal)}</td>}
+                        </tr>
+                      );
+                    })()}
+                  </tfoot>
+                </table>
+              </div>
+
+              {/* CREW RESPONSIBLE LOGISTICS PERSONNEL SECTION */}
+              <div className="border border-gray-300 p-3 rounded mb-3.5 text-xs text-left font-sans bg-slate-50/20">
+                <span className="text-slate-500 uppercase font-bold text-[9px] block border-b border-gray-200 pb-1 mb-2 tracking-wider">Condutores e Auxiliares de Transporte Associados:</span>
+                {isVale && printValeCrew.length > 0 ? (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-slate-500 text-[10px] font-semibold mb-1">🚚 Condutor(es) Responsável(eis):</p>
+                      {(() => {
+                        const drivers = printValeCrew.filter(c => c.role.toLowerCase().includes("motorista"));
+                        if (drivers.length === 0) return <p className="text-black uppercase font-bold text-[11px]">NÃO DECLARADO</p>;
+                        return (
+                          <ul className="space-y-1 text-[11px]">
+                            {drivers.map((d, dIdx) => (
+                              <li key={dIdx}>
+                                <strong className="text-black uppercase">{d.name || "NÃO DECLARADO"}</strong>
+                                {d.cpf && <span className="font-mono text-[9px] text-slate-600 block">(CPF: {d.cpf})</span>}
+                              </li>
+                            ))}
+                          </ul>
+                        );
+                      })()}
+                    </div>
+                    <div>
+                      <p className="text-slate-500 text-[10px] font-semibold mb-1">👥 Auxiliares / Ajudantes da Rota:</p>
+                      {(() => {
+                        const helpers = printValeCrew.filter(c => !c.role.toLowerCase().includes("motorista"));
+                        if (helpers.length === 0) return <p className="text-slate-600 italic text-[10px]">Sem ajudante adicional</p>;
+                        return (
+                          <ul className="list-disc pl-4 space-y-0.5 text-[11px] text-slate-800 font-sans">
+                            {helpers.map((h, hIdx) => (
+                              <li key={hIdx}>
+                                <strong className="text-black uppercase">{h.name || `${h.role} Não Declarado`}</strong>
+                                {h.cpf && <span className="font-mono text-[9px] text-slate-600"> (CPF: {h.cpf})</span>}
+                              </li>
+                            ))}
+                          </ul>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-4">
+                    <p className="text-[11px]">🚚 Motorista Operacional: <strong className="text-black uppercase">{cast.faltaMotorista || "NÃO DECLARADO"}</strong> {cast.faltaMotoristaCpf && <span className="font-mono text-[9px] text-slate-600 block">(CPF: {cast.faltaMotoristaCpf})</span>}</p>
+                    <div className="text-[11px]">
+                      <p className="mb-1 text-slate-500">👥 Auxiliares / Ajudantes envolvidos:</p>
+                      {cast.faltaAjudante1 ? (
+                        <ul className="list-disc pl-4 space-y-0.5 text-[11px] text-slate-800 font-sans">
+                          <li>
+                            <strong className="text-black uppercase">{cast.faltaAjudante1}</strong>
+                            {cast.faltaAjudante1Cpf && <span className="font-mono text-[9px] text-slate-600"> (CPF: {cast.faltaAjudante1Cpf})</span>}
+                          </li>
+                          {cast.faltaAjudante2 && (
+                            <li>
+                              <strong className="text-black uppercase">{cast.faltaAjudante2}</strong>
+                              {cast.faltaAjudante2Cpf && <span className="font-mono text-[9px] text-slate-600"> (CPF: {cast.faltaAjudante2Cpf})</span>}
+                            </li>
+                          )}
+                        </ul>
+                      ) : (
+                        <strong className="text-black uppercase">{cast.faltaAjudantes || "NÃO DECLARADOS"}</strong>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* DYNAMIC VALUE DIVISION BOX IN CASE OF VALES */}
+                {isVale && (() => {
+                  const itemsToRender = printDocItems.length > 0 ? printDocItems : printableItems;
+                  const currentDocTotalVal = itemsToRender.reduce((sum, sub) => {
+                    const itemCode = sub.item || sub.itemCode || "";
+                    const itemQty = Number(sub.quantidade) || 0;
+                    const dbProduct = PRODUCT_DATABASE.find(p => p.codigo === itemCode || p.codigo === itemCode.replace(/^0+/, ""));
+                    const embalagem = dbProduct?.embalagem || 12;
+                    const baseBoxPrice = Number(sub.customUnitPrice) || dbProduct?.valor || promaxRecords.find(r => r.produto === itemCode)?.valorUnitario || 0;
+                    const isUnd = (sub.unidadeMedida || "").toLowerCase() === "und";
+                    const actualUnitPrice = isUnd ? (baseBoxPrice / embalagem) : baseBoxPrice;
+                    return sum + (itemQty * actualUnitPrice);
+                  }, 0);
+
+                  const rateio = calculateValeRateio(
+                    currentDocTotalVal,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    printValeCrew.length > 0 ? printValeCrew : null
+                  );
+
+                  const payingCount = rateio.crew.filter(c => !c.isExempt).length;
+
+                  return (
+                    <div className={`mt-2.5 p-2 rounded text-xs text-left font-sans ${rateio.isDriverX ? "bg-purple-50 border border-purple-200" : "bg-rose-50 border border-rose-200"}`}>
+                      <span className={`uppercase font-extrabold text-[8.5px] block border-b pb-0.5 mb-1 tracking-wider ${rateio.isDriverX ? "text-purple-900 border-purple-200" : "text-rose-900 border-rose-200/50"}`}>
+                        📊 RATEIO DE PAGAMENTO DO VALE {rateio.isDriverX ? `(MOTORISTA X ISENTO - DIVIDIDO EM ${payingCount} AJUDANTE(S)):` : `(DIVISÃO EM ${rateio.count} INTEGRANTE(S)):`}
+                      </span>
+                      <div className="space-y-0.5">
+                        {rateio.crew.map((member, idx) => (
+                          <div key={idx} className="flex justify-between items-center text-[10px] text-slate-800">
+                            <span>
+                              <strong>{idx + 1}. {member.role}:</strong> {member.name}
+                            </span>
+                            <span className={`font-mono font-black ${member.isExempt ? "text-purple-600 italic" : "text-rose-700"}`}>
+                              {member.isExempt ? "R$ 0,00 (ISENTO)" : `${formatCurrency(member.value)} (${member.label})`}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* COMMENTS AND DIRECT OBSERVATIONS */}
+              <div className="border border-gray-350 p-2.5 rounded mb-3.5 text-xs">
+                <span className="text-slate-500 uppercase font-bold text-[9px] block pb-0.5 mb-1 tracking-wider">Anotações Gerais de Entrega:</span>
+                <p className="italic text-slate-700 font-sans leading-relaxed text-[10px]">
+                  "{cast.observacaoRecibo || "Operação física de devolução/ajuste documentada para faturamento interno ou reposição SSTR no Promax PW. Sem empenho de faturas adicionais para o estabelecimento se classificado erro de carregamento."}"
+                </p>
+              </div>
+
+              {/* DYNAMIC SIGNATURE DECISION MATRIX */}
+              <div className="mt-4 pt-3 border-t border-gray-200 font-sans text-xs">
+                {isVale ? (() => {
+                  const { count, crew, individualValue } = getValeSplitInfo();
+                  const gridColsClass = crew.length === 1 
+                    ? "grid-cols-1 max-w-xs mx-auto" 
+                    : crew.length === 2 
+                      ? "grid-cols-2 gap-8" 
+                      : crew.length === 3 
+                        ? "grid-cols-3 gap-5" 
+                        : crew.length === 4 
+                          ? "grid-cols-2 sm:grid-cols-4 gap-4" 
+                          : "grid-cols-3 gap-4";
+
+                  return (
+                    <div className="space-y-4">
+                      <p className="text-center text-[9.5px] text-slate-600 mb-2 font-semibold">
+                        Os {crew.length} assinantes abaixo declaram-se cientes e assumem responsabilidade no acerto operacional:
+                      </p>
+                      <div className={`grid ${gridColsClass} pt-1 text-center`}>
+                        {crew.map((member, idx) => (
+                          <div key={idx} className="space-y-1 font-sans">
+                            <div className="border-t border-black w-full my-1"></div>
+                            <p className="font-extrabold uppercase text-black text-[9.5px] leading-tight truncate">
+                              {member.name || "NOME NÃO DECLARADO"}
+                            </p>
+                            <p className="text-slate-500 font-mono text-[7.5px] leading-tight block">
+                              CPF: {member.cpf || "_________________"}
+                            </p>
+                            <div className="text-[8.5px] font-bold leading-tight uppercase font-mono mt-0.5">
+                              {member.isExempt ? (
+                                <span className="text-purple-700 italic">ISENTO (R$ 0,00)</span>
+                              ) : (
+                                <span className="text-rose-700">Pagar: {formatCurrency(member.value)} ({member.label})</span>
+                              )}
+                            </div>
+                            <p className="text-slate-500 font-sans text-[8px] font-medium">
+                              Assinatura do {member.role.toLowerCase().includes("motorista") ? "Condutor / Motorista" : member.role}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })() : (() => {
+                  const pdvDb = getPdvDatabase();
+                  const clientInfo = getClientDetails(req.nb, pdvDb, promaxRecords);
+                  const cityText = customPrintCidade ? `${customPrintCidade.trim()} - ${clientInfo.uf?.trim() || "PB"}` : "Guarabira - PB";
+                  return (
+                    /* SIGNATURES RECIBO (PDV ASSINANTE / CUSTOMER SIGN) */
+                    <div className="space-y-6">
+                      {/* Top sub-messages, balanced */}
+                      <div className="grid grid-cols-2 gap-10 mb-8 items-end text-[11px] text-slate-600 leading-normal font-sans">
+                        <div className="italic text-left">
+                          Atesto que recebi e conferi os volumes descritos neste cupom de conformidade física, suprindo qualquer falta reclamada.
+                        </div>
+                        <div className="text-right font-mono uppercase font-bold text-black">
+                          {cityText}, {cast.dataEntregaRecibo || new Date().toLocaleDateString("pt-BR")}
+                        </div>
+                      </div>
+
+                      {/* Signature lines perfectly aligned */}
+                      <div className="grid grid-cols-2 gap-12 pt-4 font-sans">
+                        <div className="text-center space-y-1.5">
+                          <div className="border-t border-black w-full my-1"></div>
+                          <p className="font-extrabold uppercase text-black">Ponto de Venda (PDV Assinante)</p>
+                          <p className="text-slate-500 font-semibold text-[9.5px]">Assinatura e carimbo do estabelecimento do Cliente</p>
+                        </div>
+                        
+                        <div className="text-center space-y-1.5">
+                          <div className="border-t border-black w-full my-1"></div>
+                          <p className="font-extrabold uppercase text-black">Conferência Pau Brasil Ambev</p>
+                          <p className="text-slate-500 font-mono text-[9px]">Assinatura do Lançador/Controle Técnico</p>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* FOOLS NOTCH FOR FISCAL ARCHIVAL */}
+              <div className="absolute right-4 top-4 text-[7px] font-mono border-dashed border border-slate-300 p-0.5 text-slate-400 font-bold uppercase select-none tracking-widest leading-none no-print">
+                PROMAX SSTR LEDGER • CNPJ 53.935.732/0001-30
+              </div>
+
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ACTION DIALOG MODAL (IFRAME SAFE) */}
+      {modalAction && (() => {
+        const targetReq = requests.find(r => r.id === modalAction.requestId);
+        if (!targetReq) return null;
+        
+        return (
+          <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in no-print">
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 w-full max-w-md shadow-2xl space-y-4 text-left">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                <h3 className="text-sm font-bold text-white font-mono flex items-center gap-1.5">
+                  {modalAction.type === "reject" && <span className="text-red-500">🔴 Reprovar Definitivamente</span>}
+                  {modalAction.type === "corrigir" && <span className="text-amber-500">⚠️ Solicitar Correção pelo RN</span>}
+                  {modalAction.type === "register" && <span className="text-emerald-500">✔️ Lançar como Cadastrado</span>}
+                  {modalAction.type === "delete" && <span className="text-slate-400">⚠️ Excluir Lançamento</span>}
+                </h3>
+                <button 
+                  onClick={() => setModalAction(null)} 
+                  className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="text-xs text-slate-350 space-y-1 font-sans">
+                <p><strong>Nota Fiscal:</strong> {targetReq.nf}</p>
+                <p><strong>Setor RN:</strong> {targetReq.setor} | <strong>NB Cliente:</strong> {targetReq.nb}</p>
+              </div>
+
+              {/* Input for Reject / Corrigir */}
+              {(modalAction.type === "reject" || modalAction.type === "corrigir") && (
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-bold text-slate-300 uppercase block">
+                    {modalAction.type === "reject" ? "Motivo da Reprovação Definitiva (Obrigatório):" : "O que deve ser corrigido/ajustado (Obrigatório):"}
+                  </label>
+                  <textarea
+                    placeholder={modalAction.type === "reject" ? "Ex: Material recusado ou sem elegibilidade..." : "Ex: Enviar foto nítida do produto, corrigir quantidade de engradados..."}
+                    value={modalInput}
+                    onChange={(e) => setModalInput(e.target.value)}
+                    rows={3}
+                    className={`w-full bg-slate-955 border rounded-lg p-2 text-xs text-slate-100 placeholder-slate-650 focus:outline-none ${
+                      modalAction.type === "reject" ? "border-red-850/60 focus:border-red-500" : "border-amber-850/60 focus:border-amber-500"
+                    }`}
+                  />
+                </div>
+              )}
+
+              {/* Input for Register */}
+              {modalAction.type === "register" && (
+                <div className="space-y-3">
+                  <div className="p-3 bg-blue-955/40 border border-blue-900/30 rounded-xl space-y-1">
+                    <p className="text-xs text-blue-350 font-sans font-bold flex items-center gap-1.5">
+                      <span>⚠️ Confirmação de Cadastro no Promax:</span>
+                    </p>
+                    <p className="text-[11px] text-slate-350 leading-relaxed font-sans">
+                      Você confirma que esta nota fiscal <strong>{targetReq.nf}</strong> do cliente <strong>{targetReq.nb}</strong> foi registrada e liquidada corretamente no sistema Promax PW?
+                    </p>
+                  </div>
+                  
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-bold text-slate-300 uppercase block font-mono">Responsável pelo Lançamento:</label>
+                    <input
+                      type="text"
+                      value={modalInput}
+                      onChange={(e) => setModalInput(e.target.value)}
+                      className="w-full bg-slate-955 border border-slate-800 rounded-lg p-2 text-xs text-slate-100 focus:border-blue-500 focus:outline-none"
+                      placeholder="Ex: Responsável pelo Controle"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Info for Delete */}
+              {modalAction.type === "delete" && (
+                <p className="text-xs text-amber-300 leading-relaxed font-sans">
+                  Tem certeza que deseja remover esta solicitação do Espelho/Histórico? Ela retornará para a lista de <strong>PENDENTES</strong> até que seja lançada novamente.
+                </p>
+              )}
+
+              {modalError && (
+                <p className="text-[10px] font-bold text-red-500 bg-red-950/20 border border-red-900/30 p-2 rounded-lg text-left">
+                  ⚠️ {modalError}
+                </p>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setModalAction(null)}
+                  className="px-3.5 py-1.5 bg-slate-950 hover:bg-slate-850 border border-slate-850 rounded-lg text-xs font-bold text-slate-400 hover:text-slate-200 cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleModalConfirm}
+                  className={`px-4 py-1.5 rounded-lg text-xs font-bold text-white shadow-md cursor-pointer ${
+                    modalAction.type === "reject" ? "bg-red-650 hover:bg-red-700" :
+                    modalAction.type === "corrigir" ? "bg-amber-600 hover:bg-amber-700 text-slate-900" :
+                    modalAction.type === "register" ? "bg-blue-600 hover:bg-blue-700" :
+                    "bg-red-600 hover:bg-red-700"
+                  }`}
+                >
+                  {modalAction.type === "register" ? "Confirmar Lançamento" :
+                   modalAction.type === "reject" ? "Confirmar Reprovação" :
+                   modalAction.type === "corrigir" ? "Solicitar Ajuste do RN" :
+                   "Confirmar Exclusão"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* CONCLUDED BAIXA SUCCESS / PATH COPY OVERLAY */}
+      {concludedBaixa && (() => {
+        return (
+          <div className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4 animate-fade-in no-print">
+            <div className="bg-slate-900 border-2 border-emerald-500/50 rounded-2xl p-6 w-full max-w-lg shadow-2xl space-y-4 text-left font-sans">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <h3 className="text-sm font-extrabold text-emerald-400 font-mono flex items-center gap-2 uppercase tracking-wide">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-500" />
+                  <span>Baixa Física Registrada com Sucesso!</span>
+                </h3>
+                <button 
+                  onClick={() => setConcludedBaixa(null)} 
+                  className="p-1 hover:bg-slate-850 rounded-full text-slate-400 hover:text-white cursor-pointer transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="space-y-3">
+                <p className="text-xs text-slate-300 leading-relaxed font-sans">
+                  O PDF de evidência completo foi compilado no servidor e o download do arquivo <strong>doc-evidência</strong> foi iniciado no seu navegador.
+                </p>
+
+                <div className="p-3.5 bg-slate-950 rounded-xl border border-slate-850 space-y-2">
+                  <p className="text-[10px] text-slate-450 font-extrabold uppercase tracking-widest font-mono">
+                    Pasta de Rede Destino para Arquivamento:
+                  </p>
+                  
+                  <div className="flex items-center gap-2 bg-slate-900/65 border border-slate-800 p-2 rounded-lg">
+                    <input 
+                      type="text" 
+                      readOnly 
+                      value="P:\Guarabira\2026\04.LOGISTICA\ARMAZÉM\3.0 ACURACIDADE\3.1 PACOTE PREJUIZO\REGISTROS"
+                      className="bg-transparent text-[11px] font-mono text-emerald-300 flex-1 outline-none select-all"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText("P:\\Guarabira\\2026\\04.LOGISTICA\\ARMAZÉM\\3.0 ACURACIDADE\\3.1 PACOTE PREJUIZO\\REGISTROS");
+                        alert("Caminho copiado com sucesso para a sua área de transferência!");
+                      }}
+                      className="px-2.5 py-1 bg-emerald-900/60 hover:bg-emerald-800 border border-emerald-700/40 text-emerald-300 hover:text-white rounded text-[10px] font-mono font-bold cursor-pointer transition-all flex items-center gap-1 shrink-0"
+                    >
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copiar Caminho</span>
+                    </button>
+                  </div>
+
+                  <p className="text-[10px] text-slate-500 italic leading-snug">
+                    💡 <strong>Como salvar na rede:</strong> Clique no botão <strong>"Copiar Caminho"</strong> acima, abra o Explorador de Arquivos do Windows (Windows Explorer), clique na barra de endereço superior, cole (Ctrl+V) e tecle Enter para acessar a pasta direta. Mova o arquivo PDF baixado para lá.
+                  </p>
+                </div>
+
+                <div className="bg-slate-950/40 border border-slate-850/60 p-3 rounded-xl grid grid-cols-2 gap-2 text-[10px] font-mono text-slate-400">
+                  <p><strong>Nota Fiscal:</strong> <span className="text-white">{concludedBaixa.nf}</span></p>
+                  <p><strong>Código Client NB:</strong> <span className="text-white">{concludedBaixa.nb}</span></p>
+                  <p><strong>Protocolo ID:</strong> <span className="text-white">{concludedBaixa.id}</span></p>
+                  <p><strong>Data da Baixa:</strong> <span className="text-white">{concludedBaixa.faltaBaixaDate}</span></p>
+                </div>
+              </div>
+
+              <div className="flex justify-end pt-2 border-t border-slate-850">
+                <button
+                  type="button"
+                  onClick={() => setConcludedBaixa(null)}
+                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-700 hover:text-white rounded-lg text-xs font-bold text-white shadow-lg cursor-pointer transition-colors"
+                >
+                  Concluir e Fechar
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* DELIVERY ALIGNMENT POP-UP REMINDER (Requirement 1: Exactly 1 day before delivery date) */}
+      {showReminderPopup && (() => {
+        const upcomingDeliveries = requests.filter(r => {
+          if (!r.dataEntrega) return false;
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          let deliveryDate: Date | null = null;
+          if (r.dataEntrega.includes("-")) {
+            const [y, m, d] = r.dataEntrega.split("-").map(Number);
+            deliveryDate = new Date(y, m - 1, d);
+          } else if (r.dataEntrega.includes("/")) {
+            const [d, m, y] = r.dataEntrega.split("/").map(Number);
+            deliveryDate = new Date(y, m - 1, d);
+          }
+          if (!deliveryDate || isNaN(deliveryDate.getTime())) return false;
+          deliveryDate.setHours(0, 0, 0, 0);
+          const diffTime = deliveryDate.getTime() - today.getTime();
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          const isPendingOrApproved = r.statusPromax === "pendente" || r.statusPromax === "cadastrado";
+          return isPendingOrApproved && diffDays <= 1;
+        });
+
+        if (upcomingDeliveries.length === 0) return null;
+
+        return (
+          <div className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4 animate-fade-in no-print">
+            <div className="bg-slate-900 border-2 border-amber-500 rounded-2xl p-6 w-full max-w-xl shadow-2xl space-y-4 text-left font-sans">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <h3 className="text-sm font-extrabold text-amber-400 font-mono flex items-center gap-2 uppercase tracking-wide">
+                  <span className="p-1 bg-amber-500/20 border border-amber-500/40 rounded text-amber-400">🔔</span>
+                  <span>LEMBRETE DE ALINHAMENTO / ENTREGA AMANHÃ!</span>
+                </h3>
+                <button 
+                  onClick={() => {
+                    setShowReminderPopup(false);
+                    setDismissedReminderToday(true);
+                  }} 
+                  className="p-1 hover:bg-slate-850 rounded-full text-slate-400 hover:text-white cursor-pointer transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-3 bg-amber-950/40 border border-amber-500/30 rounded-xl space-y-1">
+                <p className="text-xs text-amber-200 font-bold font-sans">
+                  Atenção Gestor / Logística:
+                </p>
+                <p className="text-[11px] text-slate-300 leading-relaxed font-sans">
+                  Existem <strong>{upcomingDeliveries.length} solicitação(ões)</strong> cadastradas com previsão de entrega/alinhamento para <strong>amanhã ou hoje</strong>. Verifique o carregamento e os documentos.
+                </p>
+              </div>
+
+              <div className="space-y-2 max-h-[220px] overflow-y-auto pr-1">
+                {upcomingDeliveries.map((r, i) => (
+                  <div key={r.id || i} className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-1 text-xs font-mono">
+                    <div className="flex justify-between items-center font-bold text-amber-400">
+                      <span>NF {r.nf} | NB {r.nb} (Setor {r.setor})</span>
+                      <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded">
+                        📅 Entrega: {r.dataEntrega}
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-slate-300 flex justify-between">
+                      <span>Motivo: {r.motivo || "Falta/Inversão"}</span>
+                      <span>Valor Total: {formatCurrency(getRequestValue(r, promaxRecords))}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex justify-end pt-2 border-t border-slate-850">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowReminderPopup(false);
+                    setDismissedReminderToday(true);
+                  }}
+                  className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg text-xs font-black uppercase tracking-wider shadow-lg cursor-pointer transition-colors"
+                >
+                  Entendido / Ciente
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* PROMAX CONTINGENCY CONFIRMATION MODAL */}
+      {confirmContingenciaReq && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in no-print">
+          <div className="bg-slate-900 border border-amber-500/50 rounded-2xl max-w-lg w-full p-6 space-y-5 shadow-2xl text-left">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2 text-amber-400 font-extrabold text-sm font-mono">
+                <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
+                <span>CONFIRMAR BAIXA DE CONTINGÊNCIA PROMAX</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmContingenciaReq(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-2 text-xs font-mono">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Setor / Rota:</span>
+                <strong className="text-white">{confirmContingenciaReq.setor}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">NF-e Original:</span>
+                <strong className="text-amber-300">{confirmContingenciaReq.nf}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Código NB PDV:</span>
+                <strong className="text-white">{confirmContingenciaReq.nb}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Motivo:</span>
+                <strong className="text-indigo-400">{confirmContingenciaReq.motivo || "Falta / Inversão"}</strong>
+              </div>
+              <div className="flex justify-between border-t border-slate-900 pt-2 mt-1">
+                <span className="text-slate-400">Cadastrado por (Plataforma):</span>
+                <strong className="text-indigo-300">{confirmContingenciaReq.cadastroUser || "Gestor"}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Data e Hora de Cadastro:</span>
+                <strong className="text-slate-300">{confirmContingenciaReq.cadastroDate || confirmContingenciaReq.data}</strong>
+              </div>
+            </div>
+
+            <div className="p-3 bg-amber-955/40 border border-amber-500/30 rounded-xl text-amber-200 text-xs leading-relaxed font-sans space-y-1.5">
+              <p className="font-bold text-amber-300 flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                <span>Confirmação de Registro no Promax ERP</span>
+              </p>
+              <p className="text-[11.5px] text-slate-200">
+                Para baixar esta contingência, confirma que o cadastro da troca/reposição foi verificado e efetuado com sucesso no sistema <strong>Promax ERP</strong>?
+              </p>
+            </div>
+
+            <label className="flex items-start gap-3 p-3.5 bg-slate-950 rounded-xl border border-slate-800 cursor-pointer hover:border-slate-700 transition-colors">
+              <input
+                type="checkbox"
+                checked={contingenciaConfirmChecked}
+                onChange={(e) => setContingenciaConfirmChecked(e.target.checked)}
+                className="mt-0.5 w-4 h-4 rounded border-slate-700 bg-slate-900 text-amber-500 focus:ring-amber-500 cursor-pointer shrink-0"
+              />
+              <span className="text-xs text-slate-200 font-medium leading-snug">
+                Confirmado: O cadastro referente a este registro foi efetuado no Promax ERP e pode ter a baixa de contingência concluída.
+              </span>
+            </label>
+
+            <div className="flex justify-end gap-3 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setConfirmContingenciaReq(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-all cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={!contingenciaConfirmChecked}
+                onClick={() => {
+                  if (confirmContingenciaReq) {
+                    executeBaixaContingencia(confirmContingenciaReq.id);
+                    setConfirmContingenciaReq(null);
+                  }
+                }}
+                className={`px-5 py-2 rounded-xl text-xs font-extrabold flex items-center gap-1.5 transition-all shadow-lg ${
+                  contingenciaConfirmChecked
+                    ? "bg-amber-500 hover:bg-amber-400 text-slate-950 cursor-pointer shadow-amber-900/30"
+                    : "bg-slate-800 text-slate-500 cursor-not-allowed opacity-50"
+                }`}
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Confirmar e Baixar Contingência</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal for Returning Request to Pending */}
+      {returnToPendingModalReq && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 space-y-5 shadow-2xl animate-in fade-in zoom-in duration-200">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2 text-amber-400 font-bold text-sm font-mono">
+                <RotateCcw className="w-5 h-5 text-amber-400 shrink-0" />
+                <span>RETORNAR PARA PENDENTE</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setReturnToPendingModalReq(null)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-950 p-4 rounded-xl border border-slate-850 space-y-2 text-xs font-mono">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Solicitação / ID:</span>
+                <strong className="text-white">{(returnToPendingModalReq as any).solicitacao || returnToPendingModalReq.id}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">NF-e Original:</span>
+                <strong className="text-amber-300">{returnToPendingModalReq.nf || "N/A"}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Código NB PDV:</span>
+                <strong className="text-white">{returnToPendingModalReq.nb}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Setor / Rota:</span>
+                <strong className="text-indigo-300">{returnToPendingModalReq.setor}</strong>
+              </div>
+            </div>
+
+            <div className="space-y-2 font-sans">
+              <label className="block text-xs font-semibold text-slate-300">
+                📅 Nova Data de Entrega Prevista:
+              </label>
+              <input
+                type="date"
+                value={returnNewDeliveryDate}
+                onChange={(e) => setReturnNewDeliveryDate(e.target.value)}
+                className="w-full bg-slate-950 border border-amber-500/50 rounded-xl px-3.5 py-2.5 text-xs text-amber-300 font-mono focus:outline-none focus:border-amber-400 transition-colors"
+              />
+              <p className="text-[10px] text-amber-400/80 italic font-mono flex items-center gap-1">
+                <span>🔔</span> O sistema enviará um lembrete automático 1 dia antes desta data.
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-3 pt-3 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setReturnToPendingModalReq(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-bold transition-all cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={executeReturnToPending}
+                className="px-5 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold rounded-xl text-xs flex items-center gap-1.5 transition-all shadow-lg shadow-amber-900/30 cursor-pointer"
+              >
+                <RotateCcw className="w-4 h-4" />
+                <span>Confirmar e Retornar</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}

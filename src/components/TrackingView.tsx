@@ -1,0 +1,3927 @@
+import React, { useState, useMemo } from "react";
+import { ExchangeRecord, PendingRequest, REPRESENTATIVOS_SETOR } from "../types";
+import { Search, Eye, Filter, CheckCircle2, AlertCircle, HelpCircle, X, ExternalLink, RefreshCw, UserCheck, Calendar, AlertTriangle, Layers, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, DollarSign, ClipboardList, Percent, TrendingUp, Package, Tag, FileText, Download, Loader2 } from "lucide-react";
+import { getRecordHL } from "../utils/hectoFactors";
+import { isRecordReposicao, isRecordTroca, isCustomerOrigin, isPromaxOrigin } from "../utils/processTypes";
+import { exportAuditTrackingPdf } from "../utils/auditPdfGenerator";
+import { exportAuditTrackingExcel } from "../utils/auditExcelGenerator";
+
+interface TrackingViewProps {
+  records: ExchangeRecord[];
+  pendingRequests?: PendingRequest[];
+  onUpdateRecordStatus: (id: string, newStatus: string, additionalObservations?: string) => void;
+  filteredSector?: string;
+  onClearSectorFilter?: () => void;
+}
+
+// Helper to perform strict, direct NB (customer code) matching
+// Supports exact match ("21" === "21") or prefix match ("21045".startsWith("21")),
+// also handling leading zeros normalization ("0021" vs "21").
+// Never matches arbitrary middle/trailing substrings (e.g. "12104" or "921").
+export const matchNbCode = (codigoCliente: string | undefined | null, searchInput: string): boolean => {
+  if (!codigoCliente) return false;
+  const rawCode = String(codigoCliente).trim().toLowerCase();
+  const rawSearch = searchInput.trim().toLowerCase();
+  if (!rawSearch) return true;
+
+  // 1. Direct exact match
+  if (rawCode === rawSearch) return true;
+
+  // 2. Direct prefix match: starts with (e.g. "21" matches "2104", "21458")
+  if (rawCode.startsWith(rawSearch)) return true;
+
+  // 3. Normalized without leading zeros (e.g. "00021" vs "21", or "00215" vs "21")
+  const strippedCode = rawCode.replace(/^0+/, "");
+  const strippedSearch = rawSearch.replace(/^0+/, "");
+  if (strippedCode && strippedSearch) {
+    if (strippedCode === strippedSearch) return true;
+    if (strippedCode.startsWith(strippedSearch)) return true;
+  }
+
+  return false;
+};
+
+// Helper for record search matching across all searchField options
+export const checkRecordSearchMatch = (r: ExchangeRecord, searchTerm: string, searchField: string): boolean => {
+  if (!searchTerm || !searchTerm.trim()) return true;
+  const normSearch = searchTerm.trim().toLowerCase();
+  const isOnlyDigits = /^\d+$/.test(normSearch);
+
+  if (searchField === "nb") {
+    // Strictly filter by customer NB code (starts with or exact match)
+    return matchNbCode(r.codigoCliente, normSearch);
+  }
+
+  if (searchField === "cliente_nome") {
+    return (r.nomeCliente || "").toLowerCase().includes(normSearch);
+  }
+
+  if (searchField === "cliente") {
+    // If user provided a numeric code (e.g. "21"), match NB strictly (starts with or exact)
+    if (isOnlyDigits) {
+      const nbMatch = matchNbCode(r.codigoCliente, normSearch);
+      if (nbMatch) return true;
+      // Match client name only if it contains the number as a standalone word (e.g. "BAR 21"),
+      // not as an arbitrary internal substring of names or addresses
+      const nameWordRegex = new RegExp(`(^|\\D)${normSearch}(\\D|$)`, "i");
+      return nameWordRegex.test(r.nomeCliente || "");
+    }
+    return (r.nomeCliente || "").toLowerCase().includes(normSearch) || matchNbCode(r.codigoCliente, normSearch);
+  }
+
+  if (searchField === "setor") {
+    return (r.setorVenda || "").toLowerCase().includes(normSearch);
+  }
+
+  if (searchField === "nf") {
+    return (r.nf || "").toLowerCase().includes(normSearch);
+  }
+
+  if (searchField === "motorista") {
+    return !!r.nomeMotorista && r.nomeMotorista.toLowerCase().includes(normSearch);
+  }
+
+  if (searchField === "mapa") {
+    return !!r.mapa && r.mapa.includes(normSearch);
+  }
+
+  if (searchField === "solicitacao") {
+    return (r.solicitacao || "").includes(normSearch);
+  }
+
+  if (searchField === "item") {
+    return (r.produto || "").includes(normSearch) || (r.descricaoProduto || "").toLowerCase().includes(normSearch);
+  }
+
+  // searchField === "todos"
+  if (isOnlyDigits) {
+    const nbMatch = matchNbCode(r.codigoCliente, normSearch);
+    const solMatch = (r.solicitacao || "").includes(normSearch);
+    const nfMatch = (r.nf || "").toLowerCase().includes(normSearch);
+    const mapaMatch = !!r.mapa && r.mapa.includes(normSearch);
+    const prodMatch = (r.produto || "").includes(normSearch) || (r.descricaoProduto || "").toLowerCase().includes(normSearch);
+    const motMatch = !!r.nomeMotorista && r.nomeMotorista.toLowerCase().includes(normSearch);
+    const nameWordRegex = new RegExp(`(^|\\D)${normSearch}(\\D|$)`, "i");
+    const nameMatch = nameWordRegex.test(r.nomeCliente || "");
+    return nbMatch || nameMatch || solMatch || nfMatch || mapaMatch || prodMatch || motMatch;
+  }
+
+  return (
+    (r.nomeCliente || "").toLowerCase().includes(normSearch) ||
+    matchNbCode(r.codigoCliente, normSearch) ||
+    (r.solicitacao || "").includes(normSearch) ||
+    (r.descricaoProduto || "").toLowerCase().includes(normSearch) ||
+    (r.produto || "").includes(normSearch) ||
+    (r.nf || "").toLowerCase().includes(normSearch) ||
+    (!!r.nomeMotorista && r.nomeMotorista.toLowerCase().includes(normSearch)) ||
+    (!!r.mapa && r.mapa.includes(normSearch))
+  );
+};
+
+export default function TrackingView({ records, pendingRequests = [], onUpdateRecordStatus, filteredSector, onClearSectorFilter }: TrackingViewProps) {
+  const [localSearchTerm, setLocalSearchTerm] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [searchField, setSearchField] = useState<string>("todos");
+  const [selectedStatus, setSelectedStatus] = useState<string>("todos");
+  const [selectedSector, setSelectedSector] = useState<string>(filteredSector || "todos");
+  const [selectedReason, setSelectedReason] = useState<string>("todos");
+  const [selectedGv, setSelectedGv] = useState<string>("todos");
+  const [processTypeFilter, setProcessTypeFilter] = useState<"todos" | "reposicao" | "troca">("todos");
+  const [startDate, setStartDate] = useState<string>("");
+  const [endDate, setEndDate] = useState<string>("");
+  const [activeDetailRecord, setActiveDetailRecord] = useState<ExchangeRecord | null>(null);
+
+  // Sorting state for auditoria and rastreamento
+  const [sortBy, setSortBy] = useState<"data" | "valor" | "hecto">("data");
+  const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
+
+  // Grouped View States
+  const [viewMode, setViewMode] = useState<"individual" | "grouped" | "duplicates">("grouped");
+  const isGroupedView = viewMode === "grouped";
+  const [activeGroupedSol, setActiveGroupedSol] = useState<any | null>(null);
+  const [duplicatesSubFilter, setDuplicatesSubFilter] = useState<"all" | "customer" | "promax" | "pendentes">("all");
+
+  // Pagination states
+  const [currentPage, setCurrentPage] = useState(1);
+  const ITEMS_PER_PAGE = 24;
+
+  // Metric toggle for status distribution visualization
+  const [metricView, setMetricView] = useState<"value" | "volume" | "count">("value");
+
+  // Debounce search input to avoid typing lag
+  React.useEffect(() => {
+    const timer = setTimeout(() => {
+      setSearchTerm(localSearchTerm);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [localSearchTerm]);
+
+  // Reset page to 1 whenever filters or sorting change
+  React.useEffect(() => {
+    setCurrentPage(1);
+  }, [searchTerm, searchField, selectedStatus, selectedSector, selectedReason, selectedGv, processTypeFilter, startDate, endDate, viewMode, sortBy, sortOrder]);
+
+  // Helper to convert DD/MM/YYYY or other formats to YYYY-MM-DD for comparison
+  const convertToISODate = (rawDateStr: string): string | null => {
+    if (!rawDateStr) return null;
+    const clean = rawDateStr.trim().split(" ")[0]; // remove time if any
+    if (clean.includes("-")) {
+      const p = clean.split("-");
+      if (p.length === 3) {
+        if (p[0].length === 4) return clean; // already YYYY-MM-DD
+        if (p[2].length === 4) return `${p[2]}-${p[1].padStart(2, "0")}-${p[0].padStart(2, "0")}`; // DD-MM-YYYY
+      }
+    }
+    const parts = clean.split("/");
+    if (parts.length !== 3) return null;
+    const day = parts[0].padStart(2, "0");
+    const month = parts[1].padStart(2, "0");
+    let year = parts[2];
+    if (year.length === 2) year = `20${year}`;
+    return `${year}-${month}-${day}`;
+  };
+
+  // Helper to convert YYYY-MM-DD to DD/MM/YYYY for UI display
+  const convertToPtDate = (isoDateStr: string): string => {
+    if (!isoDateStr) return "";
+    const parts = isoDateStr.split("-");
+    if (parts.length !== 3) return isoDateStr;
+    return `${parts[2]}/${parts[1]}/${parts[0]}`;
+  };
+  
+  // Custom manual action states
+  const [reviewStatus, setReviewStatus] = useState<string>("");
+  const [reviewObs, setReviewObs] = useState<string>("");
+
+  // Sync internal sector filter state with parent if changed
+  React.useEffect(() => {
+    if (filteredSector) {
+      setSelectedSector(filteredSector);
+    }
+  }, [filteredSector]);
+
+  // List of unique sectors for dropdown filter
+  const sectors = useMemo(() => {
+    const list = Array.from(new Set(records.map(r => r.setorVenda))).filter(Boolean);
+    return list.sort((a,b) => a.localeCompare(b, undefined, {numeric: true}));
+  }, [records]);
+
+  // Get unique dates sorted descending (newest first)
+  const uniqueDates = useMemo(() => {
+    const dates = Array.from(new Set(records.map(r => r.dataSolicitacao))).filter(Boolean);
+    return dates.sort((a, b) => {
+      const [dayA, monthA, yearA] = a.split("/").map(Number);
+      const [dayB, monthB, yearB] = b.split("/").map(Number);
+      const timeA = new Date(yearA, monthA - 1, dayA).getTime();
+      const timeB = new Date(yearB, monthB - 1, dayB).getTime();
+      return timeB - timeA;
+    });
+  }, [records]);
+
+  // Get unique justifications (motivos) sorted alphabetically
+  const uniqueReasons = useMemo(() => {
+    const reasons = Array.from(new Set(records.map(r => r.justificativa))).filter(Boolean);
+    return reasons.sort();
+  }, [records]);
+
+  // Unique GVs list dynamically populated matching SSTR settings
+  const uniqueGVsList = useMemo(() => {
+    const list = new Set<string>();
+    records.forEach(r => {
+      const s = (r.setorVenda || "").trim();
+      const rep = REPRESENTATIVOS_SETOR[s];
+      if (rep && rep.gv) {
+        list.add(rep.gv.toUpperCase());
+      } else {
+        list.add("OUTROS");
+      }
+    });
+    return Array.from(list).sort();
+  }, [records]);
+
+  // Find solicitations that need to be re-registered ("Recadastrar"):
+  // - Pending solicitations requested last month
+  // - That do not have any duplicate (same client and products/quantities) in the current active month
+  const recadastrarSolIds = useMemo(() => {
+    const parseDateStr = (dateStr: string) => {
+      if (!dateStr) return new Date(0);
+      const parts = dateStr.split("/");
+      if (parts.length !== 3) return new Date(0);
+      const d = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10);
+      const y = parseInt(parts[2], 10);
+      if (isNaN(d) || isNaN(m) || isNaN(y)) return new Date(0);
+      return new Date(y, m - 1, d);
+    };
+
+    // Determine current month (mês vigente) and year from latest record's date
+    let maxTime = 0;
+    let activeMonth = new Date().getMonth() + 1;
+    let activeYear = new Date().getFullYear();
+
+    records.forEach(r => {
+      if (!r.dataSolicitacao) return;
+      const d = parseDateStr(r.dataSolicitacao);
+      const t = d.getTime();
+      if (t > maxTime) {
+        maxTime = t;
+        activeMonth = d.getMonth() + 1;
+        activeYear = d.getFullYear();
+      }
+    });
+
+    let lastMonth = activeMonth - 1;
+    let lastMonthYear = activeYear;
+    if (lastMonth === 0) {
+      lastMonth = 12;
+      lastMonthYear = activeYear - 1;
+    }
+
+    // Group all system records by solicitation to find their products key
+    const solsMap: Record<string, ExchangeRecord[]> = {};
+    records.forEach(r => {
+      const solNum = (r.solicitacao || "").trim();
+      if (!solNum) return;
+      if (!solsMap[solNum]) {
+        solsMap[solNum] = [];
+      }
+      solsMap[solNum].push(r);
+    });
+
+    const allSols = Object.entries(solsMap).map(([sol, recs]) => {
+      const first = recs[0];
+      const productsKey = recs
+        .map(r => `${r.produto.trim()}:${r.quantidade}`)
+        .sort()
+        .join("|");
+      
+      const parts = (first.dataSolicitacao || "").split("/");
+      const m = parts.length === 3 ? parseInt(parts[1], 10) : 0;
+      const y = parts.length === 3 ? parseInt(parts[2], 10) : 0;
+
+      return {
+        solicitacao: sol,
+        codigoCliente: (first.codigoCliente || "").trim(),
+        status: (first.status || "").toLowerCase().trim(),
+        productsKey,
+        month: m,
+        year: y
+      };
+    });
+
+    // We consider "Pendente" (which represents not approved and not reproved) in the last month
+    const lastMonthPendingSols = allSols.filter(s => 
+      s.month === lastMonth && 
+      s.year === lastMonthYear && 
+      s.status.includes("pend")
+    );
+
+    // Active month (mês vigente) solicitations
+    const currentMonthSols = allSols.filter(s => 
+      s.month === activeMonth && 
+      s.year === activeYear
+    );
+
+    const recadastrarSet = new Set<string>();
+
+    lastMonthPendingSols.forEach(lmSol => {
+      const hasDuplicateInCurrentMonth = currentMonthSols.some(cmSol => 
+        cmSol.codigoCliente === lmSol.codigoCliente && 
+        cmSol.productsKey === lmSol.productsKey
+      );
+
+      if (!hasDuplicateInCurrentMonth) {
+        recadastrarSet.add(lmSol.solicitacao);
+      }
+    });
+
+    return recadastrarSet;
+  }, [records]);
+
+  // PDF Export States
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [exportSourceMode, setExportSourceMode] = useState<"filtro_tela" | "custom">("filtro_tela");
+  const [exportDateType, setExportDateType] = useState<"unica" | "periodo" | "todas">("unica");
+  const [exportTargetDate, setExportTargetDate] = useState<string>("");
+  const [exportTargetEndDate, setExportTargetEndDate] = useState<string>("");
+  const [exportStatusScope, setExportStatusScope] = useState<"todos_status" | "filtro_ativo">("todos_status");
+  const [exportSectorScope, setExportSectorScope] = useState<string>("todos");
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [isExportingExcel, setIsExportingExcel] = useState(false);
+  const [pdfNotification, setPdfNotification] = useState<{ message: string; type: "success" | "error" } | null>(null);
+
+  // Filtered records
+  const filteredRecords = useMemo(() => {
+    const list = records.filter(r => {
+      // 1. Search term match with searchField support
+      let matchSearch = true;
+      if (searchTerm) {
+        matchSearch = checkRecordSearchMatch(r, searchTerm, searchField);
+      }
+
+      // 2. Status match
+      const statusClean = r.status.toLowerCase().trim();
+      let matchStatus = true;
+      if (selectedStatus !== "todos") {
+        if (selectedStatus === "aprovada") {
+          matchStatus = statusClean.includes("aprov");
+        } else if (selectedStatus === "pendente") {
+          // Standard Pendentes filter excludes those tagged as Recadastrar
+          matchStatus = statusClean.includes("pend") && !recadastrarSolIds.has(r.solicitacao);
+        } else if (selectedStatus === "reprovada") {
+          matchStatus = statusClean.includes("reprov");
+        } else if (selectedStatus === "recadastrar") {
+          matchStatus = recadastrarSolIds.has(r.solicitacao);
+        }
+      }
+
+      // 3. Sector match
+      let matchSector = true;
+      if (selectedSector !== "todos") {
+        matchSector = r.setorVenda === selectedSector;
+      }
+
+      // 4. Date match (Data Inicial & Data Final range check)
+      let matchDate = true;
+      const isoDate = convertToISODate(r.dataSolicitacao);
+      if (isoDate) {
+        if (startDate && isoDate < startDate) {
+          matchDate = false;
+        }
+        if (endDate && isoDate > endDate) {
+          matchDate = false;
+        }
+      } else if (startDate || endDate) {
+        matchDate = false;
+      }
+
+      // 5. Reason match
+      let matchReason = true;
+      if (selectedReason !== "todos") {
+        matchReason = (r.justificativa || "").trim() === selectedReason.trim();
+      }
+
+      // 6. GV match
+      let matchGv = true;
+      if (selectedGv !== "todos") {
+        const s = (r.setorVenda || "").trim();
+        const rep = REPRESENTATIVOS_SETOR[s];
+        const recordGv = rep ? rep.gv.toUpperCase() : "OUTROS";
+        matchGv = recordGv === selectedGv.toUpperCase();
+      }
+
+      // 7. Process type match (Reposição vs Troca)
+      let matchProcessType = true;
+      if (processTypeFilter === "reposicao") {
+        matchProcessType = isRecordReposicao(r);
+      } else if (processTypeFilter === "troca") {
+        matchProcessType = isRecordTroca(r);
+      }
+
+      return matchSearch && matchStatus && matchSector && matchDate && matchReason && matchGv && matchProcessType;
+    });
+
+    // Sort dynamically by selected option (date, value, hecto) and direction (asc/desc)
+    return list.sort((a, b) => {
+      let comparison = 0;
+
+      if (sortBy === "data") {
+        const [dayA, monthA, yearA] = (a.dataSolicitacao || "").split("/").map(Number);
+        const timeA = yearA && monthA && dayA ? new Date(yearA, monthA - 1, dayA).getTime() : 0;
+
+        const [dayB, monthB, yearB] = (b.dataSolicitacao || "").split("/").map(Number);
+        const timeB = yearB && monthB && dayB ? new Date(yearB, monthB - 1, dayB).getTime() : 0;
+
+        if (timeA !== timeB) {
+          comparison = timeA - timeB;
+        } else {
+          if (a.hora && b.hora) {
+            const [hA, mA] = a.hora.split(":").map(Number);
+            const [hB, mB] = b.hora.split(":").map(Number);
+            const minutesA = (hA || 0) * 60 + (mA || 0);
+            const minutesB = (hB || 0) * 60 + (mB || 0);
+            comparison = minutesA - minutesB;
+          } else {
+            comparison = (a.importTimestamp || 0) - (b.importTimestamp || 0);
+          }
+        }
+      } else if (sortBy === "valor") {
+        comparison = a.valorTotal - b.valorTotal;
+      } else if (sortBy === "hecto") {
+        const hlA = getRecordHL(a);
+        const hlB = getRecordHL(b);
+        comparison = hlA - hlB;
+      }
+
+      return sortOrder === "desc" ? -comparison : comparison;
+    });
+  }, [records, searchTerm, searchField, selectedStatus, selectedSector, selectedReason, selectedGv, processTypeFilter, startDate, endDate, sortBy, sortOrder]);
+
+  // Grouped solicitations memo based on currently filtered records
+  const groupedSolicitations = useMemo(() => {
+    const groups: Record<string, ExchangeRecord[]> = {};
+    filteredRecords.forEach(rec => {
+      const sol = rec.solicitacao || "Sem Número";
+      if (!groups[sol]) {
+        groups[sol] = [];
+      }
+      groups[sol].push(rec);
+    });
+
+    const groupedList = Object.entries(groups).map(([sol, recs]) => {
+      const first = recs[0];
+      const productsKey = recs
+        .map(r => `${r.produto.trim()}:${r.quantidade}`)
+        .sort()
+        .join("|");
+
+      // Robust map resolution from Column X (mapaOrigem) or mapa across all recs in group
+      const resolvedMapa = recs
+        .map(r => r.mapaOrigem || r.mapa)
+        .map(m => (m || "").trim())
+        .find(m => m && m !== "0" && m.toLowerCase() !== "falta" && m !== "-")
+        || (first.mapaOrigem && first.mapaOrigem !== "0" ? first.mapaOrigem : "")
+        || (first.mapa && first.mapa !== "0" && first.mapa.toLowerCase() !== "falta" ? first.mapa : "");
+
+      const isCustomer = recs.some(r => isCustomerOrigin(r.sistemaOrigem));
+      const sisOrigemResolved = isCustomer ? "Customer" : (recs.find(r => r.sistemaOrigem)?.sistemaOrigem || first.sistemaOrigem || "Promax");
+
+      return {
+        id: sol,
+        solicitacao: sol,
+        codigoCliente: first.codigoCliente || "S/C",
+        nomeCliente: first.nomeCliente || "Cliente Desconhecido",
+        setorVenda: first.setorVenda || "",
+        dataSolicitacao: first.dataSolicitacao || "Sem Data",
+        status: first.status || "Pendente",
+        mapa: resolvedMapa,
+        mapaOrigem: first.mapaOrigem || "",
+        mapaReposicao: first.mapaReposicao || "",
+        observacao: first.observacao || "",
+        sistemaOrigem: sisOrigemResolved,
+        isCustomerOrigin: isCustomer,
+        records: recs,
+        productsKey,
+        totalValue: recs.reduce((sum, r) => sum + r.valorTotal, 0),
+        totalHL: recs.reduce((sum, r) => sum + getRecordHL(r), 0)
+      };
+    });
+
+    return groupedList.sort((a, b) => {
+      let comparison = 0;
+
+      if (sortBy === "data") {
+        const [dayA, monthA, yearA] = (a.dataSolicitacao || "").split("/").map(Number);
+        const timeA = yearA && monthA && dayA ? new Date(yearA, monthA - 1, dayA).getTime() : 0;
+
+        const [dayB, monthB, yearB] = (b.dataSolicitacao || "").split("/").map(Number);
+        const timeB = yearB && monthB && dayB ? new Date(yearB, monthB - 1, dayB).getTime() : 0;
+
+        if (timeA !== timeB) {
+          comparison = timeA - timeB;
+        } else {
+          comparison = a.solicitacao.localeCompare(b.solicitacao);
+        }
+      } else if (sortBy === "valor") {
+        comparison = a.totalValue - b.totalValue;
+      } else if (sortBy === "hecto") {
+        comparison = a.totalHL - b.totalHL;
+      }
+
+      return sortOrder === "desc" ? -comparison : comparison;
+    });
+  }, [filteredRecords, sortBy, sortOrder]);
+
+  // Helper to open the PDF export configuration modal
+  const handleOpenExportModal = () => {
+    // Default to active filtered screen view for zero divergence
+    setExportSourceMode("filtro_tela");
+    if (startDate) {
+      setExportTargetDate(startDate);
+      if (endDate && endDate !== startDate) {
+        setExportDateType("periodo");
+        setExportTargetEndDate(endDate);
+      } else {
+        setExportDateType("unica");
+        setExportTargetEndDate(startDate);
+      }
+    } else if (uniqueDates.length > 0) {
+      const latestPtDate = uniqueDates[0];
+      const iso = convertToISODate(latestPtDate);
+      if (iso) {
+        setExportTargetDate(iso);
+        setExportTargetEndDate(iso);
+      }
+      setExportDateType("unica");
+    } else {
+      const todayIso = new Date().toISOString().slice(0, 10);
+      setExportTargetDate(todayIso);
+      setExportTargetEndDate(todayIso);
+      setExportDateType("todas");
+    }
+    setExportSectorScope(selectedSector || "todos");
+    setExportStatusScope("todos_status");
+    setIsExportModalOpen(true);
+  };
+
+  // Preview data dynamically computed for the PDF modal
+  const exportPreviewData = useMemo(() => {
+    let list: ExchangeRecord[] = [];
+
+    if (exportSourceMode === "filtro_tela") {
+      // 100% strictly aligned with active filtered view on screen (Zero Divergence: 62 solicitations)
+      list = filteredRecords;
+    } else {
+      list = records;
+
+      // Filter by date
+      if (exportDateType === "unica" && exportTargetDate) {
+        list = list.filter(r => {
+          const iso = convertToISODate(r.dataSolicitacao);
+          return iso === exportTargetDate;
+        });
+      } else if (exportDateType === "periodo") {
+        if (exportTargetDate || exportTargetEndDate) {
+          list = list.filter(r => {
+            const iso = convertToISODate(r.dataSolicitacao);
+            if (!iso) return false;
+            if (exportTargetDate && iso < exportTargetDate) return false;
+            if (exportTargetEndDate && iso > exportTargetEndDate) return false;
+            return true;
+          });
+        }
+      }
+
+      // Filter by sector
+      if (exportSectorScope !== "todos") {
+        list = list.filter(r => (r.setorVenda || "").trim() === exportSectorScope.trim());
+      }
+
+      // Filter by status if "filtro_ativo" is selected
+      if (exportStatusScope === "filtro_ativo" && selectedStatus !== "todos") {
+        list = list.filter(r => {
+          const s = (r.status || "").toLowerCase().trim();
+          if (selectedStatus === "aprovada") return s.includes("aprov");
+          if (selectedStatus === "pendente") return s.includes("pend") && !recadastrarSolIds.has(r.solicitacao);
+          if (selectedStatus === "reprovada") return s.includes("reprov");
+          if (selectedStatus === "recadastrar") return recadastrarSolIds.has(r.solicitacao);
+          return true;
+        });
+      }
+
+      // Process type
+      if (processTypeFilter !== "todos") {
+        list = list.filter(r => {
+          const isTroca = isRecordTroca(r);
+          return processTypeFilter === "troca" ? isTroca : !isTroca;
+        });
+      }
+
+      // Reason
+      if (selectedReason !== "todos") {
+        list = list.filter(r => (r.justificativa || "").trim() === selectedReason.trim());
+      }
+    }
+
+    const uniqueSols = new Set(list.map(r => r.solicitacao).filter(Boolean));
+    const uniqueSecs = new Set(list.map(r => r.setorVenda).filter(Boolean));
+    const totalVal = list.reduce((sum, r) => sum + (Number(r.valorTotal) || 0), 0);
+    const totalHl = list.reduce((sum, r) => sum + getRecordHL(r), 0);
+
+    const aprovSols = new Set(list.filter(r => (r.status || "").toLowerCase().includes("aprov")).map(r => r.solicitacao)).size;
+    const pendSols = new Set(list.filter(r => (r.status || "").toLowerCase().includes("pend") && !recadastrarSolIds.has(r.solicitacao)).map(r => r.solicitacao)).size;
+    const reprovSols = new Set(list.filter(r => (r.status || "").toLowerCase().includes("reprov")).map(r => r.solicitacao)).size;
+    const recadSols = new Set(list.filter(r => recadastrarSolIds.has(r.solicitacao)).map(r => r.solicitacao)).size;
+
+    return {
+      records: list,
+      solicitationsCount: uniqueSols.size,
+      sectorsCount: uniqueSecs.size,
+      totalValor: totalVal,
+      totalHl,
+      aprovSols,
+      pendSols,
+      reprovSols,
+      recadSols
+    };
+  }, [exportSourceMode, filteredRecords, records, exportDateType, exportTargetDate, exportTargetEndDate, exportSectorScope, exportStatusScope, selectedStatus, processTypeFilter, selectedReason, recadastrarSolIds]);
+
+  // Execute PDF generation from the modal
+  const handleExecutePdfExport = async () => {
+    if (!exportPreviewData.records.length) {
+      setPdfNotification({
+        message: "Nenhuma solicitação encontrada para os parâmetros informados.",
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+      return;
+    }
+
+    setIsExportingPdf(true);
+    try {
+      const isRange = exportDateType === "periodo" && exportTargetDate && exportTargetEndDate && exportTargetEndDate !== exportTargetDate;
+      const effectiveDateStr = exportSourceMode === "filtro_tela"
+        ? (!endDate || endDate === startDate ? startDate : undefined)
+        : (exportDateType === "unica" ? exportTargetDate : undefined);
+      const effectiveStartDate = exportSourceMode === "filtro_tela"
+        ? (endDate && endDate !== startDate ? startDate : undefined)
+        : (exportDateType === "periodo" ? exportTargetDate : undefined);
+      const effectiveEndDate = exportSourceMode === "filtro_tela"
+        ? (endDate && endDate !== startDate ? endDate : undefined)
+        : (exportDateType === "periodo" ? exportTargetEndDate : undefined);
+
+      await exportAuditTrackingPdf(exportPreviewData.records, {
+        dateStr: effectiveDateStr,
+        startDate: effectiveStartDate,
+        endDate: effectiveEndDate,
+        sectorFilter: exportSourceMode === "filtro_tela" ? (selectedSector !== "todos" ? selectedSector : undefined) : (exportSectorScope !== "todos" ? exportSectorScope : undefined),
+        statusFilter: exportSourceMode === "filtro_tela" ? (selectedStatus !== "todos" ? selectedStatus : "todos") : (exportStatusScope === "filtro_ativo" ? selectedStatus : "todos"),
+        processTypeFilter: processTypeFilter !== "todos" ? processTypeFilter : undefined,
+        auditorName: "Auditoria Operacional SSTR",
+        filenamePrefix: `relatorio_auditoria_${exportPreviewData.solicitationsCount}_solicitacoes`
+      });
+
+      setPdfNotification({
+        message: `Relatório em PDF gerado com sucesso! (${exportPreviewData.solicitationsCount} solicitações em ${exportPreviewData.sectorsCount} setores)`,
+        type: "success"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+      setIsExportModalOpen(false);
+    } catch (err: any) {
+      setPdfNotification({
+        message: err?.message || "Erro ao gerar PDF do relatório.",
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
+  // Execute Excel export from the modal
+  const handleExecuteExcelExport = async () => {
+    if (!exportPreviewData.records.length) {
+      setPdfNotification({
+        message: "Nenhuma solicitação encontrada para os parâmetros informados.",
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+      return;
+    }
+
+    setIsExportingExcel(true);
+    try {
+      const effectiveDateStr = exportSourceMode === "filtro_tela"
+        ? (!endDate || endDate === startDate ? startDate : undefined)
+        : (exportDateType === "unica" ? exportTargetDate : undefined);
+      const effectiveStartDate = exportSourceMode === "filtro_tela"
+        ? (endDate && endDate !== startDate ? startDate : undefined)
+        : (exportDateType === "periodo" ? exportTargetDate : undefined);
+      const effectiveEndDate = exportSourceMode === "filtro_tela"
+        ? (endDate && endDate !== startDate ? endDate : undefined)
+        : (exportDateType === "periodo" ? exportTargetEndDate : undefined);
+
+      exportAuditTrackingExcel(exportPreviewData.records, {
+        dateStr: effectiveDateStr,
+        startDate: effectiveStartDate,
+        endDate: effectiveEndDate,
+        sectorFilter: exportSourceMode === "filtro_tela" ? (selectedSector !== "todos" ? selectedSector : undefined) : (exportSectorScope !== "todos" ? exportSectorScope : undefined),
+        statusFilter: exportSourceMode === "filtro_tela" ? (selectedStatus !== "todos" ? selectedStatus : "todos") : (exportStatusScope === "filtro_ativo" ? selectedStatus : "todos"),
+        processTypeFilter: processTypeFilter !== "todos" ? processTypeFilter : undefined,
+        auditorName: "Auditoria Operacional SSTR",
+        filenamePrefix: `auditoria_solicitacoes_por_rn_${exportPreviewData.solicitationsCount}_solicitacoes`
+      });
+
+      setPdfNotification({
+        message: `Planilha Excel exportada com sucesso! (${exportPreviewData.solicitationsCount} solicitações agrupadas por RN)`,
+        type: "success"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+      setIsExportModalOpen(false);
+    } catch (err: any) {
+      setPdfNotification({
+        message: err?.message || "Erro ao exportar planilha Excel.",
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+    } finally {
+      setIsExportingExcel(false);
+    }
+  };
+
+  // Quick direct 1-click export for active date filter (PDF)
+  const handleQuickExportActiveDate = async () => {
+    // Analyst principle: Export EXACTLY the filtered solicitations shown on screen (Zero Divergence)
+    const targetRecords = filteredRecords.length > 0 ? filteredRecords : records;
+    if (targetRecords.length === 0) {
+      setPdfNotification({
+        message: `Nenhuma solicitação encontrada no filtro ativo para exportação.`,
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+      return;
+    }
+
+    setIsExportingPdf(true);
+    try {
+      const isRange = !!(endDate && endDate !== startDate);
+      const uniqueSols = new Set(targetRecords.map(r => r.solicitacao).filter(Boolean)).size;
+
+      await exportAuditTrackingPdf(targetRecords, {
+        dateStr: (!isRange && startDate) ? startDate : undefined,
+        startDate: (isRange && startDate) ? startDate : undefined,
+        endDate: (isRange && endDate) ? endDate : undefined,
+        sectorFilter: selectedSector !== "todos" ? selectedSector : undefined,
+        statusFilter: selectedStatus !== "todos" ? selectedStatus : "todos",
+        processTypeFilter: processTypeFilter !== "todos" ? processTypeFilter : undefined,
+        auditorName: "Auditoria Operacional SSTR",
+        filenamePrefix: `auditoria_${uniqueSols}_solicitacoes`
+      });
+
+      setPdfNotification({
+        message: `Relatório em PDF exportado com sucesso! (${uniqueSols} solicitações agrupadas por RN)`,
+        type: "success"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+    } catch (err: any) {
+      setPdfNotification({
+        message: err?.message || "Erro ao exportar PDF.",
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
+  // Quick direct 1-click export for active date filter (Excel)
+  const handleQuickExportActiveDateExcel = async () => {
+    const targetRecords = filteredRecords.length > 0 ? filteredRecords : records;
+    if (targetRecords.length === 0) {
+      setPdfNotification({
+        message: `Nenhuma solicitação encontrada no filtro ativo para exportação.`,
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+      return;
+    }
+
+    setIsExportingExcel(true);
+    try {
+      const isRange = !!(endDate && endDate !== startDate);
+      const uniqueSols = new Set(targetRecords.map(r => r.solicitacao).filter(Boolean)).size;
+
+      exportAuditTrackingExcel(targetRecords, {
+        dateStr: (!isRange && startDate) ? startDate : undefined,
+        startDate: (isRange && startDate) ? startDate : undefined,
+        endDate: (isRange && endDate) ? endDate : undefined,
+        sectorFilter: selectedSector !== "todos" ? selectedSector : undefined,
+        statusFilter: selectedStatus !== "todos" ? selectedStatus : "todos",
+        processTypeFilter: processTypeFilter !== "todos" ? processTypeFilter : undefined,
+        auditorName: "Auditoria Operacional SSTR",
+        filenamePrefix: `auditoria_rns_${uniqueSols}_solicitacoes`
+      });
+
+      setPdfNotification({
+        message: `Planilha Excel exportada com sucesso! (${uniqueSols} solicitações agrupadas por RN)`,
+        type: "success"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+    } catch (err: any) {
+      setPdfNotification({
+        message: err?.message || "Erro ao exportar Excel.",
+        type: "error"
+      });
+      setTimeout(() => setPdfNotification(null), 4000);
+    } finally {
+      setIsExportingExcel(false);
+    }
+  };
+
+  // Dynamic statistics for the Auditoria dashboard
+  const dashStats = useMemo(() => {
+    let totalValor = 0;
+    let totalHl = 0;
+    const uniqueSols = new Set<string>();
+
+    let bApprovedValor = 0;
+    let bApprovedHl = 0;
+    let bApprovedItemsCount = 0;
+    const bApprovedSols = new Set<string>();
+
+    let bPendingValor = 0;
+    let bPendingHl = 0;
+    let bPendingItemsCount = 0;
+    const bPendingSols = new Set<string>();
+
+    let bRejectedValor = 0;
+    let bRejectedHl = 0;
+    let bRejectedItemsCount = 0;
+    const bRejectedSols = new Set<string>();
+
+    let bRecadastrarValor = 0;
+    let bRecadastrarHl = 0;
+    let bRecadastrarItemsCount = 0;
+    const bRecadastrarSols = new Set<string>();
+
+    // Compute status distribution based on active search/filters EXCEPT the status filter
+    records.forEach(r => {
+      let matchSearch = true;
+      if (searchTerm) {
+        matchSearch = checkRecordSearchMatch(r, searchTerm, searchField);
+      }
+
+      let matchSector = true;
+      if (selectedSector !== "todos") {
+        matchSector = r.setorVenda === selectedSector;
+      }
+
+      let matchDate = true;
+      const isoDate = convertToISODate(r.dataSolicitacao);
+      if (isoDate) {
+        if (startDate && isoDate < startDate) {
+          matchDate = false;
+        }
+        if (endDate && isoDate > endDate) {
+          matchDate = false;
+        }
+      } else if (startDate || endDate) {
+        matchDate = false;
+      }
+
+      let matchReason = true;
+      if (selectedReason !== "todos") {
+        matchReason = (r.justificativa || "").trim() === selectedReason.trim();
+      }
+
+      let matchGv = true;
+      if (selectedGv !== "todos") {
+        const s = (r.setorVenda || "").trim();
+        const rep = REPRESENTATIVOS_SETOR[s];
+        const recordGv = rep ? rep.gv.toUpperCase() : "OUTROS";
+        matchGv = recordGv === selectedGv.toUpperCase();
+      }
+
+      let matchProcessType = true;
+      if (processTypeFilter === "reposicao") {
+        matchProcessType = isRecordReposicao(r);
+      } else if (processTypeFilter === "troca") {
+        matchProcessType = isRecordTroca(r);
+      }
+
+      if (matchSearch && matchSector && matchDate && matchReason && matchGv && matchProcessType) {
+        const statusClean = r.status.toLowerCase().trim();
+        const val = r.valorTotal || 0;
+        const hl = getRecordHL(r);
+        const isRecadastrar = recadastrarSolIds.has(r.solicitacao);
+
+        if (isRecadastrar) {
+          bRecadastrarValor += val;
+          bRecadastrarHl += hl;
+          bRecadastrarItemsCount++;
+          if (r.solicitacao) bRecadastrarSols.add(r.solicitacao);
+        } else if (statusClean.includes("aprov")) {
+          bApprovedValor += val;
+          bApprovedHl += hl;
+          bApprovedItemsCount++;
+          if (r.solicitacao) bApprovedSols.add(r.solicitacao);
+        } else if (statusClean.includes("pend")) {
+          bPendingValor += val;
+          bPendingHl += hl;
+          bPendingItemsCount++;
+          if (r.solicitacao) bPendingSols.add(r.solicitacao);
+        } else if (statusClean.includes("reprov")) {
+          bRejectedValor += val;
+          bRejectedHl += hl;
+          bRejectedItemsCount++;
+          if (r.solicitacao) bRejectedSols.add(r.solicitacao);
+        }
+      }
+    });
+
+    // Sum total value and volume based on selected status filter to ensure consistency
+    filteredRecords.forEach(r => {
+      // Show total of everything in the filtered records (respecting whichever status filter is selected, or all if "todos")
+      totalValor += r.valorTotal || 0;
+      totalHl += getRecordHL(r);
+      if (r.solicitacao) {
+        uniqueSols.add(r.solicitacao);
+      }
+    });
+
+    // Baseline records logic: all records matching filters except client search text (searchTerm)
+    let baselineValor = 0;
+    let baselineHl = 0;
+    const baselineSols = new Set<string>();
+
+    records.forEach(r => {
+      // 2. Status match
+      const statusClean = r.status.toLowerCase().trim();
+      let matchStatus = true;
+      if (selectedStatus !== "todos") {
+        if (selectedStatus === "aprovada") {
+          matchStatus = statusClean.includes("aprov");
+        } else if (selectedStatus === "pendente") {
+          matchStatus = statusClean.includes("pend") && !recadastrarSolIds.has(r.solicitacao);
+        } else if (selectedStatus === "reprovada") {
+          matchStatus = statusClean.includes("reprov");
+        } else if (selectedStatus === "recadastrar") {
+          matchStatus = recadastrarSolIds.has(r.solicitacao);
+        }
+      }
+
+      // 3. Sector match
+      let matchSector = true;
+      if (selectedSector !== "todos") {
+        matchSector = r.setorVenda === selectedSector;
+      }
+
+      // 4. Date match (Data Inicial & Data Final range check)
+      let matchDate = true;
+      const isoDate = convertToISODate(r.dataSolicitacao);
+      if (isoDate) {
+        if (startDate && isoDate < startDate) {
+          matchDate = false;
+        }
+        if (endDate && isoDate > endDate) {
+          matchDate = false;
+        }
+      } else if (startDate || endDate) {
+        matchDate = false;
+      }
+
+      // 5. Reason match
+      let matchReason = true;
+      if (selectedReason !== "todos") {
+        matchReason = (r.justificativa || "").trim() === selectedReason.trim();
+      }
+
+      // 6. GV match
+      let matchGv = true;
+      if (selectedGv !== "todos") {
+        const s = (r.setorVenda || "").trim();
+        const rep = REPRESENTATIVOS_SETOR[s];
+        const recordGv = rep ? rep.gv.toUpperCase() : "OUTROS";
+        matchGv = recordGv === selectedGv.toUpperCase();
+      }
+
+      if (matchStatus && matchSector && matchDate && matchReason && matchGv) {
+        // Sum all records matching active filters for baseline comparison
+        baselineValor += r.valorTotal || 0;
+        baselineHl += getRecordHL(r);
+        if (r.solicitacao) {
+          baselineSols.add(r.solicitacao);
+        }
+      }
+    });
+
+    const percentValor = baselineValor > 0 ? (totalValor / baselineValor) * 100 : 100;
+    const percentHl = baselineHl > 0 ? (totalHl / baselineHl) * 100 : 100;
+    const percentSols = baselineSols.size > 0 ? (uniqueSols.size / baselineSols.size) * 100 : 100;
+
+    return {
+      totalValor,
+      totalHl,
+      solicitacoesCount: uniqueSols.size,
+      itemsCount: filteredRecords.length,
+      baselineValor,
+      baselineHl,
+      baselineSolsCount: baselineSols.size,
+      percentValor,
+      percentHl,
+      percentSols,
+      hasActiveSearchTerm: !!searchTerm.trim(),
+      // Status breakdown
+      bApprovedValor,
+      bApprovedHl,
+      bApprovedSolsCount: bApprovedSols.size,
+      bApprovedItemsCount,
+      bPendingValor,
+      bPendingHl,
+      bPendingSolsCount: bPendingSols.size,
+      bPendingItemsCount,
+      bRejectedValor,
+      bRejectedHl,
+      bRejectedSolsCount: bRejectedSols.size,
+      bRejectedItemsCount,
+      bRecadastrarValor,
+      bRecadastrarHl,
+      bRecadastrarSolsCount: bRecadastrarSols.size,
+      bRecadastrarItemsCount
+    };
+  }, [filteredRecords, records, selectedStatus, selectedSector, startDate, endDate, selectedReason, selectedGv, searchTerm, recadastrarSolIds]);
+
+  // Find precise duplicates based on: NB (codigoCliente), products and quantities, date window, and current active month constraints
+  const allDuplicateGroups = useMemo(() => {
+    const parseDateStr = (dateStr: string) => {
+      if (!dateStr) return new Date(0);
+      const parts = dateStr.split("/");
+      if (parts.length !== 3) return new Date(0);
+      const d = parseInt(parts[0], 10);
+      const m = parseInt(parts[1], 10);
+      const y = parseInt(parts[2], 10);
+      if (isNaN(d) || isNaN(m) || isNaN(y)) return new Date(0);
+      return new Date(y, m - 1, d);
+    };
+
+    // Determine the "mês vigente" (active month and year) dynamically from the latest record
+    let maxTime = 0;
+    let activeMonth = new Date().getMonth() + 1;
+    let activeYear = new Date().getFullYear();
+
+    records.forEach(r => {
+      if (!r.dataSolicitacao) return;
+      const d = parseDateStr(r.dataSolicitacao);
+      const t = d.getTime();
+      if (t > maxTime) {
+        maxTime = t;
+        activeMonth = d.getMonth() + 1;
+        activeYear = d.getFullYear();
+      }
+    });
+
+    // 1. Group all individual records by their solicitation number
+    const solsMap: Record<string, ExchangeRecord[]> = {};
+    records.forEach(r => {
+      const solNum = (r.solicitacao || "").trim();
+      if (!solNum) return;
+      if (!solsMap[solNum]) {
+        solsMap[solNum] = [];
+      }
+      solsMap[solNum].push(r);
+    });
+
+    // 2. Map solicitation groups to objects with a unique products signature
+    const solsList: any[] = Object.entries(solsMap).map(([sol, recs]) => {
+      const first = recs[0];
+      const productsKey = recs
+        .map(r => {
+          const prodCode = (r.produto || "").trim();
+          const qty = r.quantidade || 0;
+          if (qty === 1) {
+            return `${prodCode}_${qty}_map:${(r.mapa || "").trim()}`;
+          } else {
+            return `${prodCode}_${qty}`;
+          }
+        })
+        .sort()
+        .join("|");
+
+      const isCustomer = recs.some(r => isCustomerOrigin(r.sistemaOrigem));
+      const sisOrigemResolved = isCustomer ? "Customer" : (recs.find(r => r.sistemaOrigem)?.sistemaOrigem || first.sistemaOrigem || "Promax");
+
+      return {
+        solicitacao: sol,
+        codigoCliente: (first.codigoCliente || "").trim(),
+        nomeCliente: first.nomeCliente || "Cliente Desconhecido",
+        dataSolicitacao: first.dataSolicitacao || "",
+        status: first.status || "Pendente",
+        setorVenda: first.setorVenda || "",
+        mapa: first.mapa || "",
+        nf: first.nf || "",
+        records: recs,
+        productsKey,
+        origem: isCustomer ? "Customer" : (first.sistemaOrigem || "Base Importada Promax (03.18.05)"),
+        sistemaOrigem: sisOrigemResolved,
+        isCustomerOrigin: isCustomer,
+        totalValue: recs.reduce((sum, r) => sum + r.valorTotal, 0)
+      };
+    });
+
+    // Add direct platform registrations (pendingRequests) as solicitations
+    pendingRequests.forEach(pr => {
+      if (!pr.nb) return;
+      const solNum = (pr as any).solicitacao || pr.nf || pr.id;
+      const prItems = pr.items && pr.items.length > 0 
+        ? pr.items.map(item => ({
+            id: `${pr.id}_${item.id || item.item}`,
+            unb: "DIR",
+            descricaoUnb: "Direto Plataforma",
+            codigoCliente: pr.nb,
+            nomeCliente: pr.nb,
+            solicitacao: solNum,
+            tipo: pr.motivo || "Cadastro Direto",
+            dataSolicitacao: pr.data,
+            hora: "00:00",
+            status: pr.statusPromax === "cadastrado" ? "Aprovada" : pr.statusPromax === "reprovado" ? "Reprovada" : "Pendente",
+            dataAcao: pr.data,
+            usuarioAcao: pr.cadastroUser || "Representante",
+            mapa: pr.mapa || "",
+            nf: pr.nf || "",
+            statusNf: "Cadastrado",
+            produto: (item.item || item.itemCode || "SKU").trim(),
+            descricaoProduto: item.descricao || item.itemDesc || "Produto Cadastrado Direto",
+            quantidade: item.quantidade || 1,
+            um: item.unidadeMedida || "CX",
+            valorUnitario: item.precoCalculated || 0,
+            valorTotal: (item.precoCalculated || 0) * (item.quantidade || 1),
+            justificativa: item.motivo || pr.motivo || "Cadastro Direto",
+            veiculo: "",
+            placa: "",
+            transportadora: "",
+            nomeTransportadora: "",
+            motorista: "",
+            nomeMotorista: "",
+            conferente: "",
+            conferenteCarregamento: "",
+            nrPedidoReposicao: "",
+            statusCheck: "OK",
+            sistemaOrigem: "Cadastro Direto na Plataforma",
+            observacao: pr.observacao || "",
+            setorVenda: pr.setor || "",
+            importTimestamp: pr.timestamp || Date.now(),
+            importBatchName: "Cadastro Direto"
+          }))
+        : [{
+            id: pr.id,
+            unb: "DIR",
+            descricaoUnb: "Direto Plataforma",
+            codigoCliente: pr.nb,
+            nomeCliente: pr.nb,
+            solicitacao: solNum,
+            tipo: pr.motivo || "Cadastro Direto",
+            dataSolicitacao: pr.data,
+            hora: "00:00",
+            status: pr.statusPromax === "cadastrado" ? "Aprovada" : pr.statusPromax === "reprovado" ? "Reprovada" : "Pendente",
+            dataAcao: pr.data,
+            usuarioAcao: pr.cadastroUser || "Representante",
+            mapa: pr.mapa || "",
+            nf: pr.nf || "",
+            statusNf: "Cadastrado",
+            produto: (pr.item || pr.produto || "SKU").trim(),
+            descricaoProduto: pr.descricaoProduto || pr.productDesc || "Produto Cadastrado Direto",
+            quantidade: pr.quantidade || 1,
+            um: pr.um || pr.unidadeMedida || "CX",
+            valorUnitario: 0,
+            valorTotal: 0,
+            justificativa: pr.motivo || "Cadastro Direto",
+            veiculo: "",
+            placa: "",
+            transportadora: "",
+            nomeTransportadora: "",
+            motorista: "",
+            nomeMotorista: "",
+            conferente: "",
+            conferenteCarregamento: "",
+            nrPedidoReposicao: "",
+            statusCheck: "OK",
+            sistemaOrigem: "Cadastro Direto na Plataforma",
+            observacao: pr.observacao || "",
+            setorVenda: pr.setor || "",
+            importTimestamp: pr.timestamp || Date.now(),
+            importBatchName: "Cadastro Direto"
+          }];
+
+      const productsKey = prItems
+        .map(r => {
+          const prodCode = (r.produto || "").trim();
+          const qty = r.quantidade || 0;
+          if (qty === 1) {
+            return `${prodCode}_${qty}_map:${(r.mapa || "").trim()}`;
+          } else {
+            return `${prodCode}_${qty}`;
+          }
+        })
+        .sort()
+        .join("|");
+
+      solsList.push({
+        solicitacao: `DIR-${solNum}`,
+        codigoCliente: (pr.nb || "").trim(),
+        nomeCliente: pr.nb ? `PDV #${pr.nb}` : "Cliente Desconhecido",
+        dataSolicitacao: pr.data || "",
+        status: pr.statusPromax === "cadastrado" ? "Aprovada" : pr.statusPromax === "reprovado" ? "Reprovada" : "Pendente",
+        setorVenda: pr.setor || "",
+        mapa: pr.mapa || "",
+        nf: pr.nf || "",
+        records: prItems as any,
+        productsKey,
+        origem: "Cadastro Direto na Plataforma",
+        totalValue: prItems.reduce((sum, r) => sum + r.valorTotal, 0)
+      });
+    });
+
+    // 3. Group solicitations by client NB and products signature
+    const candidates: Record<string, typeof solsList> = {};
+    solsList.forEach(sol => {
+      if (!sol.codigoCliente || !sol.productsKey) return;
+      const key = `${sol.codigoCliente}_${sol.productsKey}`;
+      if (!candidates[key]) {
+        candidates[key] = [];
+      }
+      candidates[key].push(sol);
+    });
+
+    // 4. Cluster duplicates by 30-day date interval and filter by current month
+    const list: any[] = [];
+    const includedCustomerSolIds = new Set<string>();
+
+    Object.entries(candidates).forEach(([candKey, poolSols]) => {
+      if (poolSols.length <= 1) return;
+
+      // Sort solicitations by date (oldest first)
+      const sortedSols = [...poolSols].sort((a, b) => {
+        return parseDateStr(a.dataSolicitacao).getTime() - parseDateStr(b.dataSolicitacao).getTime();
+      });
+
+      // Cluster consecutive solicitations <= 30 days apart
+      const clusters: typeof poolSols[] = [];
+      let currentCluster: typeof poolSols = [];
+
+      sortedSols.forEach((sol, i) => {
+        if (i === 0) {
+          currentCluster.push(sol);
+        } else {
+          const lastSol = currentCluster[currentCluster.length - 1];
+          const d1 = parseDateStr(lastSol.dataSolicitacao);
+          const d2 = parseDateStr(sol.dataSolicitacao);
+          const diffDays = Math.abs(d2.getTime() - d1.getTime()) / (1000 * 60 * 60 * 24);
+
+          if (diffDays <= 30) {
+            currentCluster.push(sol);
+          } else {
+            clusters.push(currentCluster);
+            currentCluster = [sol];
+          }
+        }
+      });
+      if (currentCluster.length > 0) {
+        clusters.push(currentCluster);
+      }
+
+      // Filter clusters: must have size >= 2 and contain at least one pending in the active/current month
+      const validClusters = clusters.filter(cluster => {
+        if (cluster.length <= 1) return false;
+
+        // If the cluster contains any solicitation originated from Customer (Coluna BK), ALWAYS keep it!
+        const hasCustomerSol = cluster.some(sol => sol.isCustomerOrigin);
+        if (hasCustomerSol) return true;
+
+        const pendingCount = cluster.filter(sol => sol.status.toLowerCase().includes("pend")).length;
+        const approvedCount = cluster.filter(sol => sol.status.toLowerCase().includes("aprov")).length;
+        // Se houver apenas uma solicitação pendente e nenhuma aprovada (ou seja, as demais estão reprovadas),
+        // não há conflito ativo que exija atuação do usuário.
+        if (pendingCount === 1 && approvedCount === 0) {
+          return false;
+        }
+
+        return cluster.some(sol => {
+          const isPending = sol.records.some(r => r.status.toLowerCase().includes("pend"));
+          const parts = sol.dataSolicitacao.split("/");
+          if (parts.length !== 3) return false;
+          const m = parseInt(parts[1], 10);
+          const y = parseInt(parts[2], 10);
+          return isPending && m === activeMonth && y === activeYear;
+        });
+      });
+
+      // Map valid clusters to duplicate group format
+      validClusters.forEach((cluster, clusterIdx) => {
+        const hasApproved = cluster.some(sol => sol.status.toLowerCase().includes("aprov"));
+        const hasCustomerInCluster = cluster.some(s => s.isCustomerOrigin);
+        // Sort pending solicitations to find the oldest pending to keep
+        const pendingSols = cluster.filter(sol => sol.status.toLowerCase().includes("pend"));
+        const recommendedKeepSol = hasApproved ? null : pendingSols[0];
+
+        const mappedSols = cluster.map(sol => {
+          const statusClean = sol.status.toLowerCase().trim();
+          let adviceType: "keep_approved" | "already_reproved" | "reject_duplicate_approved" | "approve_recommended" | "reject_duplicate_pending" = "already_reproved";
+          let adviceText = "";
+          let adviceColor = "";
+
+          if (sol.isCustomerOrigin) {
+            includedCustomerSolIds.add(sol.solicitacao);
+            if (statusClean.includes("reprov")) {
+              adviceType = "already_reproved";
+              adviceText = "❌ JÁ REPROVADA: Esta solicitação Customer já foi resolvida e reprovada no Promax.";
+              adviceColor = "border-slate-800 bg-slate-950/40 text-slate-500 opacity-80";
+            } else if (statusClean.includes("aprov")) {
+              adviceType = "keep_approved";
+              adviceText = "✔️ MANTER APROVADA: Solicitação Customer já aprovada no sistema.";
+              adviceColor = "border-emerald-600/40 bg-emerald-950/20 text-emerald-400";
+            } else {
+              adviceType = "reject_duplicate_pending";
+              adviceText = "⚠️ REPROVAR NO PROMAX (ORIGEM CUSTOMER - COLUNA BK): Duplicata enviada via canal Customer. Reprove no Promax e mantenha o registro Promax oficial.";
+              adviceColor = "border-purple-600/60 bg-purple-950/30 text-purple-300 font-bold shadow-xs";
+            }
+          } else if (hasCustomerInCluster && !sol.isCustomerOrigin) {
+            if (statusClean.includes("aprov")) {
+              adviceType = "keep_approved";
+              adviceText = "✔️ MANTER APROVADA: Registro oficial Promax (Coluna BK) aprovado.";
+              adviceColor = "border-emerald-600/40 bg-emerald-950/20 text-emerald-400";
+            } else if (statusClean.includes("reprov")) {
+              adviceType = "already_reproved";
+              adviceText = "❌ JÁ REPROVADA: Registro Promax já reprovado.";
+              adviceColor = "border-slate-800 bg-slate-950/40 text-slate-500 opacity-80";
+            } else {
+              adviceType = "approve_recommended";
+              adviceText = "⭐ REGISTRO OFICIAL PROMAX (COLUNA BK): Mantenha este registro Promax e reprove a duplicata aberta pelo Customer.";
+              adviceColor = "border-emerald-500/50 bg-emerald-950/30 text-emerald-300 font-bold";
+            }
+          } else if (statusClean.includes("aprov")) {
+            adviceType = "keep_approved";
+            adviceText = "✔️ MANTER APROVADA: Esta solicitação já foi aprovada no sistema.";
+            adviceColor = "border-emerald-600/40 bg-emerald-950/20 text-emerald-400";
+          } else if (statusClean.includes("reprov")) {
+            adviceType = "already_reproved";
+            adviceText = "❌ JÁ REPROVADA: Esta duplicata já foi resolvida e reprovada.";
+            adviceColor = "border-slate-800 bg-slate-950/40 text-slate-500 opacity-80";
+          } else if (statusClean.includes("pend")) {
+            if (hasApproved) {
+              adviceType = "reject_duplicate_approved";
+              adviceText = "⚠️ REPROVAR NO PROMAX: Já existe outra solicitação idêntica aprovada!";
+              adviceColor = "border-rose-600/50 bg-rose-950/30 text-rose-400 animate-pulse";
+            } else if (recommendedKeepSol && sol.solicitacao === recommendedKeepSol.solicitacao) {
+              adviceType = "approve_recommended";
+              adviceText = "⭐ RECOMENDAÇÃO: APROVAR esta solicitação e reprovar a outra duplicada.";
+              adviceColor = "border-amber-500/50 bg-amber-950/30 text-amber-300";
+            } else {
+              adviceType = "reject_duplicate_pending";
+              adviceText = "⚠️ RECOMENDAÇÃO: REPROVAR esta duplicata no Promax (Mantenha a outra pendente recomendada).";
+              adviceColor = "border-rose-500/40 bg-rose-950/20 text-rose-400";
+            }
+          }
+
+          // Assign advice to each individual item record inside the solicitation for display
+          const recordsWithAdvice = sol.records.map((r: any) => ({
+            ...r,
+            adviceType,
+            adviceText,
+            adviceColor
+          }));
+
+          return {
+            ...sol,
+            records: recordsWithAdvice,
+            adviceType,
+            adviceText,
+            adviceColor
+          };
+        });
+
+        const firstSol = mappedSols[0];
+        const flatGroupRecords = mappedSols.flatMap(sol => sol.records);
+
+        list.push({
+          key: `${candKey}_cluster_${clusterIdx}`,
+          codigoCliente: firstSol.codigoCliente,
+          nomeCliente: firstSol.nomeCliente,
+          records: flatGroupRecords,
+          solicitations: mappedSols
+        });
+      });
+    });
+
+    // 5. Ensure ALL solicitations with origin "Customer" / "Costumer" in Column BK (03.18.05) appear in duplicate audit
+    const remainingCustomerSols = solsList.filter(sol => sol.isCustomerOrigin && !includedCustomerSolIds.has(sol.solicitacao));
+
+    // Group remaining customer solicitations by client NB
+    const customerByClient: Record<string, typeof solsList> = {};
+    remainingCustomerSols.forEach(sol => {
+      const clientKey = sol.codigoCliente || sol.solicitacao;
+      if (!customerByClient[clientKey]) {
+        customerByClient[clientKey] = [];
+      }
+      customerByClient[clientKey].push(sol);
+    });
+
+    Object.entries(customerByClient).forEach(([clientKey, custSols], idx) => {
+      const mappedSols = custSols.map(sol => {
+        const statusClean = sol.status.toLowerCase().trim();
+        let adviceType: "keep_approved" | "already_reproved" | "reject_duplicate_approved" | "approve_recommended" | "reject_duplicate_pending" = "reject_duplicate_pending";
+        let adviceText = "";
+        let adviceColor = "";
+
+        if (statusClean.includes("reprov")) {
+          adviceType = "already_reproved";
+          adviceText = "❌ JÁ REPROVADA: Esta solicitação Customer já foi resolvida e reprovada no Promax.";
+          adviceColor = "border-slate-800 bg-slate-950/40 text-slate-500 opacity-80";
+        } else if (statusClean.includes("aprov")) {
+          adviceType = "keep_approved";
+          adviceText = "✔️ MANTER APROVADA: Solicitação Customer validada e aprovada.";
+          adviceColor = "border-emerald-600/40 bg-emerald-950/20 text-emerald-400";
+        } else {
+          adviceType = "reject_duplicate_pending";
+          adviceText = "⚠️ SOLICITAÇÃO ORIGEM CUSTOMER (COLUNA BK 03.18.05): Lançamento externo do canal Customer. Audite se for duplicata ou indevida e reprove no Promax.";
+          adviceColor = "border-purple-600/60 bg-purple-950/30 text-purple-300 font-bold shadow-xs";
+        }
+
+        const recordsWithAdvice = sol.records.map((r: any) => ({
+          ...r,
+          adviceType,
+          adviceText,
+          adviceColor
+        }));
+
+        return {
+          ...sol,
+          records: recordsWithAdvice,
+          adviceType,
+          adviceText,
+          adviceColor
+        };
+      });
+
+      const firstSol = mappedSols[0];
+      const flatGroupRecords = mappedSols.flatMap(sol => sol.records);
+
+      list.push({
+        key: `customer_audit_${clientKey}_${idx}`,
+        codigoCliente: firstSol.codigoCliente,
+        nomeCliente: firstSol.nomeCliente,
+        isCustomerAudit: true,
+        records: flatGroupRecords,
+        solicitations: mappedSols
+      });
+    });
+
+    // Sort the duplicate groups by the number of pending solicitations inside them
+    list.sort((a, b) => {
+      const aPendCount = a.solicitations.filter((sol: any) => sol.status.toLowerCase().includes("pend")).length;
+      const bPendCount = b.solicitations.filter((sol: any) => sol.status.toLowerCase().includes("pend")).length;
+      return bPendCount - aPendCount;
+    });
+
+    return list;
+  }, [records, pendingRequests]);
+
+  // Filter duplicate groups based on dropdown/search filters
+  const filteredDuplicateGroups = useMemo(() => {
+    return allDuplicateGroups.filter(g => {
+      // Sub-filter inside duplicates view
+      if (duplicatesSubFilter === "customer") {
+        const hasCust = g.isCustomerAudit || g.solicitations.some((s: any) => s.isCustomerOrigin);
+        if (!hasCust) return false;
+      } else if (duplicatesSubFilter === "promax") {
+        const onlyPromax = !g.isCustomerAudit && g.solicitations.every((s: any) => !s.isCustomerOrigin);
+        if (!onlyPromax) return false;
+      } else if (duplicatesSubFilter === "pendentes") {
+        const hasPending = g.solicitations.some((s: any) => s.status.toLowerCase().includes("pend"));
+        if (!hasPending) return false;
+      }
+
+      // Search text match
+      if (searchTerm) {
+        const norm = searchTerm.trim().toLowerCase();
+        const isOnlyDigits = /^\d+$/.test(norm);
+        let match = false;
+        if (searchField === "nb") {
+          match = matchNbCode(g.codigoCliente, norm);
+        } else if (searchField === "cliente_nome") {
+          match = (g.nomeCliente || "").toLowerCase().includes(norm);
+        } else if (searchField === "cliente") {
+          if (isOnlyDigits) {
+            match = matchNbCode(g.codigoCliente, norm) || new RegExp(`(^|\\D)${norm}(\\D|$)`, "i").test(g.nomeCliente || "");
+          } else {
+            match = (g.nomeCliente || "").toLowerCase().includes(norm) || matchNbCode(g.codigoCliente, norm);
+          }
+        } else if (searchField === "item") {
+          match = g.records.some((r: any) => 
+            (r.produto || "").toLowerCase().includes(norm) || 
+            (r.descricaoProduto || "").toLowerCase().includes(norm)
+          );
+        } else {
+          const nameMatch = isOnlyDigits 
+            ? new RegExp(`(^|\\D)${norm}(\\D|$)`, "i").test(g.nomeCliente || "")
+            : (g.nomeCliente || "").toLowerCase().includes(norm);
+
+          match = nameMatch ||
+            matchNbCode(g.codigoCliente, norm) ||
+            g.records.some((r: any) => 
+              (r.produto || "").toLowerCase().includes(norm) || 
+              (r.descricaoProduto || "").toLowerCase().includes(norm) ||
+              (r.sistemaOrigem || "").toLowerCase().includes(norm)
+            );
+
+          if (norm.includes("costumer") || norm.includes("customer")) {
+            const hasCustomer = g.isCustomerAudit || g.solicitations.some((s: any) => s.isCustomerOrigin) || g.records.some((r: any) => isCustomerOrigin(r.sistemaOrigem));
+            if (hasCustomer) match = true;
+          }
+          if (norm.includes("promax")) {
+            const hasPromax = g.solicitations.some((s: any) => !s.isCustomerOrigin) || g.records.some((r: any) => isPromaxOrigin(r.sistemaOrigem));
+            if (hasPromax) match = true;
+          }
+        }
+        if (!match) return false;
+      }
+
+      // Sector filter
+      if (selectedSector !== "todos") {
+        const hasSector = g.records.some(r => r.setorVenda === selectedSector);
+        if (!hasSector) return false;
+      }
+
+      // Date range filter
+      if (startDate || endDate) {
+        const hasDateInRange = g.records.some(r => {
+          const isoDate = convertToISODate(r.dataSolicitacao);
+          if (!isoDate) return false;
+          if (startDate && isoDate < startDate) return false;
+          if (endDate && isoDate > endDate) return false;
+          return true;
+        });
+        if (!hasDateInRange) return false;
+      }
+
+      return true;
+    });
+  }, [allDuplicateGroups, duplicatesSubFilter, searchTerm, searchField, selectedSector, startDate, endDate]);
+
+  // Statistics for Duplicates view tabs and quick actions
+  const duplicateStats = useMemo(() => {
+    let totalCustomerGroups = 0;
+    let totalCustomerPendingSols = 0;
+    let totalPromaxGroups = 0;
+    let pendingReproveCount = 0;
+
+    allDuplicateGroups.forEach(g => {
+      const isCust = g.isCustomerAudit || g.solicitations.some((s: any) => s.isCustomerOrigin);
+      if (isCust) {
+        totalCustomerGroups++;
+      } else {
+        totalPromaxGroups++;
+      }
+
+      g.solicitations.forEach((s: any) => {
+        const isPend = s.status.toLowerCase().includes("pend");
+        if (isPend) {
+          pendingReproveCount++;
+          if (s.isCustomerOrigin) {
+            totalCustomerPendingSols++;
+          }
+        }
+      });
+    });
+
+    return {
+      totalCustomerGroups,
+      totalCustomerPendingSols,
+      totalPromaxGroups,
+      pendingReproveCount
+    };
+  }, [allDuplicateGroups]);
+
+  // Sync back to old set for list highlights
+  const duplicateSolicitationIds = useMemo(() => {
+    const duplicateSolIds = new Set<string>();
+    allDuplicateGroups.forEach(g => {
+      g.records.forEach(r => {
+        if (r.solicitacao) {
+          duplicateSolIds.add(r.solicitacao);
+        }
+      });
+    });
+    return duplicateSolIds;
+  }, [allDuplicateGroups]);
+
+  // Sliced datasets for pagination
+  const paginatedIndividualRecords = useMemo(() => {
+    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+    return filteredRecords.slice(startIndex, startIndex + ITEMS_PER_PAGE);
+  }, [filteredRecords, currentPage]);
+
+  const paginatedGroupedSolicitations = useMemo(() => {
+    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+    return groupedSolicitations.slice(startIndex, startIndex + ITEMS_PER_PAGE);
+  }, [groupedSolicitations, currentPage]);
+
+  const paginatedDuplicateGroups = useMemo(() => {
+    const startIndex = (currentPage - 1) * ITEMS_PER_PAGE;
+    return filteredDuplicateGroups.slice(startIndex, startIndex + ITEMS_PER_PAGE);
+  }, [filteredDuplicateGroups, currentPage]);
+
+  const totalPages = useMemo(() => {
+    let count = 0;
+    if (viewMode === "individual") {
+      count = filteredRecords.length;
+    } else if (viewMode === "grouped") {
+      count = groupedSolicitations.length;
+    } else {
+      count = filteredDuplicateGroups.length;
+    }
+    return Math.max(1, Math.ceil(count / ITEMS_PER_PAGE));
+  }, [viewMode, filteredRecords.length, groupedSolicitations.length, filteredDuplicateGroups.length]);
+
+  const openGroupedDetails = (g: any) => {
+    setActiveGroupedSol(g);
+    setActiveDetailRecord(null);
+    setReviewStatus(g.status);
+    setReviewObs(g.observacao || "");
+  };
+
+  const openRecordDetails = (rec: ExchangeRecord) => {
+    setActiveDetailRecord(rec);
+    setActiveGroupedSol(null);
+    setReviewStatus(rec.status);
+    setReviewObs(rec.observacao || "");
+  };
+
+  const handleApplyStatusChange = () => {
+    if (isGroupedView && activeGroupedSol) {
+      // Apply status change to all records in the grouped solicitation
+      activeGroupedSol.records.forEach((r: ExchangeRecord) => {
+        onUpdateRecordStatus(r.id, reviewStatus, reviewObs);
+      });
+      
+      // Update local grouped object state
+      setActiveGroupedSol((prev: any) => {
+        if (!prev) return null;
+        return {
+          ...prev,
+          status: reviewStatus,
+          observacao: reviewObs,
+          records: prev.records.map((r: ExchangeRecord) => ({
+            ...r,
+            status: reviewStatus,
+            observacao: reviewObs,
+            dataAcao: new Date().toLocaleDateString("pt-BR"),
+            usuarioAcao: "Administrador Logado"
+          }))
+        };
+      });
+    } else if (activeDetailRecord) {
+      onUpdateRecordStatus(activeDetailRecord.id, reviewStatus, reviewObs);
+      
+      setActiveDetailRecord(prev => prev ? {
+        ...prev,
+        status: reviewStatus,
+        observacao: reviewObs,
+        dataAcao: new Date().toLocaleDateString("pt-BR"),
+        usuarioAcao: "Administrador Logado"
+      } : null);
+    }
+  };
+
+  const getStatusBadge = (statusStr: string, solId?: string) => {
+    if (solId && recadastrarSolIds.has(solId)) {
+      return (
+        <span className="px-2.5 py-1 bg-indigo-950/80 text-indigo-400 border border-indigo-900/60 text-xs font-semibold rounded-full flex items-center w-fit space-x-1 font-mono">
+          <RefreshCw className="w-3.5 h-3.5" />
+          <span>Recadastrar</span>
+        </span>
+      );
+    }
+    const s = statusStr.toLowerCase();
+    if (s.includes("aprov")) {
+      return (
+        <span className="px-2.5 py-1 bg-emerald-950/80 text-emerald-400 border border-emerald-900/60 text-xs font-semibold rounded-full flex items-center w-fit space-x-1 font-mono">
+          <CheckCircle2 className="w-3.5 h-3.5" />
+          <span>Aprovada</span>
+        </span>
+      );
+    } else if (s.includes("reprov")) {
+      return (
+        <span className="px-2.5 py-1 bg-red-950/80 text-red-400 border border-red-900/60 text-xs font-semibold rounded-full flex items-center w-fit space-x-1 font-mono">
+          <AlertCircle className="w-3.5 h-3.5" />
+          <span>Reprovada</span>
+        </span>
+      );
+    } else {
+      return (
+        <span className="px-2.5 py-1 bg-amber-950/80 text-amber-400 border border-amber-900/60 text-xs font-semibold rounded-full flex items-center w-fit space-x-1 font-mono">
+          <RefreshCw className="w-3.5 h-3.5 animate-spin-[spin_3s_linear_infinite]" />
+          <span>Pendente</span>
+        </span>
+      );
+    }
+  };
+
+  const formatCurrency = (val: number) => {
+    return new Intl.NumberFormat("pt-BR", {
+      style: "currency",
+      currency: "BRL"
+    }).format(val);
+  };
+
+  const {
+    totalAllValor,
+    totalAllHl,
+    totalAllSols,
+    pctApprovedValor,
+    pctPendingValor,
+    pctRejectedValor,
+    pctRecadastrarValor,
+    pctApprovedHl,
+    pctPendingHl,
+    pctRejectedHl,
+    pctRecadastrarHl,
+    pctApprovedSols,
+    pctPendingSols,
+    pctRejectedSols,
+    pctRecadastrarSols
+  } = useMemo(() => {
+    const totalV = dashStats.bApprovedValor + dashStats.bPendingValor + dashStats.bRejectedValor + dashStats.bRecadastrarValor;
+    const totalH = dashStats.bApprovedHl + dashStats.bPendingHl + dashStats.bRejectedHl + dashStats.bRecadastrarHl;
+    const totalS = dashStats.bApprovedSolsCount + dashStats.bPendingSolsCount + dashStats.bRejectedSolsCount + dashStats.bRecadastrarSolsCount;
+
+    return {
+      totalAllValor: totalV,
+      totalAllHl: totalH,
+      totalAllSols: totalS,
+      
+      pctApprovedValor: totalV > 0 ? (dashStats.bApprovedValor / totalV) * 100 : 0,
+      pctPendingValor: totalV > 0 ? (dashStats.bPendingValor / totalV) * 100 : 0,
+      pctRejectedValor: totalV > 0 ? (dashStats.bRejectedValor / totalV) * 100 : 0,
+      pctRecadastrarValor: totalV > 0 ? (dashStats.bRecadastrarValor / totalV) * 100 : 0,
+
+      pctApprovedHl: totalH > 0 ? (dashStats.bApprovedHl / totalH) * 100 : 0,
+      pctPendingHl: totalH > 0 ? (dashStats.bPendingHl / totalH) * 100 : 0,
+      pctRejectedHl: totalH > 0 ? (dashStats.bRejectedHl / totalH) * 100 : 0,
+      pctRecadastrarHl: totalH > 0 ? (dashStats.bRecadastrarHl / totalH) * 100 : 0,
+
+      pctApprovedSols: totalS > 0 ? (dashStats.bApprovedSolsCount / totalS) * 100 : 0,
+      pctPendingSols: totalS > 0 ? (dashStats.bPendingSolsCount / totalS) * 100 : 0,
+      pctRejectedSols: totalS > 0 ? (dashStats.bRejectedSolsCount / totalS) * 100 : 0,
+      pctRecadastrarSols: totalS > 0 ? (dashStats.bRecadastrarSolsCount / totalS) * 100 : 0,
+    };
+  }, [dashStats]);
+
+  return (
+    <div className="space-y-6 text-slate-100 relative">
+      
+      {/* PDF Export Feedback Toast Notification */}
+      {pdfNotification && (
+        <div className={`fixed top-5 right-5 z-50 flex items-center space-x-3 px-4 py-3 rounded-xl border shadow-2xl transition-all duration-300 animate-slide-in ${
+          pdfNotification.type === "success" 
+            ? "bg-slate-900 border-emerald-500/60 text-emerald-300" 
+            : "bg-slate-900 border-rose-500/60 text-rose-300"
+        }`}>
+          {pdfNotification.type === "success" ? (
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          ) : (
+            <AlertCircle className="w-5 h-5 text-rose-400 shrink-0" />
+          )}
+          <div className="text-xs font-sans">
+            <p className="font-bold">{pdfNotification.type === "success" ? "Relatório PDF Gerado" : "Aviso de Auditoria"}</p>
+            <p className="text-slate-300 mt-0.5">{pdfNotification.message}</p>
+          </div>
+          <button 
+            onClick={() => setPdfNotification(null)}
+            className="text-slate-400 hover:text-white p-1 rounded transition-colors cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+      
+      {/* Search & Filter Header card */}
+      <div className="bg-slate-900/95 p-6 rounded-2xl border border-slate-800 shadow-2xl space-y-5">
+        
+        {/* Tier 1: Primary Controls */}
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-800/60">
+          
+          {/* Quick Search with Field Selection */}
+          <div className="flex flex-col sm:flex-row gap-3 flex-1">
+            {/* Field selection dropdown */}
+            <div className="sm:w-60 shrink-0 relative">
+              <select
+                value={searchField}
+                onChange={(e) => setSearchField(e.target.value)}
+                className="w-full pl-3 pr-8 py-3 bg-slate-950 border border-slate-850 rounded-xl text-xs font-bold text-slate-300 focus:outline-hidden focus:ring-2 focus:ring-blue-600 font-mono cursor-pointer transition-all shadow-md appearance-none"
+              >
+                <option value="todos">🔍 Todos os Campos</option>
+                <option value="nb">🔢 Código Cliente (NB)</option>
+                <option value="cliente_nome">👤 Nome / Razão Social</option>
+                <option value="cliente">👤 Cliente (Nome ou NB)</option>
+                <option value="setor">📍 Setor de Venda</option>
+                <option value="nf">📄 Nota Fiscal (NF-e)</option>
+                <option value="motorista">🚚 Motorista</option>
+                <option value="mapa">🗺️ Mapa</option>
+                <option value="solicitacao">🔢 Nº da Solicitação</option>
+                <option value="item">📦 Item (Código/Descrição)</option>
+              </select>
+              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-3 text-slate-400">
+                <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                  <path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/>
+                </svg>
+              </div>
+            </div>
+
+            {/* Search Input field */}
+            <div className="relative flex-1">
+              <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 w-4 h-4" />
+              <input
+                type="text"
+                placeholder={
+                  searchField === "todos" ? "Buscar por cliente, produto, NF, motorista, mapa, solicitação..." :
+                  searchField === "nb" ? "NB: Digite o Código do Cliente (ex: 21 ou início)..." :
+                  searchField === "cliente_nome" ? "Cliente: Digite o Nome ou Razão Social..." :
+                  searchField === "cliente" ? "Cliente: Digite o Nome ou NB (ex: 21)..." :
+                  searchField === "setor" ? "Setor: Digite o Setor de Venda..." :
+                  searchField === "nf" ? "NF: Digite o número da NF-e..." :
+                  searchField === "motorista" ? "Motorista: Digite o nome do motorista..." :
+                  searchField === "mapa" ? "Mapa: Digite o número do mapa..." :
+                  searchField === "solicitacao" ? "Solicitação: Digite o número da solicitação..." :
+                  "Item: Digite o código ou nome do produto..."
+                }
+                value={localSearchTerm}
+                onChange={(e) => setLocalSearchTerm(e.target.value)}
+                className="w-full pl-10 pr-10 py-3 bg-slate-950 border border-slate-850 rounded-xl text-sm text-slate-200 focus:outline-hidden focus:ring-2 focus:ring-blue-600 focus:border-transparent transition-all font-mono placeholder:font-sans placeholder:text-slate-500 shadow-inner"
+              />
+              {localSearchTerm && (
+                <button
+                  onClick={() => setLocalSearchTerm("")}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-1 hover:bg-slate-800 rounded-full transition-colors"
+                  title="Limpar busca"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Right: View Mode Toggle */}
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider font-mono hidden xl:inline">Visão:</span>
+            <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded-xl border border-slate-850 w-full sm:w-auto">
+              <button
+                type="button"
+                onClick={() => {
+                  setViewMode("individual");
+                  setActiveDetailRecord(null);
+                  setActiveGroupedSol(null);
+                }}
+                className={`flex-1 sm:flex-none px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
+                  viewMode === "individual"
+                    ? "bg-blue-600 text-white font-semibold shadow-md"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                Itens Individuais
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setViewMode("grouped");
+                  setActiveDetailRecord(null);
+                  setActiveGroupedSol(null);
+                }}
+                className={`flex-1 sm:flex-none px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center justify-center space-x-1 ${
+                  viewMode === "grouped"
+                    ? "bg-blue-600 text-white font-semibold shadow-md"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>Solicitações ({groupedSolicitations.length})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setViewMode("duplicates");
+                  setActiveDetailRecord(null);
+                  setActiveGroupedSol(null);
+                }}
+                className={`flex-1 sm:flex-none px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer flex items-center justify-center space-x-1 relative ${
+                  viewMode === "duplicates"
+                    ? "bg-amber-600 text-white font-semibold shadow-md"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span>Duplicatas ({filteredDuplicateGroups.length})</span>
+                {filteredDuplicateGroups.length > 0 && (
+                  <span className="absolute -top-1.5 -right-1 px-1.5 py-0.5 bg-red-600 text-white rounded-full text-[9px] font-bold animate-pulse">
+                    {filteredDuplicateGroups.length}
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {/* Primary PDF Export Button */}
+            <button
+              type="button"
+              onClick={handleOpenExportModal}
+              className="flex items-center space-x-1.5 px-3.5 py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-bold font-mono transition-all cursor-pointer shadow-md shadow-blue-950/60 border border-blue-400/40 hover:scale-[1.02] shrink-0"
+              title="Exportar Relatório Analítico em PDF (organizado por setor, com todas as solicitações e status)"
+            >
+              <FileText className="w-3.5 h-3.5 text-blue-100" />
+              <span>Exportar PDF</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Tier 2: Advanced Granular Filters Grid */}
+        <div className="bg-slate-950/60 p-4 rounded-xl border border-slate-850/70 space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-850/60 pb-2">
+            <p className="text-[10px] uppercase font-bold text-slate-400 tracking-widest font-mono flex items-center gap-1.5">
+              <Filter className="w-3 h-3 text-slate-400" />
+              <span>Filtros de Auditoria & Pesquisa Avançada</span>
+            </p>
+
+            {/* Quick Pill Filter for Reposição vs Troca */}
+            <div className="flex items-center space-x-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
+              <button
+                type="button"
+                onClick={() => setProcessTypeFilter("todos")}
+                className={`px-2.5 py-1 rounded text-[10px] font-bold font-mono transition-all cursor-pointer ${
+                  processTypeFilter === "todos"
+                    ? "bg-blue-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                🌐 Todos
+              </button>
+              <button
+                type="button"
+                onClick={() => setProcessTypeFilter("reposicao")}
+                className={`px-2.5 py-1 rounded text-[10px] font-bold font-mono transition-all cursor-pointer ${
+                  processTypeFilter === "reposicao"
+                    ? "bg-indigo-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                📦 Reposição (Falta)
+              </button>
+              <button
+                type="button"
+                onClick={() => setProcessTypeFilter("troca")}
+                className={`px-2.5 py-1 rounded text-[10px] font-bold font-mono transition-all cursor-pointer ${
+                  processTypeFilter === "troca"
+                    ? "bg-emerald-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                🔁 Troca (Outros)
+              </button>
+            </div>
+
+            {/* Quick Export Buttons: PDF and Excel grouped by RN */}
+            <div className="flex items-center space-x-1.5">
+              <button
+                type="button"
+                onClick={handleOpenExportModal}
+                className="flex items-center space-x-1 px-2.5 py-1 bg-slate-900 hover:bg-slate-850 text-blue-300 hover:text-white border border-blue-800/60 hover:border-blue-600 rounded-lg text-[10px] font-bold font-mono transition-all cursor-pointer shadow-xs"
+                title="Abrir painel de exportação de relatório analítico em PDF (Agrupado por RN)"
+              >
+                <FileText className="w-3 h-3 text-blue-400" />
+                <span>Relatório PDF</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleQuickExportActiveDateExcel}
+                disabled={isExportingExcel}
+                className="flex items-center space-x-1 px-2.5 py-1 bg-slate-900 hover:bg-slate-850 text-emerald-300 hover:text-white border border-emerald-800/60 hover:border-emerald-600 rounded-lg text-[10px] font-bold font-mono transition-all cursor-pointer shadow-xs disabled:opacity-50"
+                title="Exportar planilha Excel (.xlsx) com todas as solicitações agrupadas por RN e Setor"
+              >
+                {isExportingExcel ? (
+                  <Loader2 className="w-3 h-3 animate-spin text-emerald-400" />
+                ) : (
+                  <Download className="w-3 h-3 text-emerald-400" />
+                )}
+                <span>Excel (RNs)</span>
+              </button>
+            </div>
+          </div>
+          
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
+            
+            {/* Process Type dropdown */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono block">Tipo de Processo</label>
+              <select
+                value={processTypeFilter}
+                onChange={(e) => setProcessTypeFilter(e.target.value as any)}
+                className="w-full bg-slate-900 hover:bg-slate-850 border border-slate-800 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-300 focus:outline-hidden focus:ring-1 focus:ring-blue-500 font-mono cursor-pointer transition-colors"
+              >
+                <option value="todos">🌐 Todos os Processos</option>
+                <option value="reposicao">📦 Reposição (Falta)</option>
+                <option value="troca">🔁 Troca (Outros Motivos)</option>
+              </select>
+            </div>
+
+            {/* Sector filter */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono block">Setor de Venda</label>
+              <select
+                value={selectedSector}
+                onChange={(e) => {
+                  setSelectedSector(e.target.value);
+                  if (e.target.value === "todos" && onClearSectorFilter) onClearSectorFilter();
+                }}
+                className="w-full bg-slate-900 hover:bg-slate-850 border border-slate-800 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-300 focus:outline-hidden focus:ring-1 focus:ring-blue-500 font-mono cursor-pointer transition-colors"
+              >
+                <option value="todos">Todos os Setores</option>
+                {sectors.map(sec => (
+                  <option key={sec} value={sec}>Setor {sec}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Date Inicial Filter */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono block">Data Inicial</label>
+              <div className="relative">
+                <input
+                  type="date"
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  className="w-full bg-slate-900 hover:bg-slate-850 border border-slate-800 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-300 focus:outline-hidden focus:ring-1 focus:ring-blue-500 font-mono cursor-pointer transition-colors"
+                  title="Selecione a data inicial"
+                />
+              </div>
+            </div>
+
+            {/* Date Final Filter */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono block">Data Final</label>
+              <div className="relative">
+                <input
+                  type="date"
+                  value={endDate}
+                  onChange={(e) => setEndDate(e.target.value)}
+                  className="w-full bg-slate-900 hover:bg-slate-850 border border-slate-800 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-300 focus:outline-hidden focus:ring-1 focus:ring-blue-500 font-mono cursor-pointer transition-colors"
+                  title="Selecione a data final"
+                />
+              </div>
+            </div>
+
+            {/* Motivo filter */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono block">Motivo / Justificativa</label>
+              <select
+                value={selectedReason}
+                onChange={(e) => setSelectedReason(e.target.value)}
+                className="w-full bg-slate-900 hover:bg-slate-850 border border-slate-800 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-300 focus:outline-hidden focus:ring-1 focus:ring-blue-500 cursor-pointer transition-colors truncate"
+              >
+                <option value="todos">Todos os Motivos</option>
+                {uniqueReasons.map(r => (
+                  <option key={r} value={r}>{r}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* GV filter */}
+            <div className="space-y-1.5">
+              <label className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono block">Gerência (GV)</label>
+              <select
+                value={selectedGv}
+                onChange={(e) => setSelectedGv(e.target.value)}
+                className="w-full bg-slate-900 hover:bg-slate-850 border border-slate-800 rounded-lg px-2.5 py-2 text-xs font-semibold text-slate-300 focus:outline-hidden focus:ring-1 focus:ring-blue-500 font-mono cursor-pointer transition-colors"
+              >
+                <option value="todos">Todas as GVs</option>
+                {uniqueGVsList.map(g => (
+                  <option key={g} value={g}>{g}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Quick Date Export Banner when a date is selected */}
+            {(startDate || endDate) && (
+              <div className="col-span-1 sm:col-span-2 lg:col-span-6 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-blue-950/40 border border-blue-800/60 p-2.5 rounded-xl text-xs font-mono shadow-sm animate-fade-in mt-1">
+                <div className="flex items-center space-x-2 text-blue-200">
+                  <Calendar className="w-4 h-4 text-blue-400 shrink-0" />
+                  <span>
+                    Filtro de Data Ativo: <strong>{convertToPtDate(startDate)}</strong> {endDate && endDate !== startDate ? `até ${convertToPtDate(endDate)}` : ""}
+                  </span>
+                  <span className="text-slate-400 text-[11px] hidden md:inline">
+                    • {filteredRecords.length} registros no filtro
+                  </span>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={handleQuickExportActiveDate}
+                    disabled={isExportingPdf}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold transition-all cursor-pointer shadow-md disabled:opacity-50"
+                    title="Exportar PDF desta data com todas as solicitações (aprovadas, reprovadas e pendentes) separadas por setor"
+                  >
+                    {isExportingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                    <span>Baixar PDF Desta Data</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleOpenExportModal}
+                    className="text-[11px] text-blue-300 hover:text-white underline cursor-pointer px-1"
+                  >
+                    Opções
+                  </button>
+                </div>
+              </div>
+            )}
+
+          </div>
+        </div>
+
+        {/* Tier 3: Sorting Options Bar */}
+        <div className="bg-slate-950/40 p-3 rounded-xl border border-slate-850/60 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs mt-3">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider font-mono mr-2 flex items-center gap-1">
+              <TrendingUp className="w-3.5 h-3.5 text-blue-400" />
+              <span>Ordenar por:</span>
+            </span>
+            {[
+              { id: "data", label: "Data" },
+              { id: "valor", label: "Valor (R$)" },
+              { id: "hecto", label: "Volume (HL)" }
+            ].map(item => {
+              const isActive = sortBy === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => {
+                    if (isActive) {
+                      setSortOrder(prev => prev === "asc" ? "desc" : "asc");
+                    } else {
+                      setSortBy(item.id as any);
+                      setSortOrder("desc"); // Default to desc on change
+                    }
+                  }}
+                  className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer border flex items-center space-x-1.5 ${
+                    isActive
+                      ? "bg-slate-900 text-blue-400 border-blue-500/50 shadow-md font-semibold font-mono"
+                      : "bg-slate-950/40 hover:bg-slate-950 text-slate-400 border-slate-900 font-mono"
+                  }`}
+                >
+                  <span>{item.label}</span>
+                  {isActive && (
+                    sortOrder === "desc" 
+                      ? <ChevronDown className="w-3.5 h-3.5 text-blue-400" /> 
+                      : <ChevronUp className="w-3.5 h-3.5 text-blue-400" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <div className="text-slate-400 font-mono text-[10px] flex items-center gap-1.5">
+            <span className="uppercase text-slate-500">Direção:</span>
+            <button
+              onClick={() => setSortOrder(prev => prev === "asc" ? "desc" : "asc")}
+              className="px-2 py-1 bg-slate-900 hover:bg-slate-850 text-white rounded border border-slate-800 transition-colors uppercase font-bold text-[9px] cursor-pointer"
+            >
+              {sortOrder === "desc" ? "Decrescente" : "Crescente"}
+            </button>
+          </div>
+        </div>
+
+        {/* Status Selection and Action reset row */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pt-3">
+          
+          {/* Status filters */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider font-mono mr-2">Filtro Status:</span>
+            {[
+              { id: "todos", label: "Todos os Pedidos" },
+              { id: "aprovada", label: "Aprovadas" },
+              { id: "pendente", label: "Pendentes" },
+              { id: "reprovada", label: "Reprovadas" },
+              { id: "recadastrar", label: "Recadastrar" }
+            ].map(p => (
+              <button
+                key={p.id}
+                onClick={() => {
+                  setSelectedStatus(p.id);
+                  setActiveDetailRecord(null);
+                  setActiveGroupedSol(null);
+                }}
+                className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer whitespace-nowrap border ${
+                  selectedStatus === p.id
+                    ? "bg-blue-600 text-white border-blue-500 shadow-md font-semibold"
+                    : "bg-slate-950 hover:bg-slate-850 text-slate-300 border-slate-850"
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Quick Stats / Active Conflicts */}
+          <div className="flex items-center gap-3 text-xs font-semibold text-slate-400 font-mono">
+            {allDuplicateGroups.length > 0 && (
+              <span className="text-red-400 bg-red-950/40 border border-red-900/40 px-2.5 py-1.5 rounded-lg animate-pulse flex items-center space-x-1 font-sans">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                <span>{allDuplicateGroups.length} conflitos detectados</span>
+              </span>
+            )}
+            
+            {/* Active filters clear reset button */}
+            {(selectedSector !== "todos" || selectedReason !== "todos" || selectedGv !== "todos" || startDate || endDate || selectedStatus !== "todos" || localSearchTerm || searchField !== "todos") && (
+              <button
+                onClick={() => {
+                  setLocalSearchTerm("");
+                  setSearchField("todos");
+                  setSelectedSector("todos");
+                  setSelectedReason("todos");
+                  setSelectedGv("todos");
+                  setSelectedStatus("todos");
+                  setStartDate("");
+                  setEndDate("");
+                  if (onClearSectorFilter) onClearSectorFilter();
+                }}
+                className="px-3 py-1.5 bg-rose-950 hover:bg-rose-900/80 border border-rose-900 text-rose-300 text-[10px] font-bold rounded-lg flex items-center space-x-1 cursor-pointer transition-colors"
+                title="Limpar todos os filtros"
+              >
+                <X className="w-3 h-3" />
+                <span>Limpar Filtros</span>
+              </button>
+            )}
+
+            <span className="text-slate-400">
+              {viewMode === "duplicates" ? (
+                `Mostrando ${filteredDuplicateGroups.length} de ${allDuplicateGroups.length} conflitos`
+              ) : (
+                `Mostrando ${isGroupedView ? groupedSolicitations.length : filteredRecords.length} de ${isGroupedView ? groupedSolicitations.length : records.length} ${isGroupedView ? "solicitações" : "registros"}`
+              )}
+            </span>
+          </div>
+
+        </div>
+
+      </div>
+
+      {filteredSector && (
+        <div className="bg-blue-950/80 text-blue-300 border border-blue-900/60 p-3.5 rounded-xl text-xs flex justify-between items-center font-mono animate-fade-in shadow-md">
+          <span>Setor <strong>{filteredSector}</strong> filtrado pela Visão Geral de Custos.</span>
+          <button
+            onClick={() => {
+              setSelectedSector("todos");
+              if (onClearSectorFilter) onClearSectorFilter();
+            }}
+            className="px-2.5 py-1 bg-blue-900/50 hover:bg-blue-900 text-white rounded text-[10px] font-bold uppercase transition-colors cursor-pointer"
+          >
+            Limpar Filtro de Setor
+          </button>
+        </div>
+      )}
+
+      {/* PAINEL DE INDICADORES DINÂMICOS (DASHBOARD DA AUDITORIA) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 animate-fade-in">
+        {/* Card 1: Valor Total */}
+        <div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-xl flex items-center justify-between space-x-4 relative overflow-hidden group hover:border-blue-600/40 transition-colors">
+          <div className="space-y-1 z-10">
+            <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-mono block">
+              {selectedStatus === "todos"
+                ? "Valor Geral (R$)"
+                : selectedStatus === "aprovada"
+                ? "Valor Consumido (R$)"
+                : selectedStatus === "pendente"
+                ? "Valor Pendente (R$)"
+                : selectedStatus === "reprovada"
+                ? "Valor Reprovado (R$)"
+                : "Valor Recadastrar (R$)"}
+            </span>
+            <span className="text-xl lg:text-2xl font-extrabold text-blue-400 font-mono block">{formatCurrency(dashStats.totalValor)}</span>
+            <span className="text-[10px] text-slate-400 font-mono block leading-tight">
+              {dashStats.hasActiveSearchTerm ? (
+                <>
+                  <span className="text-emerald-400 font-bold">{dashStats.percentValor.toFixed(1)}%</span> do período ({formatCurrency(dashStats.baselineValor)})
+                </>
+              ) : selectedStatus === "todos" ? (
+                "Total de todas as solicitações"
+              ) : selectedStatus === "aprovada" ? (
+                "Apenas solicitações aprovadas"
+              ) : selectedStatus === "pendente" ? (
+                "Apenas solicitações pendentes"
+              ) : selectedStatus === "reprovada" ? (
+                "Apenas solicitações reprovadas"
+              ) : (
+                "Apenas solicitações a recadastrar"
+              )}
+            </span>
+          </div>
+          <div className="p-3 bg-blue-950/60 rounded-xl border border-blue-900/40 text-blue-400 group-hover:scale-110 transition-transform">
+            <DollarSign className="w-5 h-5" />
+          </div>
+        </div>
+
+        {/* Card 2: Volume em Hectolitros */}
+        <div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-xl flex items-center justify-between space-x-4 relative overflow-hidden group hover:border-indigo-600/40 transition-colors">
+          <div className="space-y-1 z-10">
+            <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-mono block">
+              {selectedStatus === "todos"
+                ? "Volume Geral (HL)"
+                : selectedStatus === "aprovada"
+                ? "Volume em Hectolitros (HL)"
+                : selectedStatus === "pendente"
+                ? "Volume Pendente (HL)"
+                : selectedStatus === "reprovada"
+                ? "Volume Reprovado (HL)"
+                : "Volume Recadastrar (HL)"}
+            </span>
+            <span className="text-xl lg:text-2xl font-extrabold text-indigo-400 font-mono block">{dashStats.totalHl.toFixed(2)} HL</span>
+            <span className="text-[10px] text-slate-400 font-mono block leading-tight">
+              {dashStats.hasActiveSearchTerm ? (
+                <>
+                  <span className="text-indigo-450 font-bold">{dashStats.percentHl.toFixed(1)}%</span> do período ({dashStats.baselineHl.toFixed(2)} HL)
+                </>
+              ) : selectedStatus === "todos" ? (
+                "Volume total das solicitações"
+              ) : selectedStatus === "aprovada" ? (
+                "Volume das solicitações aprovadas"
+              ) : selectedStatus === "pendente" ? (
+                "Volume das solicitações pendentes"
+              ) : selectedStatus === "reprovada" ? (
+                "Volume das solicitações reprovadas"
+              ) : (
+                "Volume das solicitações a recadastrar"
+              )}
+            </span>
+          </div>
+          <div className="p-3 bg-indigo-950/60 rounded-xl border border-indigo-900/40 text-indigo-400 group-hover:scale-110 transition-transform">
+            <TrendingUp className="w-5 h-5" />
+          </div>
+        </div>
+
+        {/* Card 3: Número de Solicitações */}
+        <div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-xl flex items-center justify-between space-x-4 relative overflow-hidden group hover:border-emerald-600/40 transition-colors">
+          <div className="space-y-1 z-10">
+            <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-mono block">
+              {selectedStatus === "todos"
+                ? "Solicitações Gerais"
+                : selectedStatus === "aprovada"
+                ? "Solicitações Atendidas"
+                : selectedStatus === "pendente"
+                ? "Solicitações Pendentes"
+                : selectedStatus === "reprovada"
+                ? "Solicitações Reprovadas"
+                : "Solicitações Recadastrar"}
+            </span>
+            <span className="text-xl lg:text-2xl font-extrabold text-emerald-400 font-mono block">{dashStats.solicitacoesCount} Sols.</span>
+            <span className="text-[10px] text-slate-400 font-mono block leading-tight">
+              {dashStats.hasActiveSearchTerm ? (
+                <>
+                  <span className="text-emerald-450 font-bold">{dashStats.percentSols.toFixed(1)}%</span> do período ({dashStats.baselineSolsCount} Sols.)
+                </>
+              ) : selectedStatus === "todos" ? (
+                `Total de ${dashStats.itemsCount} itens lançados`
+              ) : (
+                `Total de ${dashStats.itemsCount} itens lançados`
+              )}
+            </span>
+          </div>
+          <div className="p-3 bg-emerald-950/60 rounded-xl border border-emerald-900/40 text-emerald-450 group-hover:scale-110 transition-transform">
+            <ClipboardList className="w-5 h-5" />
+          </div>
+        </div>
+
+        {/* Card 4: Participação do Filtro */}
+        <div className="bg-slate-900/90 p-5 rounded-2xl border border-slate-800 shadow-xl flex items-center justify-between space-x-4 relative overflow-hidden group hover:border-amber-600/40 transition-colors">
+          <div className="space-y-1 z-10">
+            <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider font-mono block">Representatividade Real</span>
+            <span className="text-xl lg:text-2xl font-extrabold text-amber-400 font-mono block">
+              {dashStats.hasActiveSearchTerm ? `${dashStats.percentValor.toFixed(1)}%` : "100.0%"}
+            </span>
+            <span className="text-[10px] text-slate-400 font-mono block leading-tight">
+              {dashStats.hasActiveSearchTerm ? "Participação do cliente/filtro no período" : "Nenhum cliente ou NB restrito"}
+            </span>
+          </div>
+          <div className="p-3 bg-amber-950/60 rounded-xl border border-amber-900/40 text-amber-400 group-hover:scale-110 transition-transform">
+            <Percent className="w-5 h-5" />
+          </div>
+        </div>
+      </div>
+
+      {/* VISUALIZAÇÃO DE STATUS (APROVADO, PENDENTE, REPROVADO) */}
+      <div className="bg-slate-900/80 p-6 rounded-2xl border border-slate-800 shadow-xl mt-6 space-y-6 animate-fade-in">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div>
+            <h3 className="text-sm font-bold text-slate-200 tracking-wide uppercase font-sans flex items-center gap-2">
+              <Layers className="w-4 h-4 text-indigo-400" />
+              <span>Análise de Status e Distribuição das Solicitações</span>
+            </h3>
+            <p className="text-xs text-slate-400 mt-1">
+              Visualização detalhada da proporção de solicitações Aprovadas, Pendentes e Reprovadas do filtro ativo.
+            </p>
+          </div>
+          
+          {/* Toggle buttons for metric */}
+          <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs self-start md:self-auto">
+            <button
+              onClick={() => setMetricView("value")}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer ${
+                metricView === "value"
+                  ? "bg-blue-600 text-white shadow-md font-bold"
+                  : "text-slate-450 hover:text-slate-200"
+              }`}
+            >
+              Valor (R$)
+            </button>
+            <button
+              onClick={() => setMetricView("volume")}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer ${
+                metricView === "volume"
+                  ? "bg-indigo-600 text-white shadow-md font-bold"
+                  : "text-slate-450 hover:text-slate-200"
+              }`}
+            >
+              Volume (HL)
+            </button>
+            <button
+              onClick={() => setMetricView("count")}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer ${
+                metricView === "count"
+                  ? "bg-emerald-600 text-white shadow-md font-bold"
+                  : "text-slate-450 hover:text-slate-200"
+              }`}
+            >
+              Solicitações
+            </button>
+          </div>
+        </div>
+
+        {/* Stacked Progress Bar */}
+        <div className="space-y-2">
+          <div className="flex justify-between text-[11px] font-mono text-slate-400">
+            <span>Proporção por Status ({metricView === "value" ? "Valor Financeiro R$" : metricView === "volume" ? "Volume Físico HL" : "Quantidade de Solicitações"})</span>
+            <span>Total: {
+              metricView === "value" 
+                ? formatCurrency(totalAllValor) 
+                : metricView === "volume" 
+                  ? `${totalAllHl.toFixed(2)} HL` 
+                  : `${totalAllSols} Sols.`
+            }</span>
+          </div>
+          
+          <div className="h-4 w-full bg-slate-950 rounded-full overflow-hidden flex shadow-inner">
+            {/* Approved segment */}
+            <div 
+              style={{ width: `${Math.max(0.5, metricView === "value" ? pctApprovedValor : metricView === "volume" ? pctApprovedHl : pctApprovedSols)}%` }}
+              className={`bg-emerald-500 h-full transition-all duration-500 relative group ${
+                (metricView === "value" ? pctApprovedValor : metricView === "volume" ? pctApprovedHl : pctApprovedSols) === 0 ? "hidden" : ""
+              }`}
+              title={`Aprovado: ${(metricView === "value" ? pctApprovedValor : metricView === "volume" ? pctApprovedHl : pctApprovedSols).toFixed(1)}%`}
+            />
+            {/* Pending segment */}
+            <div 
+              style={{ width: `${Math.max(0.5, metricView === "value" ? pctPendingValor : metricView === "volume" ? pctPendingHl : pctPendingSols)}%` }}
+              className={`bg-amber-500 h-full transition-all duration-500 ${
+                (metricView === "value" ? pctPendingValor : metricView === "volume" ? pctPendingHl : pctPendingSols) === 0 ? "hidden" : ""
+              }`}
+              title={`Pendente: ${(metricView === "value" ? pctPendingValor : metricView === "volume" ? pctPendingHl : pctPendingSols).toFixed(1)}%`}
+            />
+            {/* Rejected segment */}
+            <div 
+              style={{ width: `${Math.max(0.5, metricView === "value" ? pctRejectedValor : metricView === "volume" ? pctRejectedHl : pctRejectedSols)}%` }}
+              className={`bg-rose-500 h-full transition-all duration-500 ${
+                (metricView === "value" ? pctRejectedValor : metricView === "volume" ? pctRejectedHl : pctRejectedSols) === 0 ? "hidden" : ""
+              }`}
+              title={`Reprovado: ${(metricView === "value" ? pctRejectedValor : metricView === "volume" ? pctRejectedHl : pctRejectedSols).toFixed(1)}%`}
+            />
+            {/* Recadastrar segment */}
+            <div 
+              style={{ width: `${Math.max(0.5, metricView === "value" ? pctRecadastrarValor : metricView === "volume" ? pctRecadastrarHl : pctRecadastrarSols)}%` }}
+              className={`bg-indigo-500 h-full transition-all duration-500 ${
+                (metricView === "value" ? pctRecadastrarValor : metricView === "volume" ? pctRecadastrarHl : pctRecadastrarSols) === 0 ? "hidden" : ""
+              }`}
+              title={`Recadastrar: ${(metricView === "value" ? pctRecadastrarValor : metricView === "volume" ? pctRecadastrarHl : pctRecadastrarSols).toFixed(1)}%`}
+            />
+          </div>
+          
+          {/* Legend */}
+          <div className="flex flex-wrap gap-4 text-[10px] font-semibold text-slate-400 pt-1">
+            <div className="flex items-center space-x-1.5">
+              <span className="w-2 h-2 rounded bg-emerald-500 block" />
+              <span>Aprovadas ({(metricView === "value" ? pctApprovedValor : metricView === "volume" ? pctApprovedHl : pctApprovedSols).toFixed(1)}%)</span>
+            </div>
+            <div className="flex items-center space-x-1.5">
+              <span className="w-2 h-2 rounded bg-amber-500 block" />
+              <span>Pendentes ({(metricView === "value" ? pctPendingValor : metricView === "volume" ? pctPendingHl : pctPendingSols).toFixed(1)}%)</span>
+            </div>
+            <div className="flex items-center space-x-1.5">
+              <span className="w-2 h-2 rounded bg-rose-500 block" />
+              <span>Reprovadas ({(metricView === "value" ? pctRejectedValor : metricView === "volume" ? pctRejectedHl : pctRejectedSols).toFixed(1)}%)</span>
+            </div>
+            {totalAllValor > 0 && dashStats.bRecadastrarValor > 0 && (
+              <div className="flex items-center space-x-1.5">
+                <span className="w-2 h-2 rounded bg-indigo-500 block" />
+                <span>Recadastrar ({(metricView === "value" ? pctRecadastrarValor : metricView === "volume" ? pctRecadastrarHl : pctRecadastrarSols).toFixed(1)}%)</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Status Cards Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* Approved Card */}
+          <div className="bg-slate-950/60 p-4 rounded-xl border border-emerald-950/40 hover:border-emerald-900/40 transition-colors space-y-3 shadow-md">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
+                <h4 className="text-xs font-bold text-emerald-400 uppercase tracking-wider">Aprovado</h4>
+              </div>
+              <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Valor Consumido:</span>
+                <span className="font-semibold text-emerald-400 font-mono">{formatCurrency(dashStats.bApprovedValor)}</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Volume Físico:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bApprovedHl.toFixed(2)} HL</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Solicitações:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bApprovedSolsCount} Sols</span>
+              </div>
+            </div>
+            <div className="pt-2 border-t border-slate-900/80 flex justify-between text-[10px] text-slate-400">
+              <span>Proporção (Valor):</span>
+              <span className="text-emerald-400 font-bold font-mono">{pctApprovedValor.toFixed(1)}%</span>
+            </div>
+          </div>
+
+          {/* Pending Card */}
+          <div className="bg-slate-950/60 p-4 rounded-xl border border-amber-950/40 hover:border-amber-900/40 transition-colors space-y-3 shadow-md">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
+                <h4 className="text-xs font-bold text-amber-400 uppercase tracking-wider">Pendente</h4>
+              </div>
+              <HelpCircle className="w-4 h-4 text-amber-500" />
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Valor Retido:</span>
+                <span className="font-semibold text-amber-400 font-mono">{formatCurrency(dashStats.bPendingValor)}</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Volume Físico:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bPendingHl.toFixed(2)} HL</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Solicitações:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bPendingSolsCount} Sols</span>
+              </div>
+            </div>
+            <div className="pt-2 border-t border-slate-900/80 flex justify-between text-[10px] text-slate-400">
+              <span>Proporção (Valor):</span>
+              <span className="text-amber-400 font-bold font-mono">{pctPendingValor.toFixed(1)}%</span>
+            </div>
+          </div>
+
+          {/* Rejected Card */}
+          <div className="bg-slate-950/60 p-4 rounded-xl border border-rose-950/40 hover:border-rose-900/40 transition-colors space-y-3 shadow-md">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-rose-500" />
+                <h4 className="text-xs font-bold text-rose-400 uppercase tracking-wider">Reprovado</h4>
+              </div>
+              <AlertCircle className="w-4 h-4 text-rose-500" />
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Valor Recusado:</span>
+                <span className="font-semibold text-rose-400 font-mono">{formatCurrency(dashStats.bRejectedValor)}</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Volume Físico:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bRejectedHl.toFixed(2)} HL</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Solicitações:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bRejectedSolsCount} Sols</span>
+              </div>
+            </div>
+            <div className="pt-2 border-t border-slate-900/80 flex justify-between text-[10px] text-slate-400">
+              <span>Proporção (Valor):</span>
+              <span className="text-rose-400 font-bold font-mono">{pctRejectedValor.toFixed(1)}%</span>
+            </div>
+          </div>
+
+          {/* Recadastrar Card */}
+          <div className="bg-slate-950/60 p-4 rounded-xl border border-indigo-950/40 hover:border-indigo-900/40 transition-colors space-y-3 shadow-md">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-indigo-500" />
+                <h4 className="text-xs font-bold text-indigo-400 uppercase tracking-wider">Recadastrar</h4>
+              </div>
+              <RefreshCw className="w-4 h-4 text-indigo-400" />
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Valor Pendente:</span>
+                <span className="font-semibold text-indigo-400 font-mono">{formatCurrency(dashStats.bRecadastrarValor)}</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Volume Físico:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bRecadastrarHl.toFixed(2)} HL</span>
+              </div>
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-slate-400">Solicitações:</span>
+                <span className="font-semibold text-slate-200 font-mono">{dashStats.bRecadastrarSolsCount} Sols</span>
+              </div>
+            </div>
+            <div className="pt-2 border-t border-slate-900/80 flex justify-between text-[10px] text-slate-400">
+              <span>Proporção (Valor):</span>
+              <span className="text-indigo-400 font-bold font-mono">{pctRecadastrarValor.toFixed(1)}%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Grid View */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+        {/* Orders list */}
+        <div className={`space-y-4 ${ (viewMode !== "duplicates" && (isGroupedView ? activeGroupedSol : activeDetailRecord)) ? "lg:col-span-7" : "lg:col-span-12"}`}>
+          {viewMode === "duplicates" ? (
+            <div className="space-y-6">
+              {/* Duplicates Sub-Filter & Bulk Actions Bar */}
+              <div className="bg-slate-900/90 p-3.5 rounded-2xl border border-slate-800 shadow-xl flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] font-mono uppercase font-bold text-slate-400 mr-1 flex items-center gap-1">
+                    <Filter className="w-3 h-3 text-slate-400" />
+                    <span>Filtrar:</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setDuplicatesSubFilter("all")}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer ${
+                      duplicatesSubFilter === "all"
+                        ? "bg-amber-600 text-white shadow-sm"
+                        : "bg-slate-950 text-slate-400 hover:text-white border border-slate-800"
+                    }`}
+                  >
+                    🌐 Todos ({allDuplicateGroups.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDuplicatesSubFilter("customer")}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
+                      duplicatesSubFilter === "customer"
+                        ? "bg-purple-600 text-white shadow-sm"
+                        : "bg-slate-950 text-purple-300 hover:text-white border border-purple-900/60"
+                    }`}
+                  >
+                    <span>👤 Origem Customer (Coluna BK) ({duplicateStats.totalCustomerGroups})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDuplicatesSubFilter("promax")}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
+                      duplicatesSubFilter === "promax"
+                        ? "bg-blue-600 text-white shadow-sm"
+                        : "bg-slate-950 text-blue-300 hover:text-white border border-blue-900/60"
+                    }`}
+                  >
+                    <span>🏢 Duplicatas Promax ({duplicateStats.totalPromaxGroups})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDuplicatesSubFilter("pendentes")}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
+                      duplicatesSubFilter === "pendentes"
+                        ? "bg-rose-600 text-white shadow-sm"
+                        : "bg-slate-950 text-rose-300 hover:text-white border border-rose-900/60"
+                    }`}
+                  >
+                    <span>⏳ Pendentes ({duplicateStats.pendingReproveCount})</span>
+                  </button>
+                </div>
+
+                {duplicateStats.totalCustomerPendingSols > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirm(`Deseja reprovar no Promax todas as ${duplicateStats.totalCustomerPendingSols} solicitações pendentes identificadas com origem Customer (Coluna BK 03.18.05)?`)) {
+                        filteredDuplicateGroups.forEach(g => {
+                          g.solicitations.forEach((s: any) => {
+                            if (s.isCustomerOrigin && s.status.toLowerCase().includes("pend")) {
+                              s.records.forEach((rec: any) => {
+                                if (rec.status.toLowerCase().includes("pend")) {
+                                  onUpdateRecordStatus(rec.id, "Reprovada", "Solicitação Customer (Coluna BK 03.18.05) reprovada no Promax via auditoria de duplicatas");
+                                }
+                              });
+                            }
+                          });
+                        });
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-gradient-to-r from-purple-900 to-rose-900 hover:from-purple-800 hover:to-rose-800 text-white font-mono text-xs font-bold rounded-xl border border-purple-700/80 shadow-md flex items-center gap-1.5 cursor-pointer transition-all ml-auto"
+                    title="Reprovar todas as solicitações pendentes abertas via canal Customer (Coluna BK)"
+                  >
+                    <AlertTriangle className="w-3.5 h-3.5 text-purple-300" />
+                    <span>Reprovar {duplicateStats.totalCustomerPendingSols} Customer no Promax</span>
+                  </button>
+                )}
+              </div>
+
+              {filteredDuplicateGroups.length === 0 ? (
+                <div className="bg-slate-900/90 text-center py-16 rounded-2xl border border-slate-850 text-slate-400 font-mono text-xs">
+                  Nenhum conflito de duplicidade ou solicitação Customer encontrado para os filtros selecionados.
+                </div>
+              ) : (
+                filteredDuplicateGroups.map((g, gIdx) => {
+                  const hasCustomerInGroup = g.isCustomerAudit || g.solicitations.some((s: any) => s.isCustomerOrigin);
+                  return (
+                  <div key={`${g.key || 'dup_grp'}_${gIdx}`} className={`bg-slate-900/90 rounded-2xl border p-6 space-y-4 shadow-2xl animate-fade-in ${
+                    hasCustomerInGroup ? "border-purple-800/70" : "border-slate-800"
+                  }`}>
+                    {/* Duplicate Group Header */}
+                    <div className="flex flex-col md:flex-row md:items-start justify-between border-b border-slate-800 pb-3 gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center space-x-2">
+                          {hasCustomerInGroup ? (
+                            <span className="px-2 py-0.5 bg-purple-950/90 text-purple-300 text-[10px] font-bold rounded border border-purple-800/60 shadow-xs flex items-center gap-1">
+                              <span>👤 ORIGEM CUSTOMER (COLUNA BK 03.18.05)</span>
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 bg-amber-950/80 text-amber-400 text-[10px] font-bold rounded border border-amber-900/40">
+                              CONFLITO #{gIdx + 1}
+                            </span>
+                          )}
+                          <span className="text-xs font-mono text-slate-400">
+                            Cód. Cliente (NB): <strong className="text-white">{g.codigoCliente}</strong>
+                          </span>
+                        </div>
+                        <h3 className="text-base font-bold text-white font-display">
+                          {g.nomeCliente}
+                        </h3>
+                      </div>
+                      <div className="text-left md:text-right">
+                        <span className="px-2.5 py-1 bg-blue-950/80 border border-blue-900/40 text-blue-400 text-xs font-mono font-semibold rounded-lg">
+                          {g.solicitations.length > 1
+                            ? `${g.solicitations.length} solicitações em conflito`
+                            : "Solicitação Customer (Coluna BK 03.18.05)"}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Side-by-Side Cards Grid */}
+                    <div className={`grid grid-cols-1 ${g.solicitations.length > 1 ? "md:grid-cols-2" : "max-w-2xl"} gap-4`}>
+                      {g.solicitations.map((sol: any, solIdx: number) => {
+                        const statusLower = sol.status.toLowerCase().trim();
+                        const uniqueSolKey = `${sol.solicitacao}_${sol.records?.[0]?.id || solIdx}_${solIdx}`;
+                        return (
+                          <div key={uniqueSolKey} className={`bg-slate-950 p-4 rounded-xl border flex flex-col justify-between space-y-4 transition-all duration-200 ${
+                            statusLower.includes("aprov") 
+                              ? "border-emerald-900 bg-emerald-950/5 shadow-md" 
+                              : statusLower.includes("reprov")
+                              ? "border-slate-900 opacity-60 bg-slate-950/20"
+                              : sol.isCustomerOrigin
+                              ? "border-purple-800/80 bg-purple-950/10 hover:border-purple-700"
+                              : "border-slate-800 hover:border-slate-700"
+                          }`}>
+                            {/* Request details */}
+                            <div className="space-y-3">
+                              <div className="flex justify-between items-start">
+                                <div className="space-y-1">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="px-2 py-0.5 bg-slate-900 text-slate-300 text-[10px] font-bold rounded font-mono border border-slate-850">
+                                      SOLICITAÇÃO #{sol.solicitacao}
+                                    </span>
+                                    {sol.records[0] && (
+                                      isRecordReposicao(sol.records[0]) ? (
+                                        <span className="px-2 py-0.5 bg-indigo-950 text-indigo-300 text-[10px] font-bold rounded font-mono border border-indigo-800/60">
+                                          📦 Reposição
+                                        </span>
+                                      ) : (
+                                        <span className="px-2 py-0.5 bg-emerald-950 text-emerald-300 text-[10px] font-bold rounded font-mono border border-emerald-800/60">
+                                          🔁 Troca
+                                        </span>
+                                      )
+                                    )}
+                                    {sol.isCustomerOrigin ? (
+                                      <span className="px-2 py-0.5 text-[9.5px] font-bold rounded font-mono border bg-purple-950/90 text-purple-300 border-purple-800/80 flex items-center gap-1 shadow-xs">
+                                        👤 Coluna BK: Customer (03.18.05)
+                                      </span>
+                                    ) : sol.origem === "Cadastro Direto na Plataforma" ? (
+                                      <span className="px-2 py-0.5 text-[9.5px] font-bold rounded font-mono border bg-amber-950 text-amber-300 border-amber-800/80">
+                                        📲 Cadastro Direto Plataforma
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 text-[9.5px] font-bold rounded font-mono border bg-blue-950 text-blue-300 border-blue-800/80 flex items-center gap-1 shadow-xs">
+                                        🏢 Coluna BK: Promax (03.18.05)
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-[10px] text-slate-500 font-mono mt-1">
+                                    Data: {sol.dataSolicitacao}
+                                  </p>
+                                </div>
+                                {getStatusBadge(sol.status)}
+                              </div>
+
+                              {/* Logistics details */}
+                              <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] font-mono text-slate-400 bg-slate-900/40 p-2 rounded-lg">
+                                <div>Setor: <strong className="text-slate-200">{sol.setorVenda}</strong></div>
+                                <div>Mapa: <strong className="text-slate-200">{sol.mapa || "N/A"}</strong></div>
+                                <div className="col-span-2 truncate font-sans">Justificativa: <strong className="text-slate-200 font-sans">{sol.records[0]?.justificativa || "N/A"}</strong></div>
+                                <div className="col-span-2 truncate">Nota Fiscal: <strong className="text-slate-200">{sol.nf || "Não Informada"}</strong></div>
+                              </div>
+
+                              {/* Product list inside the card */}
+                              <div className="bg-slate-900/60 border border-slate-800/80 p-2.5 rounded-lg space-y-2">
+                                <div className="text-[10px] text-slate-500 font-mono font-semibold uppercase tracking-wider">Produtos ({sol.records.length})</div>
+                                <div className="space-y-1.5 divide-y divide-slate-800/50">
+                                  {sol.records.map((item: any, idx: number) => (
+                                    <div key={item.id} className={`${idx > 0 ? "pt-1.5" : ""} text-[11px] font-mono flex flex-col justify-between`}>
+                                      <div className="text-blue-300 font-bold leading-tight">
+                                        [{item.produto}] {item.descricaoProduto}
+                                      </div>
+                                      <div className="flex justify-between text-[10px] text-slate-400 mt-0.5">
+                                        <span>Qtd: <strong className="text-emerald-400">{item.quantidade} {item.um}</strong></span>
+                                        <span>Total: <strong className="text-slate-200">{formatCurrency(item.valorTotal)}</strong></span>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+
+                              {/* Recommendation Banner */}
+                              <div className={`p-2.5 rounded-lg border text-[11px] leading-relaxed font-semibold ${sol.adviceColor}`}>
+                                {sol.adviceText}
+                              </div>
+                            </div>
+
+                            {/* Interactive Resolution Actions */}
+                            <div className="pt-3 border-t border-slate-900/85 flex items-center justify-between gap-2">
+                              <div className="text-[10px] font-mono text-slate-500">
+                                Total: <span className="font-bold text-slate-300">{formatCurrency(sol.totalValue)}</span>
+                              </div>
+
+                              <div className="flex items-center space-x-1.5">
+                                {!statusLower.includes("aprov") && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      sol.records.forEach((rec: any) => {
+                                        if (!rec.status.toLowerCase().includes("aprov")) {
+                                          onUpdateRecordStatus(rec.id, "Aprovada", "Aprovado via análise de duplicatas (SSTR)");
+                                        }
+                                      });
+                                    }}
+                                    className="px-2.5 py-1 bg-emerald-950 hover:bg-emerald-950/60 border border-emerald-900 text-emerald-400 hover:text-emerald-300 rounded text-[10px] font-bold cursor-pointer transition-all"
+                                  >
+                                    Aprovar
+                                  </button>
+                                )}
+                                {!statusLower.includes("reprov") && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      sol.records.forEach((rec: any) => {
+                                        if (!rec.status.toLowerCase().includes("reprov")) {
+                                          onUpdateRecordStatus(
+                                            rec.id, 
+                                            "Reprovada", 
+                                            sol.isCustomerOrigin 
+                                              ? "Solicitação Customer (Coluna BK 03.18.05) reprovada no Promax via auditoria de duplicatas"
+                                              : "Duplicata reprovada no Promax"
+                                          );
+                                        }
+                                      });
+                                    }}
+                                    className="px-2.5 py-1 bg-red-950 hover:bg-red-950/60 border border-red-900 text-red-400 hover:text-red-300 rounded text-[10px] font-bold cursor-pointer transition-all"
+                                  >
+                                    Reprovar no Promax
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  );
+                })
+              )}
+            </div>
+          ) : (
+            <>
+              <div className={`grid gap-5 ${
+                (viewMode !== "duplicates" && (isGroupedView ? activeGroupedSol : activeDetailRecord))
+                  ? "grid-cols-1 xl:grid-cols-2"
+                  : "grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"
+              }`}>
+                {isGroupedView ? (
+                paginatedGroupedSolicitations.length === 0 ? (
+                  <div className="md:col-span-2 xl:col-span-3 2xl:col-span-4 bg-slate-900/90 text-center py-16 rounded-2xl border border-slate-850 text-slate-400 font-mono text-xs">
+                    Nenhuma solicitação encontrada para os filtros selecionados.
+                  </div>
+                ) : (
+                  paginatedGroupedSolicitations.map((g, gIdx) => {
+                    const isSelected = activeGroupedSol?.solicitacao === g.solicitacao;
+                    const isDuplicate = duplicateSolicitationIds.has(g.solicitacao);
+                    const firstRec = g.records[0] || {};
+                    return (
+                      <div
+                        key={g.id || `${g.solicitacao}_${gIdx}`}
+                        onClick={() => openGroupedDetails(g)}
+                        className={`bg-slate-900/95 p-5 rounded-2xl border transition-all duration-200 cursor-pointer hover:shadow-xl hover:-translate-y-0.5 @container ${
+                          isSelected
+                            ? "border-blue-600 ring-4 ring-blue-500/10 bg-slate-900"
+                            : isDuplicate
+                            ? "border-red-500 bg-gradient-to-b from-slate-900 to-red-950/5 hover:border-red-450"
+                            : "border-slate-800 hover:border-slate-700/80"
+                        }`}
+                      >
+                        <div className="grid grid-cols-1 @md:grid-cols-12 gap-4">
+                          
+                          {/* Left Column: Core Info & Products */}
+                          <div className="@md:col-span-7 flex flex-col justify-between space-y-4">
+                            
+                            {/* Header */}
+                            <div className="space-y-1.5">
+                              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="px-2 py-0.5 bg-slate-950 text-blue-400 text-[10px] font-bold rounded font-mono border border-slate-850 shrink-0">
+                                    SETOR {g.setorVenda}
+                                  </span>
+                                  {firstRec && (
+                                    isRecordReposicao(firstRec) ? (
+                                      <span className="px-2 py-0.5 bg-indigo-950/90 text-indigo-300 text-[10px] font-bold rounded font-mono border border-indigo-800/60 shrink-0">
+                                        📦 Reposição (Falta)
+                                      </span>
+                                    ) : (
+                                      <span className="px-2 py-0.5 bg-emerald-950/90 text-emerald-300 text-[10px] font-bold rounded font-mono border border-emerald-800/60 shrink-0">
+                                        🔁 Troca (Outros)
+                                      </span>
+                                    )
+                                  )}
+                                  {g.isCustomerOrigin ? (
+                                    <span className="px-2 py-0.5 bg-purple-950/90 text-purple-300 text-[10px] font-bold rounded font-mono border border-purple-800/60 flex items-center space-x-1 shrink-0">
+                                      <span>👤 Coluna BK: Customer</span>
+                                    </span>
+                                  ) : (
+                                    <span className="px-2 py-0.5 bg-blue-950/80 text-blue-300 text-[10px] font-bold rounded font-mono border border-blue-900/40 flex items-center space-x-1 shrink-0">
+                                      <span>🏢 Coluna BK: Promax</span>
+                                    </span>
+                                  )}
+                                  {isDuplicate && (
+                                    <span className="px-2 py-0.5 bg-red-950/80 text-red-400 text-[10px] font-bold rounded font-mono border border-red-900/40 animate-pulse flex items-center space-x-1 shrink-0">
+                                      <AlertTriangle className="w-3 h-3 text-red-455 shrink-0" />
+                                      <span>Duplicata</span>
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="shrink-0">{getStatusBadge(g.status, g.solicitacao)}</span>
+                              </div>
+                              <h4 className="text-sm font-bold text-white line-clamp-1 font-display">
+                                {g.nomeCliente}
+                              </h4>
+                              <p className="text-slate-400 text-xs font-mono">
+                                Cliente Cód: <span className="font-semibold text-slate-300">{g.codigoCliente}</span>
+                              </p>
+                            </div>
+
+                            {/* Product & Quantity details */}
+                            <div className="bg-slate-950 rounded-xl border border-slate-850 divide-y divide-slate-900/80 overflow-hidden">
+                              <div className="px-3 py-1.5 bg-slate-900/45 border-b border-slate-850 flex justify-between items-center">
+                                <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">Itens ({g.records.length})</span>
+                                {g.records.length > 1 && (
+                                  <span className="text-[9px] bg-blue-900/50 text-blue-300 border border-blue-850 px-1.5 py-0.5 rounded-md font-bold font-mono">
+                                    Agrupado
+                                  </span>
+                                )}
+                              </div>
+                              <div className="p-2 space-y-1.5 max-h-[120px] overflow-y-auto">
+                                {g.records.map((itemRec: any, index: number) => (
+                                  <div key={index} className="flex justify-between items-center text-[11px] font-mono py-0.5">
+                                    <div className="truncate max-w-[70%]">
+                                      <span className="text-slate-500 font-semibold">[{itemRec.produto}]</span>{" "}
+                                      <span className="text-slate-300">{itemRec.descricaoProduto}</span>
+                                    </div>
+                                    <div className="text-right shrink-0 ml-1">
+                                      <span className="text-blue-400 font-semibold">{itemRec.quantidade} {itemRec.um}</span>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+
+                            {/* Footer Values */}
+                            <div className="flex justify-between items-center text-xs pt-2 border-t border-slate-850/60">
+                              <div className="text-slate-400 text-[10px] font-mono">
+                                Solic: <span className="font-bold text-blue-400">{g.solicitacao}</span> | <span className="text-slate-300">{g.dataSolicitacao}</span>
+                              </div>
+                              <div className="text-right font-mono">
+                                <span className="text-[9px] text-slate-500 mr-1">Soma:</span>
+                                <span className="font-bold text-emerald-400 text-sm">
+                                  {formatCurrency(g.totalValue)}
+                                </span>
+                              </div>
+                            </div>
+
+                          </div>
+
+                          {/* Right Column: Logistics Details (Mais uma Coluna) */}
+                          <div className="@md:col-span-5 bg-slate-950/40 p-3.5 rounded-xl border border-slate-850/60 flex flex-col justify-between space-y-3 text-[11px] font-mono text-slate-400">
+                            <div className="space-y-2.5">
+                              <div className="flex justify-between items-center border-b border-slate-900/60 pb-1.5 gap-2">
+                                <span className="text-slate-500 uppercase text-[9px] font-bold tracking-wider shrink-0">Logística</span>
+                                <span className="text-slate-300 font-semibold text-[9px] bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800 shrink-0">Série: {firstRec.serie || "S/S"}</span>
+                              </div>
+                              
+                              {firstRec.nomeMotorista && (
+                                <div className="space-y-0.5">
+                                  <span className="text-[9px] uppercase text-slate-500 font-bold block">Motorista:</span>
+                                  <span className="text-slate-300 font-sans font-medium line-clamp-1 truncate block">{firstRec.nomeMotorista}</span>
+                                </div>
+                              )}
+
+                              {firstRec.mapa && (
+                                <div className="flex items-center justify-between pt-1 border-t border-slate-900/30">
+                                  <span>Mapa: <strong className="text-slate-300 font-semibold">{firstRec.mapa}</strong></span>
+                                  {firstRec.nf && <span>NF: <strong className="text-slate-300 font-semibold">{firstRec.nf}</strong></span>}
+                                </div>
+                              )}
+
+                              {firstRec.justificativa && (
+                                <div className="pt-2 border-t border-slate-900/40 font-sans">
+                                  <p className="text-[9px] uppercase font-bold text-slate-500 tracking-wider">Motivos:</p>
+                                  <div className="text-slate-300 text-xs leading-relaxed line-clamp-2 mt-1 italic space-y-0.5">
+                                    {Array.from(new Set(g.records.map((r: any) => r.justificativa))).slice(0, 2).map((just: any, i) => (
+                                      <p key={i} className="truncate">• "{just}"</p>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Column Footer */}
+                            <div className="flex items-center justify-between text-[10px] text-slate-500 border-t border-slate-900/40 pt-2 font-sans shrink-0">
+                              <span>Regs: <strong className="font-semibold text-slate-400">{g.records.length} itens</strong></span>
+                              {firstRec.gv && <span className="bg-blue-950/40 text-blue-400 border border-blue-900/30 px-1.5 py-0.5 rounded font-mono text-[9px]">{firstRec.gv}</span>}
+                            </div>
+                          </div>
+
+                        </div>
+                      </div>
+                    );
+                  })
+                )
+              ) : (
+                paginatedIndividualRecords.length === 0 ? (
+                  <div className="md:col-span-2 xl:col-span-3 2xl:col-span-4 bg-slate-900/90 text-center py-16 rounded-2xl border border-slate-850 text-slate-400 font-mono text-xs">
+                    Nenhum registro de troca encontrado para os filtros selecionados.
+                  </div>
+                ) : (
+                  paginatedIndividualRecords.map((r) => {
+                    const isSelected = activeDetailRecord?.id === r.id;
+                    const isDuplicate = duplicateSolicitationIds.has(r.solicitacao);
+                    return (
+                      <div
+                        key={r.id}
+                        onClick={() => openRecordDetails(r)}
+                        className={`bg-slate-900/95 p-5 rounded-2xl border transition-all duration-200 cursor-pointer hover:shadow-xl hover:-translate-y-0.5 @container ${
+                          isSelected
+                            ? "border-blue-600 ring-4 ring-blue-500/10 bg-slate-900"
+                            : "border-slate-800 hover:border-slate-700/80"
+                        }`}
+                      >
+                        <div className="grid grid-cols-1 @md:grid-cols-12 gap-4">
+                          
+                          {/* Left Column: Client & Product Info */}
+                          <div className="@md:col-span-7 flex flex-col justify-between space-y-4">
+                            
+                            {/* Header */}
+                            <div className="space-y-1.5">
+                              <div className="flex flex-wrap items-center justify-between gap-1.5">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span className="px-2 py-0.5 bg-slate-950 text-blue-400 text-[10px] font-bold rounded font-mono border border-slate-850 shrink-0">
+                                    SETOR {r.setorVenda}
+                                  </span>
+                                  {isCustomerOrigin(r.sistemaOrigem) ? (
+                                    <span className="px-2 py-0.5 bg-purple-950/90 text-purple-300 text-[10px] font-bold rounded font-mono border border-purple-800/60 shrink-0">
+                                      👤 Coluna BK: Customer
+                                    </span>
+                                  ) : (
+                                    <span className="px-2 py-0.5 bg-blue-950/80 text-blue-300 text-[10px] font-bold rounded font-mono border border-blue-900/40 shrink-0">
+                                      🏢 Coluna BK: Promax
+                                    </span>
+                                  )}
+                                  {isDuplicate && (
+                                    <span className="px-2 py-0.5 bg-red-950/80 text-red-400 text-[10px] font-bold rounded font-mono border border-red-900/40 shrink-0">
+                                      Duplicata
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="shrink-0">{getStatusBadge(r.status, r.solicitacao)}</span>
+                              </div>
+                              <h4 className="text-sm font-bold text-white line-clamp-1 font-display">
+                                {r.nomeCliente}
+                              </h4>
+                              <p className="text-slate-400 text-xs font-mono">
+                                Cliente Cód: <span className="font-semibold text-slate-300">{r.codigoCliente}</span>
+                              </p>
+                            </div>
+
+                            {/* Product & Quantity details */}
+                            <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-850">
+                              <p className="text-xs font-semibold text-slate-200 truncate">{r.descricaoProduto}</p>
+                              <div className="flex justify-between items-center mt-1.5 text-[10px] text-slate-400 font-mono">
+                                <span>Cód: <span className="font-semibold text-slate-300">{r.produto}</span></span>
+                                <span className="text-blue-400 font-bold text-xs">{r.quantidade} {r.um}</span>
+                              </div>
+                            </div>
+
+                            {/* Footer Values */}
+                            <div className="flex justify-between items-center text-xs pt-2 border-t border-slate-850/60">
+                              <div className="text-slate-400 text-[10px] font-mono">
+                                Solic: <span className="font-semibold text-slate-300">{r.solicitacao}</span> | <span className="text-slate-300">{r.dataSolicitacao}</span>
+                              </div>
+                              <span className="font-bold text-blue-400 font-mono text-sm">
+                                {formatCurrency(r.valorTotal)}
+                              </span>
+                            </div>
+
+                          </div>
+
+                          {/* Right Column: Logistics Details (Mais uma Coluna) */}
+                          <div className="@md:col-span-5 bg-slate-950/40 p-3.5 rounded-xl border border-slate-850/60 flex flex-col justify-between space-y-3 text-[11px] font-mono text-slate-400">
+                            <div className="space-y-2.5">
+                              <div className="flex justify-between items-center border-b border-slate-900/60 pb-1.5 gap-2">
+                                <span className="text-slate-500 uppercase text-[9px] font-bold tracking-wider shrink-0">Logística</span>
+                                <span className="text-slate-300 font-semibold text-[9px] bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800 shrink-0">Série: {r.serie || "S/S"}</span>
+                              </div>
+                              
+                              {r.nomeMotorista && (
+                                <div className="space-y-0.5">
+                                  <span className="text-[9px] uppercase text-slate-500 font-bold block">Motorista:</span>
+                                  <span className="text-slate-300 font-sans font-medium line-clamp-1 truncate block">{r.nomeMotorista}</span>
+                                </div>
+                              )}
+
+                              {r.mapa && (
+                                <div className="flex items-center justify-between pt-1 border-t border-slate-900/30">
+                                  <span>Mapa: <strong className="text-slate-300 font-semibold">{r.mapa}</strong></span>
+                                  {r.nf && <span>NF: <strong className="text-slate-300 font-semibold">{r.nf}</strong></span>}
+                                </div>
+                              )}
+
+                              {r.justificativa && (
+                                <div className="pt-2 border-t border-slate-900/40 font-sans">
+                                  <p className="text-[9px] uppercase font-bold text-slate-500 tracking-wider">Motivo / Justificativa:</p>
+                                  <p className="text-slate-300 text-xs leading-relaxed line-clamp-2 mt-1 italic">
+                                    "{r.justificativa}"
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Column Footer */}
+                            <div className="flex items-center justify-between text-[10px] text-slate-500 border-t border-slate-900/40 pt-2 font-sans shrink-0">
+                              <span>ID: <strong className="font-semibold text-slate-400">{r.id}</strong></span>
+                              {r.gv && <span className="bg-blue-950/40 text-blue-400 border border-blue-900/30 px-1.5 py-0.5 rounded font-mono text-[9px]">{r.gv}</span>}
+                            </div>
+                          </div>
+
+                        </div>
+                      </div>
+                    );
+                  })
+                )
+              )}
+            </div>
+
+            {/* Pagination controls for main lists */}
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between bg-slate-900/95 border border-slate-800 p-4 rounded-2xl shadow-lg mt-6 font-mono text-xs">
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                  disabled={currentPage === 1}
+                  className="px-3.5 py-2 bg-slate-950 border border-slate-800 hover:border-slate-700 disabled:opacity-40 disabled:hover:border-slate-800 text-slate-300 rounded-xl transition-all cursor-pointer flex items-center space-x-1"
+                >
+                  <ChevronLeft className="w-4 h-4 shrink-0" />
+                  <span>Anterior</span>
+                </button>
+                <span className="text-slate-400 font-medium">
+                  Página <strong className="text-white font-bold">{currentPage}</strong> de <strong className="text-white font-bold">{totalPages}</strong>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                  disabled={currentPage === totalPages}
+                  className="px-3.5 py-2 bg-slate-950 border border-slate-800 hover:border-slate-700 disabled:opacity-40 disabled:hover:border-slate-800 text-slate-300 rounded-xl transition-all cursor-pointer flex items-center space-x-1"
+                >
+                  <span>Próxima</span>
+                  <ChevronRight className="w-4 h-4 shrink-0" />
+                </button>
+              </div>
+            )}
+            </>
+          )}
+        </div>
+
+        {/* Audit Sheet Sidebar */}
+        {viewMode !== "duplicates" && (isGroupedView ? activeGroupedSol : activeDetailRecord) && (
+          <div className="lg:col-span-5 bg-slate-900 border border-slate-800 shadow-2xl p-6 rounded-2xl space-y-6 sticky top-4 animate-fade-in print-break-inside-none">
+            {/* Drawer header */}
+            <div className="flex justify-between items-start pb-4 border-b border-slate-850">
+              <div>
+                <span className="px-2.5 py-0.5 bg-blue-600 text-white rounded text-[10px] font-bold font-mono">
+                  SOLICITAÇÃO #{isGroupedView ? activeGroupedSol.solicitacao : activeDetailRecord?.solicitacao}
+                </span>
+                <h3 className="text-lg font-bold font-display text-white mt-1.5">Ficha de Auditoria</h3>
+              </div>
+              <button
+                onClick={() => {
+                  setActiveDetailRecord(null);
+                  setActiveGroupedSol(null);
+                }}
+                className="p-1.5 bg-slate-950 hover:bg-slate-850 text-slate-400 rounded-full transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Audit body details */}
+            <div className="space-y-5 text-xs max-h-[500px] overflow-y-auto pr-1 text-slate-200">
+              
+              {/* Product and Cost block */}
+              {isGroupedView && activeGroupedSol ? (
+                <div className="space-y-3 bg-slate-950 p-4 rounded-xl border border-slate-850">
+                  <p className="text-[10px] uppercase font-bold text-slate-400 tracking-widest font-mono">Produtos Solicitados ({activeGroupedSol.records.length})</p>
+                  <div className="divide-y divide-slate-900/80 space-y-2 max-h-[220px] overflow-y-auto pr-1">
+                    {activeGroupedSol.records.map((r: any, rIdx: number) => (
+                      <div key={rIdx} className="pt-2 first:pt-0">
+                        <div className="flex justify-between items-start">
+                          <div>
+                            <h4 className="font-bold text-white text-xs">{r.descricaoProduto}</h4>
+                            <p className="text-slate-500 font-mono text-[9px] mt-0.5">Código: {r.produto} | {r.um}</p>
+                          </div>
+                          <span className="text-blue-400 font-mono font-bold text-xs shrink-0 ml-2">{r.quantidade} {r.um}</span>
+                        </div>
+                        <div className="flex justify-between items-center text-[9px] font-mono text-slate-500 mt-1">
+                          <span>Unitário: {formatCurrency(r.valorUnitario)}</span>
+                          <span>Subtotal: <strong className="text-slate-300">{formatCurrency(r.valorTotal)}</strong></span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="pt-2 border-t border-slate-800 flex justify-between items-center font-mono text-xs">
+                    <span className="text-[10px] uppercase text-slate-400 font-sans font-semibold">Soma Total Repasse</span>
+                    <span className="font-bold text-emerald-450 text-sm">{formatCurrency(activeGroupedSol.totalValue)}</span>
+                  </div>
+                </div>
+              ) : (
+                activeDetailRecord && (
+                  <div className="space-y-3 bg-slate-950 p-4 rounded-xl border border-slate-850">
+                    <p className="text-[10px] uppercase font-bold text-slate-400 tracking-widest font-mono">Produto Solicitado</p>
+                    <div>
+                      <h4 className="font-bold text-white text-sm">{activeDetailRecord.descricaoProduto}</h4>
+                      <p className="text-slate-400 font-mono text-[10px] mt-0.5">Código do Produto: {activeDetailRecord.produto} | Medida: {activeDetailRecord.um}</p>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-800 font-mono">
+                      <div>
+                        <span className="text-[9px] text-slate-400 block uppercase">Quantidade</span>
+                        <span className="font-bold text-white text-xs">{activeDetailRecord.quantidade}</span>
+                      </div>
+                      <div>
+                        <span className="text-[9px] text-slate-400 block uppercase">Unitário</span>
+                        <span className="font-bold text-white text-xs">{formatCurrency(activeDetailRecord.valorUnitario)}</span>
+                      </div>
+                      <div>
+                        <span className="text-[9px] text-slate-400 block uppercase">Total Repasse</span>
+                        <span className="font-bold text-blue-400 text-xs">{formatCurrency(activeDetailRecord.valorTotal)}</span>
+                      </div>
+                    </div>
+                  </div>
+                )
+              )}
+
+              {/* Justification of repasse */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block font-mono">Justificativa</span>
+                  <span className="font-semibold text-white text-xs mt-1 block">
+                    {isGroupedView ? activeGroupedSol?.records[0]?.justificativa || "Produto Avariado" : activeDetailRecord?.justificativa || "Produto Avariado"}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block font-mono">Setor de Venda</span>
+                  <span className="font-mono font-semibold text-slate-300 text-xs mt-1 block">
+                    Setor {isGroupedView ? activeGroupedSol?.setorVenda : activeDetailRecord?.setorVenda}
+                  </span>
+                </div>
+              </div>
+
+              {/* Client specifications */}
+              <div className="space-y-1">
+                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block font-mono">Cliente Destinatário</span>
+                <p className="font-semibold text-white text-xs">
+                  {isGroupedView ? activeGroupedSol?.nomeCliente : activeDetailRecord?.nomeCliente}
+                </p>
+                <p className="text-slate-400 text-[10px] font-mono">
+                  Código do Cliente: {isGroupedView ? activeGroupedSol?.codigoCliente : activeDetailRecord?.codigoCliente}
+                </p>
+              </div>
+
+              {/* Status and Actions taken by staff */}
+              <div className="space-y-1.5 pt-3 border-t border-slate-850">
+                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block font-mono">Status e Resolução</span>
+                <div className="flex flex-wrap items-center gap-2">
+                  {getStatusBadge(isGroupedView ? activeGroupedSol?.status : (activeDetailRecord?.status || ""))}
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    NF/Série: <span className="font-semibold text-slate-200">
+                      {isGroupedView ? activeGroupedSol?.records[0]?.nf || "Não Gerada" : activeDetailRecord?.nf || "Não Gerada"}
+                    </span>
+                  </span>
+                  {(isGroupedView ? activeGroupedSol?.isCustomerOrigin : isCustomerOrigin(activeDetailRecord?.sistemaOrigem)) ? (
+                    <span className="px-2 py-0.5 bg-purple-950/90 text-purple-300 text-[9.5px] font-bold rounded font-mono border border-purple-800/60 shadow-xs">
+                      👤 Coluna BK: Customer
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 bg-blue-950/80 text-blue-300 text-[9.5px] font-bold rounded font-mono border border-blue-900/40 shadow-xs">
+                      🏢 Coluna BK: Promax
+                    </span>
+                  )}
+                </div>
+                {(isGroupedView ? activeGroupedSol?.records[0]?.usuarioAcao : activeDetailRecord?.usuarioAcao) && (
+                  <div className="bg-slate-950 p-2.5 rounded-lg text-[10px] text-slate-400 font-mono space-y-1">
+                    <p className="flex items-center">
+                      <UserCheck className="w-3 h-3 mr-1 text-blue-450" />
+                      Ação por: {isGroupedView ? activeGroupedSol?.records[0]?.usuarioAcao : activeDetailRecord?.usuarioAcao}
+                    </p>
+                    <p className="flex items-center">
+                      <Calendar className="w-3 h-3 mr-1 text-slate-500" />
+                      Data: {isGroupedView ? activeGroupedSol?.records[0]?.dataAcao : activeDetailRecord?.dataAcao} {isGroupedView ? (activeGroupedSol?.records[0]?.hora ? `às ${activeGroupedSol?.records[0]?.hora}` : "") : (activeDetailRecord?.hora ? `às ${activeDetailRecord?.hora}` : "")}
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Logistical data */}
+              <div className="space-y-2 pt-3 border-t border-slate-850 font-mono text-[10px]">
+                <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider block font-sans font-semibold">Logística & Entrega (Pau Brasil)</span>
+                
+                <div className="grid grid-cols-2 gap-2 bg-slate-950 p-3 rounded-lg border border-slate-850">
+                  <div>
+                    <span className="text-slate-400 block text-[9px]">MOTORISTA:</span>
+                    <span className="font-bold text-slate-200 truncate block">
+                      {isGroupedView ? activeGroupedSol?.records[0]?.nomeMotorista || "Não Informado" : activeDetailRecord?.nomeMotorista || "Não Informado"}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block text-[9px]">VEÍCULO / PLACA:</span>
+                    <span className="font-bold text-slate-200 block">
+                      {isGroupedView ? (activeGroupedSol?.records[0]?.placa ? `${activeGroupedSol?.records[0]?.veiculo || ""} (${activeGroupedSol?.records[0]?.placa})` : "Não Informado") : (activeDetailRecord?.placa ? `${activeDetailRecord.veiculo || ""} (${activeDetailRecord.placa})` : "Não Informado")}
+                    </span>
+                  </div>
+                  <div className="mt-2 text-wrap col-span-2">
+                    <span className="text-slate-400 block text-[9px]">TRANSPORTADORA:</span>
+                    <span className="font-bold text-slate-200 block line-clamp-1">
+                      {isGroupedView ? activeGroupedSol?.records[0]?.nomeTransportadora || "Não Informada" : activeDetailRecord?.nomeTransportadora || "Não Informada"}
+                    </span>
+                  </div>
+                  <div className="mt-2 col-span-2 bg-slate-900/60 p-2.5 rounded-lg border border-slate-800">
+                    <span className="text-slate-400 block text-[9px] font-mono uppercase tracking-wider font-semibold">
+                      MAPA DA CARGA / ENTREGA (COLUNA X 03.18.05):
+                    </span>
+                    <div className="flex flex-wrap items-center gap-2 mt-1">
+                      <span className="font-bold text-blue-400 text-sm font-mono">
+                        {(() => {
+                          const activeSol = isGroupedView ? activeGroupedSol : null;
+                          const activeRec = activeDetailRecord;
+                          const recs = activeSol?.records || (activeRec ? [activeRec] : []);
+                          
+                          const foundMapa = recs
+                            .map((r: any) => r.mapaOrigem || r.mapa)
+                            .map((m: any) => (m || "").toString().trim())
+                            .find((m: string) => m && m !== "0" && m.toLowerCase() !== "falta" && m !== "-")
+                            || activeSol?.mapa
+                            || activeRec?.mapaOrigem
+                            || activeRec?.mapa
+                            || "";
+
+                          const clean = (foundMapa || "").trim();
+                          if (!clean || clean === "0" || clean.toLowerCase() === "falta" || clean === "-") {
+                            return "Não Informado no Relatório";
+                          }
+                          return clean.toLowerCase().startsWith("mapa") ? clean : `Mapa ${clean}`;
+                        })()}
+                      </span>
+                      {(() => {
+                        const activeSol = isGroupedView ? activeGroupedSol : null;
+                        const activeRec = activeDetailRecord;
+                        const recs = activeSol?.records || (activeRec ? [activeRec] : []);
+                        const repoMapa = recs.map((r: any) => r.mapaReposicao).find((m: any) => m && m !== "0");
+                        if (repoMapa) {
+                          return (
+                            <span className="text-[10px] bg-indigo-950 text-indigo-300 border border-indigo-800/60 px-2 py-0.5 rounded font-mono">
+                              Mapa Reposição: {repoMapa}
+                            </span>
+                          );
+                        }
+                        return null;
+                      })()}
+                    </div>
+                  </div>
+                  <div className="mt-2 font-sans text-[10px] col-span-2">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <span className="text-slate-400 block text-[9px] font-mono">CONFERENTE RETIRADA:</span>
+                        <span className="font-bold text-slate-200 block">
+                          {isGroupedView ? activeGroupedSol?.records[0]?.conferente || "Não Declarado" : activeDetailRecord?.conferente || "Não Declarado"}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-400 block text-[9px] font-mono">CONFERENTE CARREGAMENTO:</span>
+                        <span className="font-bold text-slate-200 block">
+                          {isGroupedView ? activeGroupedSol?.records[0]?.conferenteCarregamento || "Não Declarado" : activeDetailRecord?.conferenteCarregamento || "Não Declarado"}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Update Form Panel for Gestores */}
+              <div className="p-4 bg-slate-950 border border-slate-850 rounded-xl space-y-4 shadow-inner">
+                <h4 className="text-xs font-bold text-blue-400 uppercase tracking-widest font-mono">
+                  Gerenciar Status {isGroupedView ? "da Solicitação" : "do Pedido"}
+                </h4>
+                
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-[10px] text-slate-400 block uppercase font-mono mb-1 font-semibold font-sans">Alterar para Status:</label>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { id: "Aprovada", label: "Aprovar" },
+                        { id: "Pendente", label: "Pendente" },
+                        { id: "Reprovada", label: "Reprovar" }
+                      ].map(act => (
+                        <button
+                          key={act.id}
+                          type="button"
+                          onClick={() => setReviewStatus(act.id)}
+                          className={`px-2 py-1.5 rounded text-xs font-semibold text-center cursor-pointer transition-all border ${
+                            reviewStatus === act.id
+                              ? "bg-blue-600 text-white border-blue-500 font-bold"
+                              : "bg-slate-900 hover:bg-slate-850 text-slate-300 border-slate-800"
+                          }`}
+                        >
+                          {act.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] text-slate-400 block uppercase font-mono mb-1 font-semibold font-sans">Obs Interna / Comentário:</label>
+                    <textarea
+                      rows={2}
+                      value={reviewObs}
+                      onChange={(e) => setReviewObs(e.target.value)}
+                      placeholder="Adicione notas de auditoria, número da nova nota gerada, ou motivo da alteração..."
+                      className="w-full bg-slate-900 border border-slate-800 text-slate-200 rounded p-2 text-xs focus:ring-1 focus:ring-blue-500 focus:outline-hidden font-mono"
+                    />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleApplyStatusChange}
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg text-xs transition-all cursor-pointer text-center shadow-lg shadow-blue-900/40"
+                  >
+                    Salvar Alterações
+                  </button>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* MODAL DE EXPORTAÇÃO DE AUDITORIA EM PDF */}
+      {isExportModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[92vh] animate-fade-in">
+            {/* Modal Header */}
+            <div className="bg-slate-950 p-5 border-b border-slate-800 flex items-center justify-between relative overflow-hidden">
+              <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-600 via-indigo-500 to-emerald-500" />
+              <div className="flex items-center space-x-3">
+                <div className="p-2.5 bg-blue-950/80 text-blue-400 rounded-xl border border-blue-800/60">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-base font-sans">Exportar Relatório de Auditoria & Rastreamento</h3>
+                  <p className="text-slate-400 text-xs font-sans mt-0.5">
+                    Todas as solicitações agrupadas por RN e Setor com quadro consolidado e fichas organizadas
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsExportModalOpen(false)}
+                className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+                title="Fechar"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Scrollable Body */}
+            <div className="p-6 space-y-5 overflow-y-auto font-sans text-sm">
+              
+              {/* Highlight Banner: RN Grouping */}
+              <div className="bg-blue-950/40 border border-blue-800/60 p-3.5 rounded-xl flex items-start gap-3">
+                <div className="p-2 bg-blue-900/60 rounded-lg text-blue-400 shrink-0 mt-0.5">
+                  <Layers className="w-4 h-4" />
+                </div>
+                <div className="text-xs text-blue-200 leading-snug">
+                  <span className="font-bold text-white block font-mono text-[11px] mb-0.5">
+                    AGRUPAMENTO INTEGRAL POR REPRESENTANTE (RN) & SETOR:
+                  </span>
+                  No relatório exportado, todas as solicitações de todos os RNs estão agrupadas em um local apenas por setor, com nome completo do RN, CPF, base/gerência, quadro consolidado no início e fichas alinhadas para dedução imediata de informações.
+                </div>
+              </div>
+
+              {/* Export Mode Toggle (Garante ZERO Divergência entre Tela e Relatório) */}
+              <div className="bg-slate-950/80 border border-slate-800 p-3.5 rounded-xl space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-200 font-mono flex items-center gap-1.5 uppercase tracking-wider">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                    Modo de Exportação
+                  </span>
+                  <span className="text-[10px] bg-emerald-950 text-emerald-300 border border-emerald-800/60 px-2 py-0.5 rounded font-mono font-bold">
+                    Zero Divergência
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setExportSourceMode("filtro_tela")}
+                    className={`p-3 rounded-lg border text-left transition-all cursor-pointer ${
+                      exportSourceMode === "filtro_tela"
+                        ? "bg-blue-600 text-white border-blue-400 shadow-md ring-1 ring-blue-400"
+                        : "bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-700"
+                    }`}
+                  >
+                    <div className="font-bold text-xs flex items-center justify-between">
+                      <span>Visão Filtrada da Tela</span>
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold ${exportSourceMode === "filtro_tela" ? "bg-white/20 text-white" : "bg-slate-800 text-blue-400"}`}>
+                        {groupedSolicitations.length} Sols
+                      </span>
+                    </div>
+                    <p className={`text-[11px] mt-1 leading-tight ${exportSourceMode === "filtro_tela" ? "text-blue-100" : "text-slate-400"}`}>
+                      Exporta exatamente as {groupedSolicitations.length} solicitações filtradas em tela com rigor analítico.
+                    </p>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setExportSourceMode("custom")}
+                    className={`p-3 rounded-lg border text-left transition-all cursor-pointer ${
+                      exportSourceMode === "custom"
+                        ? "bg-blue-600 text-white border-blue-400 shadow-md ring-1 ring-blue-400"
+                        : "bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-700"
+                    }`}
+                  >
+                    <div className="font-bold text-xs flex items-center justify-between">
+                      <span>Personalizar Parâmetros</span>
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded ${exportSourceMode === "custom" ? "bg-white/20 text-white" : "bg-slate-800 text-slate-400"}`}>
+                        Filtros Livres
+                      </span>
+                    </div>
+                    <p className={`text-[11px] mt-1 leading-tight ${exportSourceMode === "custom" ? "text-blue-100" : "text-slate-400"}`}>
+                      Altere data, período, setores e status livremente para uma nova extração.
+                    </p>
+                  </button>
+                </div>
+
+                {exportSourceMode === "filtro_tela" && (
+                  <div className="bg-slate-900/90 p-2.5 rounded-lg border border-slate-800 text-[11px] text-slate-300 flex flex-wrap gap-x-4 gap-y-1 font-mono">
+                    <span>Data: <strong className="text-white">{startDate ? convertToPtDate(startDate) : "Todas"} {endDate && endDate !== startDate ? `até ${convertToPtDate(endDate)}` : ""}</strong></span>
+                    <span>Status: <strong className="text-white">{selectedStatus.toUpperCase()}</strong></span>
+                    <span>Setor: <strong className="text-white">{selectedSector === "todos" ? "Todos os Setores" : `Setor ${selectedSector}`}</strong></span>
+                    <span>Processo: <strong className="text-white">{processTypeFilter.toUpperCase()}</strong></span>
+                  </div>
+                )}
+              </div>
+
+              {/* 1. Date Selection Section */}
+              <div className="bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 space-y-3">
+                <label className="text-xs font-bold text-slate-300 uppercase tracking-wider font-mono flex items-center gap-1.5">
+                  <Calendar className="w-3.5 h-3.5 text-blue-400" />
+                  <span>1. Selecione a Data ou Período Auditado</span>
+                </label>
+
+                {/* Tabs */}
+                <div className="flex rounded-lg bg-slate-900 p-1 border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setExportDateType("unica")}
+                    className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${
+                      exportDateType === "unica"
+                        ? "bg-blue-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Data Específica
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setExportDateType("periodo")}
+                    className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${
+                      exportDateType === "periodo"
+                        ? "bg-blue-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Intervalo de Datas
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setExportDateType("todas")}
+                    className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all cursor-pointer ${
+                      exportDateType === "todas"
+                        ? "bg-blue-600 text-white shadow-sm"
+                        : "text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    Todas as Datas
+                  </button>
+                </div>
+
+                {/* Date Inputs */}
+                {exportDateType === "unica" && (
+                  <div className="space-y-2 pt-1">
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                      <input
+                        type="date"
+                        value={exportTargetDate}
+                        onChange={(e) => setExportTargetDate(e.target.value)}
+                        className="bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-hidden focus:ring-1 focus:ring-blue-500 cursor-pointer flex-1"
+                      />
+                      {/* Quick date chips */}
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {uniqueDates.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const iso = convertToISODate(uniqueDates[0]);
+                              if (iso) setExportTargetDate(iso);
+                            }}
+                            className="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-850 text-blue-400 hover:text-blue-300 border border-slate-800 rounded-lg text-[11px] font-mono transition-colors cursor-pointer"
+                          >
+                            Última ({uniqueDates[0]})
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setExportTargetDate(new Date().toISOString().slice(0, 10))}
+                          className="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-850 text-slate-400 hover:text-slate-200 border border-slate-800 rounded-lg text-[11px] font-mono transition-colors cursor-pointer"
+                        >
+                          Hoje
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {exportDateType === "periodo" && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                    <div className="space-y-1">
+                      <span className="text-[10px] text-slate-400 font-mono">Data Inicial:</span>
+                      <input
+                        type="date"
+                        value={exportTargetDate}
+                        onChange={(e) => setExportTargetDate(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-hidden focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <span className="text-[10px] text-slate-400 font-mono">Data Final:</span>
+                      <input
+                        type="date"
+                        value={exportTargetEndDate}
+                        onChange={(e) => setExportTargetEndDate(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-hidden focus:ring-1 focus:ring-blue-500 cursor-pointer"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {exportDateType === "todas" && (
+                  <p className="text-xs text-slate-400 font-mono pt-1">
+                    O relatório incluirá todas as solicitações registradas na base de auditoria, organizadas bloco por bloco de setor.
+                  </p>
+                )}
+              </div>
+
+              {/* 2. Status Scope Selection */}
+              <div className="bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 space-y-3">
+                <label className="text-xs font-bold text-slate-300 uppercase tracking-wider font-mono flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>2. Escopo das Situações / Status</span>
+                </label>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label
+                    onClick={() => setExportStatusScope("todos_status")}
+                    className={`p-3 rounded-xl border cursor-pointer flex items-start space-x-3 transition-all ${
+                      exportStatusScope === "todos_status"
+                        ? "bg-blue-950/40 border-blue-500/70 text-white shadow-sm"
+                        : "bg-slate-900/60 border-slate-800 text-slate-400 hover:border-slate-700"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="statusScope"
+                      checked={exportStatusScope === "todos_status"}
+                      onChange={() => setExportStatusScope("todos_status")}
+                      className="mt-0.5"
+                    />
+                    <div className="space-y-0.5">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-bold text-xs">Todas as Situações</span>
+                        <span className="text-[9px] bg-emerald-950 border border-emerald-800/60 text-emerald-300 px-1.5 py-0.5 rounded font-bold uppercase font-mono">
+                          Recomendado
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 leading-tight">
+                        Aprovadas, Reprovadas, Pendentes e Recadastrar agrupadas e com identificação visual.
+                      </p>
+                    </div>
+                  </label>
+
+                  <label
+                    onClick={() => setExportStatusScope("filtro_ativo")}
+                    className={`p-3 rounded-xl border cursor-pointer flex items-start space-x-3 transition-all ${
+                      exportStatusScope === "filtro_ativo"
+                        ? "bg-blue-950/40 border-blue-500/70 text-white shadow-sm"
+                        : "bg-slate-900/60 border-slate-800 text-slate-400 hover:border-slate-700"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="statusScope"
+                      checked={exportStatusScope === "filtro_ativo"}
+                      onChange={() => setExportStatusScope("filtro_ativo")}
+                      className="mt-0.5"
+                    />
+                    <div className="space-y-0.5">
+                      <span className="font-bold text-xs">Apenas o Filtro Ativo ({selectedStatus.toUpperCase()})</span>
+                      <p className="text-[11px] text-slate-400 leading-tight">
+                        Exporta somente solicitações que correspondem ao filtro atual selecionado na tela.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              {/* 3. Sector Scope */}
+              <div className="bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 space-y-2">
+                <label className="text-xs font-bold text-slate-300 uppercase tracking-wider font-mono flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>3. Filtro de Setor</span>
+                </label>
+
+                <select
+                  value={exportSectorScope}
+                  onChange={(e) => setExportSectorScope(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-semibold text-slate-200 focus:outline-hidden focus:ring-1 focus:ring-blue-500 cursor-pointer font-mono"
+                >
+                  <option value="todos">Todos os Setores (Separados por Seção)</option>
+                  {sectors.map((sec) => (
+                    <option key={sec} value={sec}>
+                      Setor {sec}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* 4. Real-time Live Summary Box (Analyst View) */}
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest font-mono">
+                    Resumo do Relatório a Ser Gerado
+                  </span>
+                  <span className="text-xs font-bold text-blue-400 font-mono">
+                    {exportPreviewData.solicitationsCount} Solicitações • {exportPreviewData.sectorsCount} Setores
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center font-mono">
+                  <div className="bg-slate-900 p-2 rounded-lg border border-slate-850">
+                    <span className="text-[10px] text-slate-400 block">Total R$</span>
+                    <span className="text-xs font-bold text-white block truncate">
+                      {formatCurrency(exportPreviewData.totalValor)}
+                    </span>
+                  </div>
+                  <div className="bg-slate-900 p-2 rounded-lg border border-slate-850">
+                    <span className="text-[10px] text-slate-400 block">Volume (HL)</span>
+                    <span className="text-xs font-bold text-indigo-400 block truncate">
+                      {exportPreviewData.totalHl.toFixed(2)} HL
+                    </span>
+                  </div>
+                  <div className="bg-slate-900 p-2 rounded-lg border border-slate-850">
+                    <span className="text-[10px] text-emerald-400 block">Aprovadas</span>
+                    <span className="text-xs font-bold text-emerald-400 block">
+                      {exportPreviewData.aprovSols}
+                    </span>
+                  </div>
+                  <div className="bg-slate-900 p-2 rounded-lg border border-slate-850">
+                    <span className="text-[10px] text-amber-400 block">Pendentes</span>
+                    <span className="text-xs font-bold text-amber-400 block">
+                      {exportPreviewData.pendSols}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-850 font-mono">
+                  <span>Reprovadas: <strong className="text-rose-400">{exportPreviewData.reprovSols}</strong></span>
+                  {exportPreviewData.recadSols > 0 && (
+                    <span>Recadastrar: <strong className="text-purple-400">{exportPreviewData.recadSols}</strong></span>
+                  )}
+                  <span>Registros Totais: <strong className="text-slate-200">{exportPreviewData.records.length} itens</strong></span>
+                </div>
+              </div>
+
+            </div>
+
+            {/* Modal Actions Footer */}
+            <div className="p-4 bg-slate-950 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
+              <button
+                type="button"
+                onClick={() => setIsExportModalOpen(false)}
+                disabled={isExportingPdf || isExportingExcel}
+                className="px-4 py-2.5 bg-slate-900 hover:bg-slate-850 text-slate-300 rounded-xl text-xs font-semibold transition-colors cursor-pointer border border-slate-800"
+              >
+                Cancelar
+              </button>
+
+              <div className="flex items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={handleExecuteExcelExport}
+                  disabled={isExportingExcel || exportPreviewData.records.length === 0}
+                  className="flex items-center space-x-2 px-4 py-2.5 bg-slate-900 hover:bg-slate-850 text-emerald-300 hover:text-white border border-emerald-700/60 hover:border-emerald-500 rounded-xl text-xs font-bold font-mono transition-all cursor-pointer shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Exportar planilha Excel (.xlsx) com aba de resumo e solicitações agrupadas por RN"
+                >
+                  {isExportingExcel ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
+                      <span>Gerando Excel...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-4 h-4 text-emerald-400" />
+                      <span>Planilha Excel (RNs)</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExecutePdfExport}
+                  disabled={isExportingPdf || exportPreviewData.records.length === 0}
+                  className="flex items-center space-x-2 px-5 py-2.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-xl text-xs font-bold font-mono transition-all cursor-pointer shadow-lg shadow-blue-900/40 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Exportar documento PDF executivo com todas as solicitações agrupadas por RN & Setor"
+                >
+                  {isExportingPdf ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin text-white" />
+                      <span>Gerando PDF Executivo...</span>
+                    </>
+                  ) : (
+                    <>
+                      <FileText className="w-4 h-4 text-white" />
+                      <span>Gerar PDF por RN ({exportPreviewData.solicitationsCount} Sols)</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
