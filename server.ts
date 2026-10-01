@@ -269,12 +269,18 @@ async function processConcludedRequest(requestId: string, docData: any) {
     
     const finalPdfUrl = `/api/uploads/${pdfFilename}`;
     
-    // Update the record's document in Firestore
-    await db.collection("pendingRequests").doc(requestId).update({
-      fotoUrl: finalPdfUrl,
-      pdfGeneratedAt: FieldValue.serverTimestamp(),
-    });
-    console.log(`[PDF-PIPELINE] Updated request ${requestId} with PDF URL.`);
+    // Update the record's document in Firestore if connected
+    if (db) {
+      try {
+        await db.collection("pendingRequests").doc(requestId).update({
+          fotoUrl: finalPdfUrl,
+          pdfGeneratedAt: FieldValue.serverTimestamp(),
+        });
+        console.log(`[PDF-PIPELINE] Updated request ${requestId} with PDF URL.`);
+      } catch (dbErr: any) {
+        console.warn(`[PDF-PIPELINE] Firestore update note:`, dbErr?.message);
+      }
+    }
     
     // Purge the original heavy image from local disk cache
     if (originalFilename) {

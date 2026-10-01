@@ -481,13 +481,13 @@ export default function ImportPanel({
               <button
                 onClick={() => {
                   onResetToDemo();
-                  setSuccessMessage("Base redefinida com sucesso para o padrão oficial do Studio (342 solicitações e 2 duplicatas).");
+                  setSuccessMessage("Base redefinida para os dados demonstrativos padrão.");
                 }}
-                className="px-3 py-2 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-700/80 text-white rounded-xl text-xs font-semibold flex items-center space-x-1.5 cursor-pointer transition-colors shadow-sm"
-                title="Redefinir para Base Oficial Congelada (342 Solicitações / 2 Duplicatas)"
+                className="px-3 py-2 bg-blue-900/40 hover:bg-blue-900/70 border border-blue-800 text-white rounded-xl text-xs font-semibold flex items-center space-x-1.5 cursor-pointer transition-colors"
+                title="Resetar Banco"
               >
-                <RotateCcw className="w-4 h-4 text-indigo-400" />
-                <span>Restaurar Base Padrão Oficial (342)</span>
+                <RotateCcw className="w-4 h-4 text-blue-400" />
+                <span>Redefinir Demo</span>
               </button>
             </div>
           </div>

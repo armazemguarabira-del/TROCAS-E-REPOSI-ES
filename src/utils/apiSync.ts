@@ -1391,17 +1391,10 @@ export function initializeSync() {
 
   console.log("Initializing SSTR Two-Phase Real-time Sync Engine with network timeouts...");
 
-  // Detect project changes and PRESERVE local cache (never wipe data)
+  // Detect project changes: preserve all platform data across project transitions (Zero Data Loss)
   const savedProjectId = safeGetItem("sstr_connected_project_id");
   if (savedProjectId && savedProjectId !== firebaseConfig.projectId) {
-    console.log(`[PROJECT-CHANGE] Conectando ao banco Firebase "${firebaseConfig.projectId}" (anterior: "${savedProjectId || 'nenhum'}"). Preservando 100% dos dados locais e preparando migração...`);
-    try {
-      createSystemSafetySnapshot(`Backup pré-conexão com ${firebaseConfig.projectId}`);
-    } catch (e) {}
-    // Trigger migration of existing local records to the new project database after fast sync starts
-    setTimeout(() => {
-      migrateExistingLocalDataToFirestore();
-    }, 2000);
+    console.log(`[PROJECT-CHANGE] Firebase Project changed from ${savedProjectId} to ${firebaseConfig.projectId}. Preserving existing platform database and syncing safely.`);
   }
   safeSetItem("sstr_connected_project_id", firebaseConfig.projectId);
 
@@ -1550,148 +1543,8 @@ function seedLocalStorageDefaults() {
   if (!safeGetItem("sstr_motoristas_rotas")) safeSetItem("sstr_motoristas_rotas", JSON.stringify(DEFAULT_MOTORISTAS_ROTAS));
 }
 
-async function migrateExistingLocalDataToFirestore() {
-  console.log("[MIGRATION] Verificando e garantindo persistência dos dados locais no novo banco de dados...");
-  try {
-    // 1. Managers
-    const localManagersRaw = safeGetItem("sstr_registered_managers");
-    if (localManagersRaw) {
-      try {
-        const managersList = JSON.parse(localManagersRaw);
-        if (Array.isArray(managersList)) {
-          for (const m of managersList) {
-            if (m && m.username) {
-              setFirestoreDoc("managers", m.username, m);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 2. Pending Requests
-    const localRequestsRaw = safeGetItem("sstr_representative_pending_requests");
-    if (localRequestsRaw) {
-      try {
-        const restored = restoreImagesFromCache(localRequestsRaw);
-        const reqList = JSON.parse(restored);
-        if (Array.isArray(reqList)) {
-          for (const req of reqList) {
-            if (req && req.id) {
-              setFirestoreDoc("pendingRequests", req.id, req);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 3. Vales
-    const localValesRaw = safeGetItem("sstr_vales_historico_reg");
-    if (localValesRaw) {
-      try {
-        const restoredVales = restoreImagesFromCache(localValesRaw);
-        const valesList = JSON.parse(restoredVales);
-        if (Array.isArray(valesList)) {
-          for (const v of valesList) {
-            if (v && v.id) {
-              setFirestoreDoc("vales", v.id, v);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 4. Crew List
-    const localCrewRaw = safeGetItem("sstr_lista_crew");
-    if (localCrewRaw) {
-      try {
-        const crewList = JSON.parse(localCrewRaw);
-        if (Array.isArray(crewList)) {
-          for (const c of crewList) {
-            const crewId = c.id || c.nome;
-            if (crewId) {
-              setFirestoreDoc("crewList", String(crewId), c);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 5. Reps por Setor
-    const localRepsRaw = safeGetItem("sstr_reps_setor");
-    if (localRepsRaw) {
-      try {
-        const repsObj = JSON.parse(localRepsRaw);
-        if (typeof repsObj === "object" && repsObj !== null) {
-          for (const [setorKey, repData] of Object.entries(repsObj)) {
-            setFirestoreDoc("repsSetor", setorKey, repData);
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 6. Motoristas Rotas
-    const localMotoristasRaw = safeGetItem("sstr_motoristas_rotas");
-    if (localMotoristasRaw) {
-      try {
-        const motObj = JSON.parse(localMotoristasRaw);
-        if (typeof motObj === "object" && motObj !== null) {
-          for (const [rotaKey, motData] of Object.entries(motObj)) {
-            setFirestoreDoc("motoristasRotas", rotaKey, motData);
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 7. Custom PDVs
-    const localPdvsRaw = safeGetItem("sstr_custom_pdvs_v1");
-    if (localPdvsRaw) {
-      try {
-        const pdvsList = JSON.parse(localPdvsRaw);
-        if (Array.isArray(pdvsList)) {
-          for (const p of pdvsList) {
-            const pId = p.id || p.nb;
-            if (pId) {
-              setFirestoreDoc("customPdvs", String(pId), p);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 8. Batches
-    const localBatchesRaw = safeGetItem("sstr_cached_batches_v1");
-    if (localBatchesRaw) {
-      try {
-        const batchesList = JSON.parse(localBatchesRaw);
-        if (Array.isArray(batchesList)) {
-          for (const b of batchesList) {
-            if (b && b.id) {
-              setFirestoreDoc("batches", b.id, b);
-            }
-          }
-        }
-      } catch (e) {}
-    }
-
-    // 9. Records chunks
-    const localRecordsRaw = safeGetItem("sstr_cached_records_v1");
-    if (localRecordsRaw) {
-      try {
-        const recordsList = JSON.parse(localRecordsRaw);
-        if (Array.isArray(recordsList) && recordsList.length > 0) {
-          syncExchangeRecordsConsolidated(recordsList);
-        }
-      } catch (e) {}
-    }
-
-    console.log("[MIGRATION] Migração/sincronização de todos os dados locais para o novo banco de dados iniciada com sucesso!");
-  } catch (err) {
-    console.warn("[MIGRATION-WARN] Aviso na migração para o novo banco:", err);
-  }
-}
-
 async function seedFirestoreBaselines() {
-  console.log("Seeding Firestore baseline credentials e migrando dados locais...");
+  console.log("Seeding Firestore baseline credentials...");
   
   const defaultManagers = [
     { username: "gestor", password: "paubrasil2026", name: "Gestor Principal" },
@@ -1706,25 +1559,12 @@ async function seedFirestoreBaselines() {
     { username: "monitoramento", password: "Anbev10", name: "MONITORAMENTO" }
   ];
 
-  let managersToSeed = defaultManagers;
-  const localManagersRaw = safeGetItem("sstr_registered_managers");
-  if (localManagersRaw) {
-    try {
-      const parsed = JSON.parse(localManagersRaw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        managersToSeed = parsed;
-      }
-    } catch (e) {}
-  }
-
   isSyncingFromFirestore = true;
 
   await enqueueFirestoreWrite(async () => {
     const batch = writeBatch(firestoreDb);
-    managersToSeed.forEach(m => {
-      if (m && m.username) {
-        batch.set(doc(firestoreDb, "managers", m.username), sanitizeForFirestore(m));
-      }
+    defaultManagers.forEach(m => {
+      batch.set(doc(firestoreDb, "managers", m.username), sanitizeForFirestore(m));
     });
     // Set minimal metadata doc for chunk management
     const metaRef = doc(firestoreDb, "exchangeRecords_chunks", "metadata");
@@ -1736,17 +1576,15 @@ async function seedFirestoreBaselines() {
     });
     try {
       await batch.commit();
-      recordWrites(managersToSeed.length + 1);
+      recordWrites(defaultManagers.length + 1);
     } catch (err: any) {
       console.warn("[SEED-BASELINES] Erro ao gravar baselines de gestores no Firestore:", err?.message || err);
     }
   });
 
-  await migrateExistingLocalDataToFirestore();
-
   seedLocalStorageDefaults();
   isSyncingFromFirestore = false;
-  console.log("Firestore baseline seed e migração concluídas com sucesso.");
+  console.log("Firestore baseline seed completed smoothly.");
 }
 
 // Granular Document-Level Write Helpers for Instant Real-Time Operations with Indestructible Offline Queue

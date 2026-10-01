@@ -1,8 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { useSstrData } from "../context/SstrDataContext";
 import { SafetySnapshotMeta } from "../utils/indexedDbCache";
-import { HISTORICAL_RECORDS_JAN_JUL_2026 } from "../data/historicalRecordsJul2026";
-import { ImportBatch } from "../types";
 import { 
   ShieldCheck, 
   HardDrive, 
@@ -19,8 +17,7 @@ import {
   History, 
   Lock,
   ArrowRight,
-  ShieldAlert,
-  RotateCcw
+  ShieldAlert
 } from "lucide-react";
 
 interface DataSafetyVaultModalProps {
@@ -40,8 +37,7 @@ export const DataSafetyVaultModal: React.FC<DataSafetyVaultModalProps> = ({ isOp
     restoreSafetySnapshot, 
     listSafetySnapshots,
     exportDatabaseBackup,
-    importDatabaseBackup,
-    saveRecordsAndBatches
+    importDatabaseBackup
   } = useSstrData();
 
   const [snapshots, setSnapshots] = useState<SafetySnapshotMeta[]>([]);
@@ -149,24 +145,6 @@ export const DataSafetyVaultModal: React.FC<DataSafetyVaultModalProps> = ({ isOp
       e.target.value = "";
     };
     reader.readAsText(file);
-  };
-
-  const handleResetToOfficialBaseline = async () => {
-    if (!window.confirm("⚠️ Deseja redefinir a base para a Base Padrão Oficial do Studio (342 solicitações e 2 duplicatas)?\n\nUm ponto de restauração de segurança automático será salvo antes da operação para garantir zero perda de dados.")) {
-      return;
-    }
-    await createSafetySnapshot("Backup pré-alinhamento com Base Oficial 342");
-    const defaultBatch: ImportBatch = {
-      id: "batch_default_hist",
-      timestamp: Date.now(),
-      fileName: "Base Promax 03.18.05 (Jan-Jul 2026 Congelada)",
-      recordCount: HISTORICAL_RECORDS_JAN_JUL_2026.length,
-      totalValue: HISTORICAL_RECORDS_JAN_JUL_2026.reduce((acc, r) => acc + (r.valorTotal || 0), 0)
-    };
-    await saveRecordsAndBatches(HISTORICAL_RECORDS_JAN_JUL_2026, [defaultBatch], "overwrite");
-    setSnapshotSuccessMsg("✅ Base redefinida com sucesso para o padrão oficial do Studio (342 solicitações e 2 duplicatas)!");
-    await loadSnapshots();
-    setTimeout(() => setSnapshotSuccessMsg(null), 5000);
   };
 
   return (
@@ -288,15 +266,6 @@ export const DataSafetyVaultModal: React.FC<DataSafetyVaultModalProps> = ({ isOp
               >
                 <Upload className="w-4 h-4 text-purple-400" />
                 <span>Restaurar de Arquivo</span>
-              </button>
-
-              <button
-                onClick={handleResetToOfficialBaseline}
-                className="px-3.5 py-2 bg-indigo-950/90 hover:bg-indigo-900 border border-indigo-700/80 text-indigo-200 hover:text-white text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center gap-2 shadow-sm"
-                title="Redefine a base para a Base Oficial do Studio (342 solicitações / 2 duplicatas)"
-              >
-                <RotateCcw className="w-4 h-4 text-indigo-400" />
-                <span>Restaurar Base Padrão Oficial (342)</span>
               </button>
             </div>
           </div>
