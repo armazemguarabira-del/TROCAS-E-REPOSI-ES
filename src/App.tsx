@@ -4,6 +4,7 @@ import { parseCSVToRecords } from "./utils/csvParser";
 import { RAW_SAMPLE_DATA } from "./sampleData";
 import { initializeSync, startPolling } from "./utils/apiSync";
 import { getUnifiedOfficialRecords } from "./utils/processTypes";
+import { HISTORICAL_RECORDS_JAN_JUL_2026 } from "./data/historicalRecordsJul2026";
 
 // Components
 import DashboardView from "./components/DashboardView";
@@ -152,16 +153,16 @@ function MainApp() {
   }, []);
 
   const resetToDefaultDemoData = () => {
-    if (!window.confirm("⚠️ ATENÇÃO: Deseja realmente restaurar os dados de demonstração padrão? O sistema criará um snapshot de segurança automático no cofre antes desta operação para que nenhum dado seja perdido.")) {
+    if (!window.confirm("⚠️ ATENÇÃO: Deseja redefinir a base para a Base Padrão Oficial do Studio (342 solicitações e 2 duplicatas)? Um snapshot de segurança automático será salvo no cofre antes de restaurar.")) {
       return;
     }
-    const defaultRecords = parseCSVToRecords(RAW_SAMPLE_DATA, "Planilha Base Pau Brasil");
+    const defaultRecords = HISTORICAL_RECORDS_JAN_JUL_2026;
     const initialBatch: ImportBatch = {
-      id: "batch_default",
+      id: "batch_default_hist",
       timestamp: Date.now(),
-      fileName: "Planilha Base Pau Brasil.csv",
+      fileName: "Base Promax 03.18.05 (Jan-Jul 2026 Congelada)",
       recordCount: defaultRecords.length,
-      totalValue: defaultRecords.reduce((acc, r) => acc + r.valorTotal, 0)
+      totalValue: defaultRecords.reduce((acc, r) => acc + (r.valorTotal || 0), 0)
     };
 
     saveRecordsAndBatches(defaultRecords, [initialBatch], "overwrite");
