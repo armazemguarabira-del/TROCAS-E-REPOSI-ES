@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from "react";
 import { ExchangeRecord, ImportBatch } from "./types";
 import { parseCSVToRecords } from "./utils/csvParser";
 import { RAW_SAMPLE_DATA } from "./sampleData";
-import { initializeSync, startPolling } from "./utils/apiSync";
+import { initializeSync, startPolling, purgeLocalCacheAndReload } from "./utils/apiSync";
 import { getUnifiedOfficialRecords } from "./utils/processTypes";
 
 // Components

@@ -7,11 +7,7 @@ import { initializeApp } from "firebase/app";
 import {
   getFirestore,
   initializeFirestore,
-  persistentLocalCache,
-  persistentMultipleTabManager,
-  persistentSingleTabManager,
   memoryLocalCache,
-  enableIndexedDbPersistence,
   doc,
   getDoc,
   setDoc,
@@ -168,37 +164,18 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
 const firebaseApp = initializeApp(firebaseConfig);
 const dbId = (firebaseConfig as any).firestoreDatabaseId || (firebaseConfig as any).databaseId;
 
-// Initialize Firestore with resilient multi-tab persistent cache support,
-// falling back cleanly to single-tab forceOwnership or memory-only cache if IndexedDB is restricted.
+// Initialize Firestore strictly in 100% direct online live mode with memoryLocalCache (zero disk/IndexedDB caching)
 let firestoreDbInstance: any;
 try {
   firestoreDbInstance = initializeFirestore(firebaseApp, {
-    localCache: persistentLocalCache({
-      tabManager: persistentMultipleTabManager()
-    })
+    localCache: memoryLocalCache()
   }, dbId && dbId !== "(default)" ? dbId : undefined);
-  console.log("[FIREBASE-INIT] Firestore initialized with multi-tab persistent cache.");
-} catch (multiTabErr) {
+  console.log("[FIREBASE-INIT] Firestore conectado em modo DIRETO 100% ONLINE (sem cache em disco).");
+} catch (cacheErr) {
   try {
-    firestoreDbInstance = initializeFirestore(firebaseApp, {
-      localCache: persistentLocalCache({
-        tabManager: persistentSingleTabManager({ forceOwnership: true })
-      })
-    }, dbId && dbId !== "(default)" ? dbId : undefined);
-    console.log("[FIREBASE-INIT] Firestore initialized with single-tab local cache fallback (forceOwnership: true).");
-  } catch (cacheErr) {
-    console.warn("[FIREBASE-INIT] Persistent local cache unavailable. Initializing with memoryLocalCache...", cacheErr);
-    try {
-      firestoreDbInstance = initializeFirestore(firebaseApp, {
-        localCache: memoryLocalCache()
-      }, dbId && dbId !== "(default)" ? dbId : undefined);
-    } catch (memErr) {
-      try {
-        firestoreDbInstance = getFirestore(firebaseApp, dbId && dbId !== "(default)" ? dbId : undefined);
-      } catch (finalErr) {
-        firestoreDbInstance = getFirestore(firebaseApp);
-      }
-    }
+    firestoreDbInstance = getFirestore(firebaseApp, dbId && dbId !== "(default)" ? dbId : undefined);
+  } catch (finalErr) {
+    firestoreDbInstance = getFirestore(firebaseApp);
   }
 }
 
@@ -1873,5 +1850,25 @@ if (typeof window !== "undefined") {
 
 export function startPolling() {
   console.log("Real-time synchronization established through native onSnapshot collections.");
+}
+
+/**
+ * Purges any local browser storage and forces a complete direct refetch from Firebase Firestore.
+ */
+export function purgeLocalCacheAndReload() {
+  try {
+    for (const key of Object.keys(COLLECTION_MAP)) {
+      safeRemoveItem(key);
+    }
+    safeRemoveItem("sstr_offline_write_queue");
+    safeRemoveItem("sstr_storage_backups_meta");
+    if (typeof window !== "undefined") {
+      window.location.reload();
+    }
+  } catch (e) {
+    if (typeof window !== "undefined") {
+      window.location.reload();
+    }
+  }
 }
 
