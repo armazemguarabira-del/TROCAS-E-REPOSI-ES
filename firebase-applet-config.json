@@ -3,7 +3,7 @@
   "appId": "1:792483558739:web:1bcaba10d2038d7a6ddda6",
   "apiKey": "AIzaSyC8Xkvh4Nj-VjzzDwqSNjefu3a79Y6ti2A",
   "authDomain": "retorno-de-rota-pau-brasil.firebaseapp.com",
-  "firestoreDatabaseId": "(default)",
+  "firestoreDatabaseId": "default",
   "storageBucket": "retorno-de-rota-pau-brasil.firebasestorage.app",
   "messagingSenderId": "792483558739",
   "measurementId": "G-FTGZF84NKM"
