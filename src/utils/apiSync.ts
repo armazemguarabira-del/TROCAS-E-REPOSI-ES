@@ -63,10 +63,18 @@ export interface SyncIssueDetail {
 
 export function notifySyncIssue(message: string, err?: any, force: boolean = false) {
   const now = Date.now();
-  const errorCode = err?.code || (err?.message && (err.message.includes("resource-exhausted") || err.message.includes("quota")) ? "resource-exhausted" : "unknown");
+  const errMsg = String(err?.message || err || "");
+  const isNotFound = errMsg.includes("NOT_FOUND") || errMsg.includes("not-found") || err?.code === "not-found";
+  const isQuota = err?.code === "resource-exhausted" || errMsg.includes("resource-exhausted") || errMsg.includes("quota");
+  const errorCode = isQuota ? "resource-exhausted" : (isNotFound ? "not-found" : (err?.code || "unknown"));
   
+  let resolvedMessage = message;
+  if (isNotFound) {
+    resolvedMessage = `O banco Cloud Firestore ainda não foi ativado no console do projeto "${firebaseConfig.projectId}". Acesse o Firebase Console (Build > Firestore Database) e clique em "Criar banco de dados" em modo de teste para ativar a interatividade e sincronização em tempo real entre usuários.`;
+  }
+
   const issueData: SyncIssueDetail = {
-    message,
+    message: resolvedMessage,
     code: errorCode,
     error: err?.message || String(err || ""),
     timestamp: now

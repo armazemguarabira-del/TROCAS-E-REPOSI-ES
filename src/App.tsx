@@ -70,6 +70,10 @@ function MainApp() {
     return getUnifiedOfficialRecords(records, pendingRequests);
   }, [records, pendingRequests]);
 
+  const pendingActionCount = useMemo(() => {
+    return (pendingRequests || []).filter(r => (r.status || "").toLowerCase().includes("pend")).length;
+  }, [pendingRequests]);
+
   const [activePortal, setActivePortal] = useState<"gestor" | "representante">("representante");
   const [activeTab, setActiveTab] = useState<"dashboard" | "tracking" | "import" | "export" | "pending" | "faltas" | "managers" | "rankings" | "dados">("dashboard");
   const [isManagerLoggedIn, setIsManagerLoggedIn] = useState<boolean>(() => {
@@ -506,6 +510,11 @@ function MainApp() {
                     >
                       <Icon className={`w-4 h-4 mr-1 ${isSelected ? "text-white" : "text-blue-400"}`} />
                       <span>{tab.label}</span>
+                      {tab.id === "pending" && pendingActionCount > 0 && (
+                        <span className="ml-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold font-mono bg-amber-500 text-slate-950 animate-pulse shadow-sm">
+                          {pendingActionCount}
+                        </span>
+                      )}
                     </button>
                   );
                 })}
